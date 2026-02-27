@@ -275,19 +275,25 @@ impl Database {
         let conn = self.conn.lock();
         let query = match limit {
             Some(l) => format!(
-                "SELECT agent_id, content, is_error, timestamp FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT {}",
+                "SELECT agent_id, role, content, is_error, timestamp FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT {}",
                 l
             ),
-            None => "SELECT agent_id, content, is_error, timestamp FROM messages WHERE session_id = ?1 ORDER BY id".to_string(),
+            None => "SELECT agent_id, role, content, is_error, timestamp FROM messages WHERE session_id = ?1 ORDER BY id".to_string(),
         };
 
         let mut stmt = conn.prepare(&query)?;
         let messages = stmt.query_map(params![session_id], |row| {
+            let role: String = row.get(1)?;
+            let agent_id: String = if role == "user" {
+                "user".to_string()
+            } else {
+                row.get(0)?
+            };
             Ok(AgentMessage {
-                agent_id: row.get(0)?,
-                content: row.get(1)?,
-                is_error: row.get::<_, i32>(2)? != 0,
-                timestamp: row.get(3)?,
+                agent_id,
+                content: row.get(2)?,
+                is_error: row.get::<_, i32>(3)? != 0,
+                timestamp: row.get(4)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -297,18 +303,24 @@ impl Database {
     pub fn get_messages_by_workspace(&self, workspace_id: &str) -> Result<Vec<AgentMessage>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT m.agent_id, m.content, m.is_error, m.timestamp FROM messages m
+            "SELECT m.agent_id, m.role, m.content, m.is_error, m.timestamp FROM messages m
              JOIN sessions s ON m.session_id = s.id
              WHERE s.workspace_id = ?1
              ORDER BY m.id"
         )?;
 
         let messages = stmt.query_map(params![workspace_id], |row| {
+            let role: String = row.get(1)?;
+            let agent_id: String = if role == "user" {
+                "user".to_string()
+            } else {
+                row.get(0)?
+            };
             Ok(AgentMessage {
-                agent_id: row.get(0)?,
-                content: row.get(1)?,
-                is_error: row.get::<_, i32>(2)? != 0,
-                timestamp: row.get(3)?,
+                agent_id,
+                content: row.get(2)?,
+                is_error: row.get::<_, i32>(3)? != 0,
+                timestamp: row.get(4)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 

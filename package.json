@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build-app": "tauri build --bundles app && mkdir -p builds && find src-tauri/target/release/bundle -maxdepth 3 -type d -name '*.app' -exec cp -R {} builds/ \\;",
+    "build-dmg": "npm run build-app && hdiutil create -volname \"Claude Orchestrator\" -srcfolder \"builds/Claude Orchestrator.app\" -ov -format UDZO \"builds/Claude Orchestrator.dmg\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

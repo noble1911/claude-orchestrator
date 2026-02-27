@@ -29,6 +29,11 @@ struct ClientHandle {
 pub enum WsMessage {
     Connect { client_name: String },
     ListWorkspaces,
+    GetMessages { workspace_id: String },
+    ListFiles { workspace_id: String, relative_path: Option<String> },
+    ReadFile { workspace_id: String, relative_path: String, max_bytes: Option<usize> },
+    ListChanges { workspace_id: String },
+    RunChecks { workspace_id: String },
     Subscribe { workspace_id: String },
     Unsubscribe { workspace_id: String },
     SendMessage { workspace_id: String, message: String },
@@ -45,6 +50,28 @@ pub enum WsResponse {
     },
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
+    },
+    MessageHistory {
+        workspace_id: String,
+        messages: Vec<MessageInfo>,
+    },
+    FilesList {
+        workspace_id: String,
+        relative_path: String,
+        entries: Vec<FileEntryInfo>,
+    },
+    FileContent {
+        workspace_id: String,
+        path: String,
+        content: String,
+    },
+    ChangesList {
+        workspace_id: String,
+        changes: Vec<ChangeInfo>,
+    },
+    ChecksResult {
+        workspace_id: String,
+        checks: Vec<CheckInfo>,
     },
     Subscribed {
         workspace_id: String,
@@ -79,12 +106,51 @@ pub struct WorkspaceInfo {
     pub has_agent: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageInfo {
+    pub agent_id: String,
+    pub content: String,
+    pub is_error: bool,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntryInfo {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeInfo {
+    pub status: String,
+    pub path: String,
+    pub old_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckInfo {
+    pub name: String,
+    pub command: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u128,
+    pub skipped: bool,
+}
+
 // Commands from WebSocket to main app
 pub enum ServerCommand {
     SendMessage { workspace_id: String, message: String, response_tx: mpsc::UnboundedSender<String> },
     StartAgent { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     StopAgent { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     ListWorkspaces { response_tx: mpsc::UnboundedSender<String> },
+    GetMessages { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
+    ListFiles { workspace_id: String, relative_path: Option<String>, response_tx: mpsc::UnboundedSender<String> },
+    ReadFile { workspace_id: String, relative_path: String, max_bytes: Option<usize>, response_tx: mpsc::UnboundedSender<String> },
+    ListChanges { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
+    RunChecks { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
 }
 
 impl WebSocketServer {
@@ -184,7 +250,14 @@ async fn handle_connection(
     // Send welcome message
     let welcome = WsResponse::Connected {
         server_name: "Claude Orchestrator".to_string(),
-        features: vec!["workspaces".to_string(), "streaming".to_string(), "agents".to_string()],
+        features: vec![
+            "workspaces".to_string(),
+            "streaming".to_string(),
+            "agents".to_string(),
+            "files".to_string(),
+            "changes".to_string(),
+            "checks".to_string(),
+        ],
     };
     let _ = ws_sender
         .send(Message::Text(serde_json::to_string(&welcome).unwrap().into()))
@@ -215,6 +288,51 @@ async fn handle_connection(
                         WsMessage::ListWorkspaces => {
                             let (response_tx, mut response_rx) = mpsc::unbounded_channel();
                             if message_tx.send(ServerCommand::ListWorkspaces { response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::GetMessages { workspace_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::GetMessages { workspace_id, response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::ListFiles { workspace_id, relative_path } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::ListFiles { workspace_id, relative_path, response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::ReadFile { workspace_id, relative_path, max_bytes } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::ReadFile { workspace_id, relative_path, max_bytes, response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::ListChanges { workspace_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::ListChanges { workspace_id, response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::RunChecks { workspace_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::RunChecks { workspace_id, response_tx }).is_ok() {
                                 if let Some(response) = response_rx.recv().await {
                                     let _ = tx.send(response);
                                 }

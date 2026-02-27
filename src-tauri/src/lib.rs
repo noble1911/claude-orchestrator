@@ -1,9 +1,12 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::Arc;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tauri::{Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
@@ -14,10 +17,13 @@ mod process_manager;
 mod websocket_server;
 
 use database::Database;
-use websocket_server::{WebSocketServer, WsResponse, WorkspaceInfo, ServerCommand};
+use websocket_server::{ChangeInfo, CheckInfo, FileEntryInfo, MessageInfo, WebSocketServer, WsResponse, WorkspaceInfo, ServerCommand};
+
+static CLI_ENV_CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 // Types
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Repository {
     pub id: String,
     pub path: String,
@@ -27,6 +33,7 @@ pub struct Repository {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub id: String,
     pub repo_id: String,
@@ -46,6 +53,7 @@ pub enum WorkspaceStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Agent {
     pub id: String,
     pub workspace_id: String,
@@ -85,6 +93,35 @@ pub struct AgentMessage {
     pub content: String,
     pub is_error: bool,
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceChangeEntry {
+    pub status: String,
+    pub path: String,
+    pub old_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCheckResult {
+    pub name: String,
+    pub command: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u128,
+    pub skipped: bool,
 }
 
 // Application State
@@ -195,6 +232,26 @@ fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn remove_workspace_directory(repo_path: &str, worktree_path: &str) -> Result<(), String> {
+    let repo_root = PathBuf::from(repo_path);
+    let allowed_root = repo_root.join(".worktrees");
+    let workspace_path = PathBuf::from(worktree_path);
+
+    if !workspace_path.starts_with(&allowed_root) {
+        return Err(format!(
+            "Refusing to delete workspace path outside .worktrees: {}",
+            worktree_path
+        ));
+    }
+
+    if workspace_path.exists() {
+        std::fs::remove_dir_all(&workspace_path)
+            .map_err(|e| format!("Failed to delete workspace files: {}", e))?;
+    }
+
+    Ok(())
+}
+
 // Tauri Commands
 #[tauri::command]
 async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
@@ -293,7 +350,20 @@ async fn remove_repository(
         };
         
         for workspace in workspaces_to_remove {
-            let _ = remove_worktree(&repo_path, &workspace.worktree_path);
+            if let Err(e) = remove_worktree(&repo_path, &workspace.worktree_path) {
+                tracing::warn!(
+                    "git worktree remove failed for {}: {}",
+                    workspace.worktree_path,
+                    e
+                );
+            }
+            if let Err(e) = remove_workspace_directory(&repo_path, &workspace.worktree_path) {
+                tracing::warn!(
+                    "workspace directory cleanup failed for {}: {}",
+                    workspace.worktree_path,
+                    e
+                );
+            }
             let mut workspaces = state.workspaces.write();
             workspaces.remove(&workspace.id);
         }
@@ -387,7 +457,10 @@ async fn remove_workspace(
         (repo.path.clone(), workspace.worktree_path.clone())
     };
     
-    remove_worktree(&repo_path, &worktree_path)?;
+    if let Err(e) = remove_worktree(&repo_path, &worktree_path) {
+        tracing::warn!("git worktree remove failed for {}: {}", worktree_path, e);
+    }
+    remove_workspace_directory(&repo_path, &worktree_path)?;
     
     // Delete from database
     state.db.delete_workspace(&workspace_id)
@@ -408,6 +481,7 @@ async fn list_agents(state: State<'_, Arc<AppState>>) -> Result<Vec<Agent>, Stri
 #[tauri::command]
 async fn start_agent(
     workspace_id: String,
+    env_overrides: Option<HashMap<String, String>>,
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Agent, String> {
@@ -421,11 +495,11 @@ async fn start_agent(
     let agent_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
     
-    // Check for existing Claude session
-    let claude_session_id = state.db.get_active_session(&workspace_id)
-        .ok()
-        .flatten()
-        .and_then(|(_, claude_id)| claude_id);
+    // Always start a fresh Claude session for each launched agent.
+    // Reusing persisted session IDs can fail with:
+    // "No conversation found with session ID ..."
+    // and can incorrectly route auth mode (e.g. requiring /login).
+    let claude_session_id: Option<String> = None;
     
     // Create session in database
     let now = chrono::Utc::now().to_rfc3339();
@@ -469,9 +543,21 @@ async fn start_agent(
     let db = state.db.clone();
     let session_id_clone = session_id.clone();
     let workspace_id_clone = workspace_id.clone();
+    let env_overrides_clone = env_overrides.unwrap_or_default();
     
     std::thread::spawn(move || {
-        run_claude_cli(app, agent_id_clone, workspace_path, workspace_name, claude_session_id, db, session_id_clone, ws_server, workspace_id_clone);
+        run_claude_cli(
+            app,
+            agent_id_clone,
+            workspace_path,
+            workspace_name,
+            claude_session_id,
+            db,
+            session_id_clone,
+            ws_server,
+            workspace_id_clone,
+            env_overrides_clone,
+        );
     });
     
     Ok(agent)
@@ -490,6 +576,143 @@ fn find_claude_cli() -> Option<String> {
         .cloned()
 }
 
+fn load_cli_shell_env() -> HashMap<String, String> {
+    let mut env_map: HashMap<String, String> = std::env::vars().collect();
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let output = Command::new(&shell)
+        .args(["-lic", "printenv"])
+        // Avoid shell-framework writes that can fail in app/sandbox contexts.
+        .env("DISABLE_AUTO_UPDATE", "true")
+        .env("DISABLE_UPDATE_PROMPT", "true")
+        .env("ZSH_DISABLE_COMPFIX", "true")
+        .env("ZSH_COMPDUMP", "/tmp/.zcompdump-claude-orchestrator")
+        .output();
+
+    let output = match output {
+        Ok(value) => value,
+        Err(_) => return env_map,
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return env_map;
+    }
+
+    for line in stdout.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            if !key.trim().is_empty() {
+                env_map.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+
+    env_map
+}
+
+fn cli_env() -> &'static HashMap<String, String> {
+    CLI_ENV_CACHE.get_or_init(load_cli_shell_env)
+}
+
+fn configure_cli_env(cmd: &mut Command) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let base_env = cli_env();
+    for (key, value) in base_env {
+        cmd.env(key, value);
+    }
+
+    let existing = base_env
+        .get("PATH")
+        .cloned()
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let extra = format!(
+        "{}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        home
+    );
+    let merged = if existing.is_empty() {
+        extra
+    } else {
+        format!("{}:{}", extra, existing)
+    };
+    cmd.env("PATH", merged);
+}
+
+fn apply_env_overrides(cmd: &mut Command, env_overrides: &HashMap<String, String>) {
+    for (key, value) in env_overrides {
+        if !key.trim().is_empty() {
+            cmd.env(key, value);
+        }
+    }
+}
+
+fn emit_agent_message(
+    app: &tauri::AppHandle,
+    db: &Database,
+    session_id: &str,
+    agent_id: &str,
+    workspace_id: &str,
+    ws_server: &Option<Arc<WebSocketServer>>,
+    content: String,
+    is_error: bool,
+    role: &str,
+) {
+    let msg = AgentMessage {
+        agent_id: agent_id.to_string(),
+        content: content.clone(),
+        is_error,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = db.insert_message(session_id, agent_id, role, &msg.content, is_error, &msg.timestamp);
+    let _ = app.emit("agent-message", msg.clone());
+    if let Some(ws) = ws_server {
+        ws.broadcast_to_workspace(workspace_id, &WsResponse::AgentMessage {
+            workspace_id: workspace_id.to_string(),
+            content: msg.content,
+            is_error,
+            timestamp: msg.timestamp,
+        });
+    }
+}
+
+fn parse_stream_event_for_activity(event: &Value) -> Option<String> {
+    let event_type = event.get("type")?.as_str()?;
+
+    match event_type {
+        "content_block_start" => {
+            let block_type = event
+                .get("content_block")
+                .and_then(|b| b.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if block_type == "tool_use" {
+                let tool_name = event
+                    .get("content_block")
+                    .and_then(|b| b.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool");
+                Some(format!("Running tool: {}", tool_name))
+            } else if block_type == "thinking" {
+                Some("Thinking...".to_string())
+            } else {
+                None
+            }
+        }
+        "content_block_delta" => {
+            let delta_type = event
+                .get("delta")
+                .and_then(|d| d.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if delta_type == "thinking_delta" {
+                Some("Thinking...".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn run_claude_cli(
     app: tauri::AppHandle, 
     agent_id: String, 
@@ -500,6 +723,7 @@ fn run_claude_cli(
     session_id: String,
     ws_server: Option<Arc<WebSocketServer>>,
     workspace_id: String,
+    env_overrides: HashMap<String, String>,
 ) {
     let claude_path = match find_claude_cli() {
         Some(p) => p,
@@ -529,7 +753,7 @@ fn run_claude_cli(
     // Send initial message
     let init_msg = AgentMessage {
         agent_id: agent_id.clone(),
-        content: format!("Starting Claude in workspace: {}", workspace_name),
+        content: format!("Launching Claude in workspace: {}", workspace_name),
         is_error: false,
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
@@ -545,96 +769,28 @@ fn run_claude_cli(
             timestamp: init_msg.timestamp,
         });
     }
-    
-    // Build command
-    let mut cmd = Command::new(&claude_path);
-    cmd.current_dir(&workspace_path);
-    
-    // Use --resume if we have an existing session, otherwise create new
-    if let Some(ref session) = existing_session {
-        cmd.args(["--print", "--resume", session, "-p"]);
-        cmd.arg("Continue working on this codebase. What's the current status?");
-    } else {
-        // Create new session with session-id
-        let new_session_id = Uuid::new_v4().to_string();
-        cmd.args(["--print", "--session-id", &new_session_id, "-p"]);
-        cmd.arg(format!("You are working in the {} workspace at {}. Briefly describe what you see in this codebase (2-3 sentences max).", 
-            workspace_name, workspace_path));
-        
-        // Store the new Claude session ID
-        let _ = db.update_session_claude_id(&session_id, &new_session_id);
+
+    // Do not run a synthetic startup prompt. Agent startup should be quiet and
+    // wait for the user's first real message.
+    let ready_msg = AgentMessage {
+        agent_id: agent_id.clone(),
+        content: format!("Claude is ready in workspace: {}", workspace_name),
+        is_error: false,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = db.insert_message(&session_id, &agent_id, "system", &ready_msg.content, false, &ready_msg.timestamp);
+    let _ = app.emit("agent-message", ready_msg.clone());
+    if let Some(ws) = &ws_server {
+        ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
+            workspace_id: workspace_id.clone(),
+            content: ready_msg.content,
+            is_error: false,
+            timestamp: ready_msg.timestamp,
+        });
     }
-    
-    let output = cmd.output();
-    
-    match output {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            
-            if !stdout.is_empty() {
-                let msg = AgentMessage {
-                    agent_id: agent_id.clone(),
-                    content: stdout.clone(),
-                    is_error: false,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                };
-                let _ = db.insert_message(&session_id, &agent_id, "assistant", &msg.content, false, &msg.timestamp);
-                let _ = app.emit("agent-message", msg.clone());
-                
-                // Broadcast to WebSocket clients
-                if let Some(ws) = &ws_server {
-                    ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
-                        workspace_id: workspace_id.clone(),
-                        content: msg.content,
-                        is_error: false,
-                        timestamp: msg.timestamp,
-                    });
-                }
-            }
-            
-            if !stderr.is_empty() && !output.status.success() {
-                let msg = AgentMessage {
-                    agent_id: agent_id.clone(),
-                    content: stderr.clone(),
-                    is_error: true,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                };
-                let _ = db.insert_message(&session_id, &agent_id, "error", &msg.content, true, &msg.timestamp);
-                let _ = app.emit("agent-message", msg.clone());
-                
-                // Broadcast to WebSocket clients
-                if let Some(ws) = &ws_server {
-                    ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
-                        workspace_id: workspace_id.clone(),
-                        content: msg.content,
-                        is_error: true,
-                        timestamp: msg.timestamp,
-                    });
-                }
-            }
-        }
-        Err(e) => {
-            let msg = AgentMessage {
-                agent_id: agent_id.clone(),
-                content: format!("Error running Claude: {}", e),
-                is_error: true,
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            };
-            let _ = db.insert_message(&session_id, &agent_id, "error", &msg.content, true, &msg.timestamp);
-            let _ = app.emit("agent-message", msg.clone());
-            
-            // Broadcast to WebSocket clients
-            if let Some(ws) = &ws_server {
-                ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
-                    workspace_id: workspace_id.clone(),
-                    content: msg.content,
-                    is_error: true,
-                    timestamp: msg.timestamp,
-                });
-            }
-        }
-    }
+
+    // Ensure these remain referenced for future reintroduction of startup runs.
+    let _ = (&workspace_path, &existing_session, &env_overrides, &claude_path);
 }
 
 #[tauri::command]
@@ -685,6 +841,7 @@ async fn stop_agent(
 async fn send_message_to_agent(
     agent_id: String,
     message: String,
+    env_overrides: Option<HashMap<String, String>>,
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
@@ -711,6 +868,7 @@ async fn send_message_to_agent(
     let agent_id_clone = agent_id.clone();
     let message_clone = message.clone();
     let db = state.db.clone();
+    let env_overrides = env_overrides.unwrap_or_default();
     
     std::thread::spawn(move || {
         let claude_path = match find_claude_cli() {
@@ -739,57 +897,184 @@ async fn send_message_to_agent(
         // Build command - always use --resume if we have a session
         let mut cmd = Command::new(&claude_path);
         cmd.current_dir(&workspace_path);
+        configure_cli_env(&mut cmd);
+        apply_env_overrides(&mut cmd, &env_overrides);
         
         if let Some(ref claude_sid) = claude_session_id {
-            cmd.args(["--print", "--resume", claude_sid, "-p", &message_clone]);
+            cmd.args([
+                "--print",
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--include-partial-messages",
+                "--resume",
+                claude_sid,
+                "-p",
+                &message_clone,
+            ]);
         } else {
-            cmd.args(["--print", "-p", &message_clone]);
+            cmd.args([
+                "--print",
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--include-partial-messages",
+                "-p",
+                &message_clone,
+            ]);
         }
-        
-        let output = cmd.output();
-        
-        match output {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                if !stdout.is_empty() {
-                    let msg = AgentMessage {
-                        agent_id: agent_id_clone.clone(),
-                        content: stdout.clone(),
-                        is_error: false,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                    };
-                    let _ = db.insert_message(&session_id, &agent_id_clone, "assistant", &msg.content, false, &msg.timestamp);
-                    let _ = app.emit("agent-message", msg.clone());
-                    
-                    if let Some(ws) = &ws_server {
-                        ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
-                            workspace_id: workspace_id.clone(),
-                            content: msg.content,
-                            is_error: false,
-                            timestamp: msg.timestamp,
-                        });
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    format!("Error spawning Claude: {}", e),
+                    true,
+                    "error",
+                );
+                return;
+            }
+        };
+
+        let mut assistant_text = String::new();
+        let mut last_activity = String::new();
+        let mut error_emitted = false;
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().flatten() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                    if let Some(activity) = parse_stream_event_for_activity(&event) {
+                        if activity != last_activity {
+                            last_activity = activity.clone();
+                            emit_agent_message(
+                                &app,
+                                &db,
+                                &session_id,
+                                &agent_id_clone,
+                                &workspace_id,
+                                &ws_server,
+                                activity,
+                                false,
+                                "system",
+                            );
+                        }
+                    }
+
+                    if event.get("type").and_then(|v| v.as_str()) == Some("content_block_delta") {
+                        if event
+                            .get("delta")
+                            .and_then(|d| d.get("type"))
+                            .and_then(|v| v.as_str())
+                            == Some("text_delta")
+                        {
+                            if let Some(chunk) = event
+                                .get("delta")
+                                .and_then(|d| d.get("text"))
+                                .and_then(|v| v.as_str())
+                            {
+                                assistant_text.push_str(chunk);
+                            }
+                        }
+                    }
+
+                    if event.get("type").and_then(|v| v.as_str()) == Some("result") {
+                        let is_error = event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                        if is_error {
+                            let errors = event
+                                .get("errors")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_else(|| "Claude execution failed".to_string());
+                            emit_agent_message(
+                                &app,
+                                &db,
+                                &session_id,
+                                &agent_id_clone,
+                                &workspace_id,
+                                &ws_server,
+                                errors,
+                                true,
+                                "error",
+                            );
+                            error_emitted = true;
+                        }
                     }
                 }
             }
+        }
+
+        let mut stderr_buf = String::new();
+        if let Some(stderr) = child.stderr.take() {
+            let mut reader = BufReader::new(stderr);
+            let _ = std::io::Read::read_to_string(&mut reader, &mut stderr_buf);
+        }
+
+        let status = match child.wait() {
+            Ok(s) => s,
             Err(e) => {
-                let msg = AgentMessage {
-                    agent_id: agent_id_clone.clone(),
-                    content: format!("Error: {}", e),
-                    is_error: true,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                };
-                let _ = db.insert_message(&session_id, &agent_id_clone, "error", &msg.content, true, &msg.timestamp);
-                let _ = app.emit("agent-message", msg.clone());
-                
-                if let Some(ws) = &ws_server {
-                    ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
-                        workspace_id: workspace_id.clone(),
-                        content: msg.content,
-                        is_error: true,
-                        timestamp: msg.timestamp,
-                    });
-                }
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    format!("Error waiting for Claude: {}", e),
+                    true,
+                    "error",
+                );
+                return;
             }
+        };
+
+        if !assistant_text.trim().is_empty() {
+            emit_agent_message(
+                &app,
+                &db,
+                &session_id,
+                &agent_id_clone,
+                &workspace_id,
+                &ws_server,
+                assistant_text,
+                false,
+                "assistant",
+            );
+        }
+
+        if !status.success() && !error_emitted {
+            let error_content = if !stderr_buf.trim().is_empty() {
+                stderr_buf
+            } else {
+                format!("Claude exited with status: {:?}", status.code())
+            };
+            emit_agent_message(
+                &app,
+                &db,
+                &session_id,
+                &agent_id_clone,
+                &workspace_id,
+                &ws_server,
+                error_content,
+                true,
+                "error",
+            );
         }
     });
     
@@ -852,6 +1137,249 @@ async fn create_pull_request(
     Ok(pr_url)
 }
 
+#[tauri::command]
+async fn list_workspace_files(
+    workspace_id: String,
+    relative_path: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<WorkspaceFileEntry>, String> {
+    let workspace_root = {
+        let workspaces = state.workspaces.read();
+        let workspace = workspaces
+            .get(&workspace_id)
+            .ok_or("Workspace not found")?;
+        workspace.worktree_path.clone()
+    };
+
+    let root = std::fs::canonicalize(&workspace_root)
+        .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
+
+    let requested_rel = relative_path.unwrap_or_default();
+    let target = if requested_rel.is_empty() {
+        root.clone()
+    } else {
+        root.join(&requested_rel)
+    };
+
+    let canonical_target = std::fs::canonicalize(&target)
+        .map_err(|e| format!("Failed to resolve target path: {}", e))?;
+
+    if !canonical_target.starts_with(&root) {
+        return Err("Path is outside workspace root".to_string());
+    }
+
+    let read_dir = std::fs::read_dir(&canonical_target)
+        .map_err(|e| format!("Failed to read directory: {}", e))?;
+
+    let mut entries: Vec<WorkspaceFileEntry> = Vec::new();
+
+    for item in read_dir {
+        let entry = item.map_err(|e| format!("Failed to read directory entry: {}", e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to inspect directory entry: {}", e))?;
+        let entry_path = entry.path();
+        let relative = entry_path
+            .strip_prefix(&root)
+            .map_err(|e| format!("Failed to normalize file path: {}", e))?;
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        entries.push(WorkspaceFileEntry {
+            name,
+            path: relative_str,
+            is_dir: file_type.is_dir(),
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        use std::cmp::Ordering;
+        match (a.is_dir, b.is_dir) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+
+    Ok(entries)
+}
+
+#[tauri::command]
+async fn read_workspace_file(
+    workspace_id: String,
+    relative_path: String,
+    max_bytes: Option<usize>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    let workspace_root = {
+        let workspaces = state.workspaces.read();
+        let workspace = workspaces
+            .get(&workspace_id)
+            .ok_or("Workspace not found")?;
+        workspace.worktree_path.clone()
+    };
+
+    let root = std::fs::canonicalize(&workspace_root)
+        .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
+    let target = root.join(&relative_path);
+    let canonical_target = std::fs::canonicalize(&target)
+        .map_err(|e| format!("Failed to resolve file path: {}", e))?;
+
+    if !canonical_target.starts_with(&root) {
+        return Err("Path is outside workspace root".to_string());
+    }
+
+    let metadata = std::fs::metadata(&canonical_target)
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+    if !metadata.is_file() {
+        return Err("Path is not a file".to_string());
+    }
+
+    let limit = max_bytes.unwrap_or(200_000);
+    let bytes = std::fs::read(&canonical_target)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let (slice, truncated) = if bytes.len() > limit {
+        (&bytes[..limit], true)
+    } else {
+        (&bytes[..], false)
+    };
+
+    let mut content = String::from_utf8_lossy(slice).to_string();
+    if truncated {
+        content.push_str("\n\n[truncated]");
+    }
+    Ok(content)
+}
+
+#[tauri::command]
+async fn list_workspace_changes(
+    workspace_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<WorkspaceChangeEntry>, String> {
+    let workspace_root = {
+        let workspaces = state.workspaces.read();
+        let workspace = workspaces
+            .get(&workspace_id)
+            .ok_or("Workspace not found")?;
+        workspace.worktree_path.clone()
+    };
+
+    let output = Command::new("git")
+        .args(["status", "--porcelain=1", "--untracked-files=all"])
+        .current_dir(&workspace_root)
+        .output()
+        .map_err(|e| format!("Failed to run git status: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Git status failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut changes = Vec::new();
+
+    for line in stdout.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+
+        let status = line[0..2].to_string();
+        let rest = line[3..].to_string();
+        if let Some((old_path, new_path)) = rest.split_once(" -> ") {
+            changes.push(WorkspaceChangeEntry {
+                status,
+                path: new_path.to_string(),
+                old_path: Some(old_path.to_string()),
+            });
+        } else {
+            changes.push(WorkspaceChangeEntry {
+                status,
+                path: rest,
+                old_path: None,
+            });
+        }
+    }
+
+    Ok(changes)
+}
+
+#[tauri::command]
+async fn run_workspace_checks(
+    workspace_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<WorkspaceCheckResult>, String> {
+    let workspace_root = {
+        let workspaces = state.workspaces.read();
+        let workspace = workspaces
+            .get(&workspace_id)
+            .ok_or("Workspace not found")?;
+        workspace.worktree_path.clone()
+    };
+
+    let mut checks: Vec<(&str, &str, Vec<&str>)> = Vec::new();
+    let root_path = PathBuf::from(&workspace_root);
+
+    if root_path.join("Cargo.toml").exists() {
+        checks.push(("Cargo Check", "cargo", vec!["check"]));
+    }
+    if root_path.join("package.json").exists() {
+        checks.push(("NPM Lint", "npm", vec!["run", "lint", "--if-present"]));
+        checks.push(("NPM Build", "npm", vec!["run", "build", "--if-present"]));
+    }
+
+    if checks.is_empty() {
+        return Ok(vec![WorkspaceCheckResult {
+            name: "No configured checks".to_string(),
+            command: "-".to_string(),
+            success: true,
+            exit_code: Some(0),
+            stdout: "No known check commands were detected for this workspace.".to_string(),
+            stderr: String::new(),
+            duration_ms: 0,
+            skipped: true,
+        }]);
+    }
+
+    let mut results = Vec::new();
+    for (name, bin, args) in checks {
+        let cmd_str = format!("{} {}", bin, args.join(" "));
+        let started = Instant::now();
+
+        let result = match Command::new(bin).args(&args).current_dir(&workspace_root).output() {
+            Ok(output) => {
+                let elapsed = started.elapsed().as_millis();
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                WorkspaceCheckResult {
+                    name: name.to_string(),
+                    command: cmd_str,
+                    success: output.status.success(),
+                    exit_code: output.status.code(),
+                    stdout,
+                    stderr,
+                    duration_ms: elapsed,
+                    skipped: false,
+                }
+            }
+            Err(e) => WorkspaceCheckResult {
+                name: name.to_string(),
+                command: cmd_str,
+                success: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("Failed to execute check: {}", e),
+                duration_ms: started.elapsed().as_millis(),
+                skipped: false,
+            },
+        };
+
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
 // WebSocket command handler
 async fn handle_ws_commands(
     mut rx: mpsc::UnboundedReceiver<ServerCommand>,
@@ -880,6 +1408,279 @@ async fn handle_ws_commands(
                 }).collect();
                 
                 let response = WsResponse::WorkspaceList { workspaces: workspace_list };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+
+            ServerCommand::GetMessages { workspace_id, response_tx } => {
+                match state.db.get_messages_by_workspace(&workspace_id) {
+                    Ok(messages) => {
+                        let mapped: Vec<MessageInfo> = messages
+                            .into_iter()
+                            .map(|m| MessageInfo {
+                                agent_id: m.agent_id,
+                                content: m.content,
+                                is_error: m.is_error,
+                                timestamp: m.timestamp,
+                            })
+                            .collect();
+                        let response = WsResponse::MessageHistory {
+                            workspace_id,
+                            messages: mapped,
+                        };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    }
+                    Err(e) => {
+                        let response = WsResponse::Error {
+                            message: format!("Failed to load messages: {}", e),
+                        };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    }
+                }
+            }
+
+            ServerCommand::ListFiles { workspace_id, relative_path, response_tx } => {
+                let root_path = {
+                    let workspaces = state.workspaces.read();
+                    match workspaces.get(&workspace_id) {
+                        Some(ws) => ws.worktree_path.clone(),
+                        None => {
+                            let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                    }
+                };
+                let root = match std::fs::canonicalize(&root_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let response = WsResponse::Error { message: format!("Failed to resolve workspace path: {}", e) };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+                let rel = relative_path.unwrap_or_default();
+                let target = if rel.is_empty() { root.clone() } else { root.join(&rel) };
+                let canonical_target = match std::fs::canonicalize(&target) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let response = WsResponse::Error { message: format!("Failed to resolve target path: {}", e) };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+                if !canonical_target.starts_with(&root) {
+                    let response = WsResponse::Error { message: "Path is outside workspace root".to_string() };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                let read_dir = match std::fs::read_dir(&canonical_target) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let response = WsResponse::Error { message: format!("Failed to read directory: {}", e) };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+                let mut entries: Vec<FileEntryInfo> = Vec::new();
+                for item in read_dir {
+                    if let Ok(entry) = item {
+                        if let Ok(file_type) = entry.file_type() {
+                            let entry_path = entry.path();
+                            if let Ok(relative) = entry_path.strip_prefix(&root) {
+                                entries.push(FileEntryInfo {
+                                    name: entry.file_name().to_string_lossy().to_string(),
+                                    path: relative.to_string_lossy().replace('\\', "/"),
+                                    is_dir: file_type.is_dir(),
+                                });
+                            }
+                        }
+                    }
+                }
+                entries.sort_by(|a, b| {
+                    use std::cmp::Ordering;
+                    match (a.is_dir, b.is_dir) {
+                        (true, false) => Ordering::Less,
+                        (false, true) => Ordering::Greater,
+                        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                    }
+                });
+                let response = WsResponse::FilesList {
+                    workspace_id,
+                    relative_path: rel,
+                    entries,
+                };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+
+            ServerCommand::ReadFile { workspace_id, relative_path, max_bytes, response_tx } => {
+                let root_path = {
+                    let workspaces = state.workspaces.read();
+                    match workspaces.get(&workspace_id) {
+                        Some(ws) => ws.worktree_path.clone(),
+                        None => {
+                            let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                    }
+                };
+                let root = match std::fs::canonicalize(&root_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let response = WsResponse::Error { message: format!("Failed to resolve workspace path: {}", e) };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+                let target = root.join(&relative_path);
+                let canonical_target = match std::fs::canonicalize(&target) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let response = WsResponse::Error { message: format!("Failed to resolve file path: {}", e) };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+                if !canonical_target.starts_with(&root) {
+                    let response = WsResponse::Error { message: "Path is outside workspace root".to_string() };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                let limit = max_bytes.unwrap_or(200_000);
+                let bytes = match std::fs::read(&canonical_target) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let response = WsResponse::Error { message: format!("Failed to read file: {}", e) };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+                let (slice, truncated) = if bytes.len() > limit {
+                    (&bytes[..limit], true)
+                } else {
+                    (&bytes[..], false)
+                };
+                let mut content = String::from_utf8_lossy(slice).to_string();
+                if truncated {
+                    content.push_str("\n\n[truncated]");
+                }
+                let response = WsResponse::FileContent { workspace_id, path: relative_path, content };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+
+            ServerCommand::ListChanges { workspace_id, response_tx } => {
+                let workspace_root = {
+                    let workspaces = state.workspaces.read();
+                    match workspaces.get(&workspace_id) {
+                        Some(ws) => ws.worktree_path.clone(),
+                        None => {
+                            let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                    }
+                };
+                let output = match Command::new("git")
+                    .args(["status", "--porcelain=1", "--untracked-files=all"])
+                    .current_dir(&workspace_root)
+                    .output()
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        let response = WsResponse::Error { message: format!("Failed to run git status: {}", e) };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let response = WsResponse::Error { message: format!("Git status failed: {}", stderr) };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut changes = Vec::new();
+                for line in stdout.lines() {
+                    if line.len() < 3 {
+                        continue;
+                    }
+                    let status = line[0..2].to_string();
+                    let rest = line[3..].to_string();
+                    if let Some((old_path, new_path)) = rest.split_once(" -> ") {
+                        changes.push(ChangeInfo { status, path: new_path.to_string(), old_path: Some(old_path.to_string()) });
+                    } else {
+                        changes.push(ChangeInfo { status, path: rest, old_path: None });
+                    }
+                }
+                let response = WsResponse::ChangesList { workspace_id, changes };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+
+            ServerCommand::RunChecks { workspace_id, response_tx } => {
+                let workspace_root = {
+                    let workspaces = state.workspaces.read();
+                    match workspaces.get(&workspace_id) {
+                        Some(ws) => ws.worktree_path.clone(),
+                        None => {
+                            let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                    }
+                };
+                let mut checks: Vec<(&str, &str, Vec<&str>)> = Vec::new();
+                let root_path = PathBuf::from(&workspace_root);
+                if root_path.join("Cargo.toml").exists() {
+                    checks.push(("Cargo Check", "cargo", vec!["check"]));
+                }
+                if root_path.join("package.json").exists() {
+                    checks.push(("NPM Lint", "npm", vec!["run", "lint", "--if-present"]));
+                    checks.push(("NPM Build", "npm", vec!["run", "build", "--if-present"]));
+                }
+                let mut results: Vec<CheckInfo> = Vec::new();
+                if checks.is_empty() {
+                    results.push(CheckInfo {
+                        name: "No configured checks".to_string(),
+                        command: "-".to_string(),
+                        success: true,
+                        exit_code: Some(0),
+                        stdout: "No known check commands were detected for this workspace.".to_string(),
+                        stderr: String::new(),
+                        duration_ms: 0,
+                        skipped: true,
+                    });
+                } else {
+                    for (name, bin, args) in checks {
+                        let started = Instant::now();
+                        match Command::new(bin).args(&args).current_dir(&workspace_root).output() {
+                            Ok(output) => {
+                                results.push(CheckInfo {
+                                    name: name.to_string(),
+                                    command: format!("{} {}", bin, args.join(" ")),
+                                    success: output.status.success(),
+                                    exit_code: output.status.code(),
+                                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                                    duration_ms: started.elapsed().as_millis(),
+                                    skipped: false,
+                                });
+                            }
+                            Err(e) => {
+                                results.push(CheckInfo {
+                                    name: name.to_string(),
+                                    command: format!("{} {}", bin, args.join(" ")),
+                                    success: false,
+                                    exit_code: None,
+                                    stdout: String::new(),
+                                    stderr: format!("Failed to execute check: {}", e),
+                                    duration_ms: started.elapsed().as_millis(),
+                                    skipped: false,
+                                });
+                            }
+                        }
+                    }
+                }
+                let response = WsResponse::ChecksResult { workspace_id, checks: results };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
             
@@ -924,34 +1725,178 @@ async fn handle_ws_commands(
                             if let Some(claude_path) = find_claude_cli() {
                                 let mut cmd = Command::new(&claude_path);
                                 cmd.current_dir(&workspace_path);
+                                configure_cli_env(&mut cmd);
                                 
                                 if let Some(ref claude_sid) = claude_session_id {
-                                    cmd.args(["--print", "--resume", claude_sid, "-p", &message]);
+                                    cmd.args([
+                                        "--print",
+                                        "--verbose",
+                                        "--output-format",
+                                        "stream-json",
+                                        "--include-partial-messages",
+                                        "--resume",
+                                        claude_sid,
+                                        "-p",
+                                        &message,
+                                    ]);
                                 } else {
-                                    cmd.args(["--print", "-p", &message]);
+                                    cmd.args([
+                                        "--print",
+                                        "--verbose",
+                                        "--output-format",
+                                        "stream-json",
+                                        "--include-partial-messages",
+                                        "-p",
+                                        &message,
+                                    ]);
                                 }
-                                
-                                if let Ok(output) = cmd.output() {
-                                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                                    if !stdout.is_empty() {
-                                        let msg = AgentMessage {
-                                            agent_id: agent_id_clone.clone(),
-                                            content: stdout.clone(),
-                                            is_error: false,
-                                            timestamp: chrono::Utc::now().to_rfc3339(),
-                                        };
-                                        let _ = db.insert_message(&session_id, &agent_id_clone, "assistant", &msg.content, false, &msg.timestamp);
-                                        let _ = app_clone.emit("agent-message", msg.clone());
-                                        
-                                        if let Some(ws) = &ws_server {
-                                            ws.broadcast_to_workspace(&workspace_id_clone, &WsResponse::AgentMessage {
-                                                workspace_id: workspace_id_clone.clone(),
-                                                content: msg.content,
-                                                is_error: false,
-                                                timestamp: msg.timestamp,
-                                            });
+
+                                cmd.stdout(Stdio::piped());
+                                cmd.stderr(Stdio::piped());
+                                let mut child = match cmd.spawn() {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            format!("Error spawning Claude: {}", e),
+                                            true,
+                                            "error",
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                let mut assistant_text = String::new();
+                                let mut last_activity = String::new();
+                                let mut error_emitted = false;
+
+                                if let Some(stdout) = child.stdout.take() {
+                                    let reader = BufReader::new(stdout);
+                                    for line in reader.lines().flatten() {
+                                        if line.trim().is_empty() {
+                                            continue;
+                                        }
+                                        if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                                            if let Some(activity) = parse_stream_event_for_activity(&event) {
+                                                if activity != last_activity {
+                                                    last_activity = activity.clone();
+                                                    emit_agent_message(
+                                                        &app_clone,
+                                                        &db,
+                                                        &session_id,
+                                                        &agent_id_clone,
+                                                        &workspace_id_clone,
+                                                        &ws_server,
+                                                        activity,
+                                                        false,
+                                                        "system",
+                                                    );
+                                                }
+                                            }
+
+                                            if event.get("type").and_then(|v| v.as_str()) == Some("content_block_delta")
+                                                && event.get("delta").and_then(|d| d.get("type")).and_then(|v| v.as_str())
+                                                    == Some("text_delta")
+                                            {
+                                                if let Some(chunk) =
+                                                    event.get("delta").and_then(|d| d.get("text")).and_then(|v| v.as_str())
+                                                {
+                                                    assistant_text.push_str(chunk);
+                                                }
+                                            }
+
+                                            if event.get("type").and_then(|v| v.as_str()) == Some("result") {
+                                                let is_error =
+                                                    event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                                                if is_error {
+                                                    let errors = event
+                                                        .get("errors")
+                                                        .and_then(|v| v.as_array())
+                                                        .map(|arr| {
+                                                            arr.iter()
+                                                                .filter_map(|v| v.as_str())
+                                                                .collect::<Vec<_>>()
+                                                                .join("\n")
+                                                        })
+                                                        .unwrap_or_else(|| "Claude execution failed".to_string());
+                                                    emit_agent_message(
+                                                        &app_clone,
+                                                        &db,
+                                                        &session_id,
+                                                        &agent_id_clone,
+                                                        &workspace_id_clone,
+                                                        &ws_server,
+                                                        errors,
+                                                        true,
+                                                        "error",
+                                                    );
+                                                    error_emitted = true;
+                                                }
+                                            }
                                         }
                                     }
+                                }
+
+                                let mut stderr_buf = String::new();
+                                if let Some(stderr) = child.stderr.take() {
+                                    let mut reader = BufReader::new(stderr);
+                                    let _ = std::io::Read::read_to_string(&mut reader, &mut stderr_buf);
+                                }
+
+                                let status = match child.wait() {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            format!("Error waiting for Claude: {}", e),
+                                            true,
+                                            "error",
+                                        );
+                                        return;
+                                    }
+                                };
+
+                                if !assistant_text.trim().is_empty() {
+                                    emit_agent_message(
+                                        &app_clone,
+                                        &db,
+                                        &session_id,
+                                        &agent_id_clone,
+                                        &workspace_id_clone,
+                                        &ws_server,
+                                        assistant_text,
+                                        false,
+                                        "assistant",
+                                    );
+                                }
+
+                                if !status.success() && !error_emitted {
+                                    let error_content = if !stderr_buf.trim().is_empty() {
+                                        stderr_buf
+                                    } else {
+                                        format!("Claude exited with status: {:?}", status.code())
+                                    };
+                                    emit_agent_message(
+                                        &app_clone,
+                                        &db,
+                                        &session_id,
+                                        &agent_id_clone,
+                                        &workspace_id_clone,
+                                        &ws_server,
+                                        error_content,
+                                        true,
+                                        "error",
+                                    );
                                 }
                             }
                         });
@@ -960,10 +1905,106 @@ async fn handle_ws_commands(
             }
             
             ServerCommand::StartAgent { workspace_id, response_tx } => {
-                // This would need to call start_agent logic
-                // For now, send an error that this should be done via the UI
-                let response = WsResponse::Error { 
-                    message: "Agent start via WebSocket not yet implemented - use the desktop UI".to_string() 
+                // Reuse an existing running agent for this workspace when available.
+                if let Some(existing_agent_id) = {
+                    let agents = state.agents.read();
+                    agents
+                        .values()
+                        .find(|a| a.workspace_id == workspace_id)
+                        .map(|a| a.id.clone())
+                } {
+                    let response = WsResponse::AgentStarted {
+                        workspace_id,
+                        agent_id: existing_agent_id,
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+
+                let workspace = {
+                    let workspaces = state.workspaces.read();
+                    match workspaces.get(&workspace_id) {
+                        Some(ws) => ws.clone(),
+                        None => {
+                            let response = WsResponse::Error {
+                                message: "Workspace not found".to_string(),
+                            };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                    }
+                };
+
+                let agent_id = Uuid::new_v4().to_string();
+                let session_id = Uuid::new_v4().to_string();
+                let claude_session_id: Option<String> = None;
+                let now = chrono::Utc::now().to_rfc3339();
+
+                if let Err(e) = state.db.insert_session(
+                    &session_id,
+                    &workspace_id,
+                    claude_session_id.as_deref(),
+                    &now,
+                ) {
+                    let response = WsResponse::Error {
+                        message: format!("Failed to create session: {}", e),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+
+                let agent = Agent {
+                    id: agent_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    status: AgentStatus::Running,
+                    session_id: Some(session_id.clone()),
+                    claude_session_id: claude_session_id.clone(),
+                };
+
+                {
+                    let mut agents = state.agents.write();
+                    agents.insert(agent_id.clone(), agent);
+                }
+
+                {
+                    let mut workspaces = state.workspaces.write();
+                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
+                        workspace.status = WorkspaceStatus::Running;
+                        workspace.last_activity = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                }
+                let _ = state
+                    .db
+                    .update_workspace_status(&workspace_id, &WorkspaceStatus::Running, Some(&now));
+
+                // Spawn Claude bootstrap process for this workspace.
+                let ws_server = state.ws_server.clone();
+                let workspace_path = workspace.worktree_path.clone();
+                let workspace_name = workspace.name.clone();
+                let agent_id_clone = agent_id.clone();
+                let db = state.db.clone();
+                let session_id_clone = session_id.clone();
+                let workspace_id_clone = workspace_id.clone();
+                let app_clone = app.clone();
+
+                std::thread::spawn(move || {
+                    run_claude_cli(
+                        app_clone,
+                        agent_id_clone,
+                        workspace_path,
+                        workspace_name,
+                        claude_session_id,
+                        db,
+                        session_id_clone,
+                        ws_server,
+                        workspace_id_clone,
+                        HashMap::new(),
+                    );
+                });
+
+                let response = WsResponse::AgentStarted {
+                    workspace_id,
+                    agent_id,
                 };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
@@ -1080,6 +2121,10 @@ pub fn run() {
             send_message_to_agent,
             get_agent_messages,
             create_pull_request,
+            list_workspace_files,
+            read_workspace_file,
+            list_workspace_changes,
+            run_workspace_checks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
