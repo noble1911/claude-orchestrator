@@ -202,6 +202,15 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_workspace_name(&self, id: &str, name: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE workspaces SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_workspace(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock();
         // Delete associated messages
@@ -291,6 +300,8 @@ impl Database {
             };
             Ok(AgentMessage {
                 agent_id,
+                workspace_id: None,
+                role,
                 content: row.get(2)?,
                 is_error: row.get::<_, i32>(3)? != 0,
                 timestamp: row.get(4)?,
@@ -318,6 +329,8 @@ impl Database {
             };
             Ok(AgentMessage {
                 agent_id,
+                workspace_id: Some(workspace_id.to_string()),
+                role,
                 content: row.get(2)?,
                 is_error: row.get::<_, i32>(3)? != 0,
                 timestamp: row.get(4)?,

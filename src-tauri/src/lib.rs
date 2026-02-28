@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, State};
 use tauri_plugin_dialog::DialogExt;
@@ -18,8 +18,6 @@ mod websocket_server;
 
 use database::Database;
 use websocket_server::{ChangeInfo, CheckInfo, FileEntryInfo, MessageInfo, WebSocketServer, WsResponse, WorkspaceInfo, ServerCommand};
-
-static CLI_ENV_CACHE: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 // Types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +88,8 @@ pub struct AppStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AgentMessage {
     pub agent_id: String,
+    pub workspace_id: Option<String>,
+    pub role: String,
     pub content: String,
     pub is_error: bool,
     pub timestamp: String,
@@ -124,6 +124,17 @@ pub struct WorkspaceCheckResult {
     pub skipped: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalCommandResult {
+    pub command: String,
+    pub cwd: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u128,
+}
+
 // Application State
 pub struct AppState {
     db: Arc<Database>,
@@ -132,6 +143,7 @@ pub struct AppState {
     agents: RwLock<HashMap<String, Agent>>,
     ws_server: Option<Arc<WebSocketServer>>,
     ws_server_running: RwLock<bool>,
+    ws_connected_clients: RwLock<usize>,
 }
 
 impl AppState {
@@ -144,6 +156,7 @@ impl AppState {
             agents: RwLock::new(HashMap::new()),
             ws_server: None,
             ws_server_running: RwLock::new(false),
+            ws_connected_clients: RwLock::new(0),
         };
         
         // Load persisted data
@@ -273,7 +286,7 @@ async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
 async fn get_app_status(state: State<'_, Arc<AppState>>) -> Result<AppStatus, String> {
     let repositories: Vec<Repository> = state.repositories.read().values().cloned().collect();
     let running = *state.ws_server_running.read();
-    let client_count = state.ws_server.as_ref().map(|s| s.client_count()).unwrap_or(0);
+    let client_count = *state.ws_connected_clients.read();
     
     Ok(AppStatus {
         repositories,
@@ -473,6 +486,76 @@ async fn remove_workspace(
 }
 
 #[tauri::command]
+async fn rename_workspace(
+    workspace_id: String,
+    name: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Workspace, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Workspace name cannot be empty".to_string());
+    }
+
+    let updated = {
+        let mut workspaces = state.workspaces.write();
+        let workspace = workspaces
+            .get_mut(&workspace_id)
+            .ok_or("Workspace not found")?;
+        workspace.name = trimmed.to_string();
+        workspace.clone()
+    };
+
+    state
+        .db
+        .update_workspace_name(&workspace_id, trimmed)
+        .map_err(|e| format!("Failed to rename workspace: {}", e))?;
+
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn run_workspace_terminal_command(
+    workspace_id: String,
+    command: String,
+    env_overrides: Option<HashMap<String, String>>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<TerminalCommandResult, String> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return Err("Command cannot be empty".to_string());
+    }
+
+    let workspace = {
+        let workspaces = state.workspaces.read();
+        workspaces
+            .get(&workspace_id)
+            .cloned()
+            .ok_or("Workspace not found")?
+    };
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let started = Instant::now();
+    let mut process = Command::new(shell);
+    process.current_dir(&workspace.worktree_path);
+    process.args(["-lc", cmd]);
+    let overrides = env_overrides.unwrap_or_default();
+    let effective_env = build_effective_cli_env(&overrides);
+    configure_cli_env(&mut process, &effective_env);
+    let output = process
+        .output()
+        .map_err(|e| format!("Failed to execute command: {}", e))?;
+
+    Ok(TerminalCommandResult {
+        command: cmd.to_string(),
+        cwd: workspace.worktree_path,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code(),
+        duration_ms: started.elapsed().as_millis(),
+    })
+}
+
+#[tauri::command]
 async fn list_agents(state: State<'_, Arc<AppState>>) -> Result<Vec<Agent>, String> {
     let agents = state.agents.read();
     Ok(agents.values().cloned().collect())
@@ -610,18 +693,18 @@ fn load_cli_shell_env() -> HashMap<String, String> {
     env_map
 }
 
-fn cli_env() -> &'static HashMap<String, String> {
-    CLI_ENV_CACHE.get_or_init(load_cli_shell_env)
+fn env_truthy(value: Option<&String>) -> bool {
+    match value.map(|s| s.trim().to_lowercase()) {
+        Some(v) if v == "1" || v == "true" || v == "yes" || v == "on" => true,
+        _ => false,
+    }
 }
 
-fn configure_cli_env(cmd: &mut Command) {
+fn build_effective_cli_env(env_overrides: &HashMap<String, String>) -> HashMap<String, String> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let base_env = cli_env();
-    for (key, value) in base_env {
-        cmd.env(key, value);
-    }
+    let mut env_map = load_cli_shell_env();
 
-    let existing = base_env
+    let existing = env_map
         .get("PATH")
         .cloned()
         .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
@@ -634,14 +717,101 @@ fn configure_cli_env(cmd: &mut Command) {
     } else {
         format!("{}:{}", extra, existing)
     };
-    cmd.env("PATH", merged);
-}
+    env_map.insert("PATH".to_string(), merged);
 
-fn apply_env_overrides(cmd: &mut Command, env_overrides: &HashMap<String, String>) {
     for (key, value) in env_overrides {
         if !key.trim().is_empty() {
-            cmd.env(key, value);
+            env_map.insert(key.clone(), value.clone());
         }
+    }
+
+    env_map
+}
+
+fn configure_cli_env(cmd: &mut Command, env_map: &HashMap<String, String>) {
+    for (key, value) in env_map {
+        cmd.env(key, value);
+    }
+}
+
+fn auth_env_feedback(env_map: &HashMap<String, String>) -> (String, Option<String>) {
+    let bedrock = env_truthy(env_map.get("CLAUDE_CODE_USE_BEDROCK"));
+    let aws_key = env_map.get("AWS_ACCESS_KEY_ID").map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let aws_secret = env_map.get("AWS_SECRET_ACCESS_KEY").map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let aws_session = env_map.get("AWS_SESSION_TOKEN").map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let aws_profile = env_map.get("AWS_PROFILE").map(|v| !v.trim().is_empty()).unwrap_or(false);
+    let anthropic_key = env_map
+        .get("ANTHROPIC_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    let summary = format!(
+        "env mode: bedrock={}, aws_key={}, aws_secret={}, aws_session={}, aws_profile={}, anthropic_key={}",
+        bedrock, aws_key, aws_secret, aws_session, aws_profile, anthropic_key
+    );
+
+    let hint = if bedrock {
+        if !(aws_profile || (aws_key && aws_secret)) {
+            Some(
+                "Bedrock mode is enabled but AWS credentials are missing. Set AWS_PROFILE or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY."
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    } else if !anthropic_key {
+        Some(
+            "ANTHROPIC_API_KEY is not set. Claude may fail with login/API key errors unless your CLI session is already authenticated."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    (summary, hint)
+}
+
+fn normalize_permission_mode(mode: Option<&str>) -> &'static str {
+    match mode.map(|v| v.trim()) {
+        Some("plan") => "plan",
+        _ => "bypassPermissions",
+    }
+}
+
+fn stream_event_payload<'a>(event: &'a Value) -> &'a Value {
+    if event.get("type").and_then(|v| v.as_str()) == Some("stream_event") {
+        event.get("event").unwrap_or(event)
+    } else {
+        event
+    }
+}
+
+fn extract_stream_session_id(event: &Value) -> Option<String> {
+    event
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| stream_event_payload(event).get("session_id").and_then(|v| v.as_str()))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn choose_assistant_text(delta_text: &str, snapshot_text: Option<&String>) -> Option<String> {
+    let delta_trimmed = delta_text.trim();
+    let snapshot_trimmed = snapshot_text
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+
+    match (snapshot_trimmed, delta_trimmed.is_empty()) {
+        (Some(snapshot), false) => {
+            if snapshot.len() >= delta_trimmed.len() {
+                Some(snapshot.to_string())
+            } else {
+                Some(delta_text.to_string())
+            }
+        }
+        (Some(snapshot), true) => Some(snapshot.to_string()),
+        (None, false) => Some(delta_text.to_string()),
+        (None, true) => None,
     }
 }
 
@@ -658,6 +828,8 @@ fn emit_agent_message(
 ) {
     let msg = AgentMessage {
         agent_id: agent_id.to_string(),
+        workspace_id: Some(workspace_id.to_string()),
+        role: role.to_string(),
         content: content.clone(),
         is_error,
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -667,6 +839,7 @@ fn emit_agent_message(
     if let Some(ws) = ws_server {
         ws.broadcast_to_workspace(workspace_id, &WsResponse::AgentMessage {
             workspace_id: workspace_id.to_string(),
+            role: role.to_string(),
             content: msg.content,
             is_error,
             timestamp: msg.timestamp,
@@ -674,43 +847,312 @@ fn emit_agent_message(
     }
 }
 
-fn parse_stream_event_for_activity(event: &Value) -> Option<String> {
-    let event_type = event.get("type")?.as_str()?;
+fn summarize_tool_call(tool_name: &str, input_json: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(input_json).ok();
+    let lower = tool_name.to_lowercase();
+
+    let message = if lower.contains("glob") {
+        let pattern = parsed
+            .as_ref()
+            .and_then(|v| v.get("pattern"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(input_json);
+        format!("Glob {}", pattern)
+    } else if lower.contains("grep") {
+        let pattern = parsed
+            .as_ref()
+            .and_then(|v| v.get("pattern"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let path = parsed
+            .as_ref()
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if pattern.is_empty() && path.is_empty() {
+            format!("Grep {}", input_json)
+        } else if path.is_empty() {
+            format!("Grep {}", pattern)
+        } else if pattern.is_empty() {
+            format!("Grep in {}", path)
+        } else {
+            format!("Grep '{}' in {}", pattern, path)
+        }
+    } else if lower.contains("read") {
+        let file = parsed
+            .as_ref()
+            .and_then(|v| v.get("file_path").or_else(|| v.get("path")))
+            .and_then(|v| v.as_str())
+            .unwrap_or(input_json);
+        let offset = parsed
+            .as_ref()
+            .and_then(|v| v.get("offset"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let limit = parsed
+            .as_ref()
+            .and_then(|v| v.get("limit"))
+            .and_then(|v| v.as_i64());
+        if let Some(limit) = limit {
+            if offset > 0 {
+                format!("Read {} lines from {} (offset {})", limit, file, offset)
+            } else {
+                format!("Read {} lines from {}", limit, file)
+            }
+        } else {
+            format!("Read {}", file)
+        }
+    } else if lower.contains("bash") || lower.contains("shell") {
+        let cmd = parsed
+            .as_ref()
+            .and_then(|v| {
+                v.get("command")
+                    .or_else(|| v.get("cmd"))
+                    .or_else(|| v.get("input"))
+            })
+            .and_then(|v| v.as_str())
+            .unwrap_or(input_json);
+        format!("Run {}", cmd)
+    } else if lower.contains("ls") || lower.contains("list") {
+        let path = parsed
+            .as_ref()
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        format!("List {}", path)
+    } else if lower.contains("task") {
+        let description = parsed
+            .as_ref()
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Run delegated task");
+        format!("Task {}", description)
+    } else {
+        let compact = if input_json.len() > 180 {
+            format!("{}...", &input_json[..180])
+        } else {
+            input_json.to_string()
+        };
+        format!("{} {}", tool_name, compact)
+    };
+
+    Some(message)
+}
+
+fn parse_stream_event_for_activity(
+    event: &Value,
+    tool_names: &mut HashMap<i64, String>,
+    tool_inputs: &mut HashMap<i64, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let payload = stream_event_payload(event);
+    let event_type = match payload.get("type").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return out,
+    };
 
     match event_type {
+        "system" => {
+            let subtype = payload
+                .get("subtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if subtype == "init" {
+                let model = payload
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown model");
+                let permission_mode = payload
+                    .get("permissionMode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                out.push(format!(
+                    "Claude initialized ({}, permission={})",
+                    model, permission_mode
+                ));
+            } else if !subtype.is_empty() {
+                out.push(format!("System {}", subtype));
+            }
+        }
+        "assistant" => {
+            if let Some(content) = payload
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|v| v.as_array())
+            {
+                for item in content {
+                    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if item_type == "thinking" || item_type == "redacted_thinking" {
+                        out.push("Thinking".to_string());
+                    } else if item_type == "tool_use" {
+                        let tool_name = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tool")
+                            .to_string();
+                        if let Some(input_val) = item.get("input") {
+                            let input_json = if input_val.is_string() {
+                                input_val.as_str().unwrap_or("").to_string()
+                            } else {
+                                serde_json::to_string(input_val).unwrap_or_default()
+                            };
+                            if !input_json.trim().is_empty() {
+                                if let Some(summary) = summarize_tool_call(&tool_name, &input_json) {
+                                    out.push(summary);
+                                }
+                            }
+                        } else {
+                            out.push(format!("Tool {}", tool_name));
+                        }
+                    }
+                }
+            }
+        }
         "content_block_start" => {
-            let block_type = event
+            let block_type = payload
                 .get("content_block")
                 .and_then(|b| b.get("type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if block_type == "tool_use" {
-                let tool_name = event
+            let index = payload
+                .get("index")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            if block_type == "thinking" {
+                out.push("Thinking".to_string());
+            } else if block_type == "tool_use" {
+                let tool_name = payload
                     .get("content_block")
                     .and_then(|b| b.get("name"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("tool");
-                Some(format!("Running tool: {}", tool_name))
-            } else if block_type == "thinking" {
-                Some("Thinking...".to_string())
-            } else {
-                None
+                    .unwrap_or("tool")
+                    .to_string();
+                if index >= 0 {
+                    tool_names.insert(index, tool_name.clone());
+                    tool_inputs.insert(index, String::new());
+                }
             }
         }
         "content_block_delta" => {
-            let delta_type = event
+            let delta_type = payload
                 .get("delta")
                 .and_then(|d| d.get("type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let index = payload
+                .get("index")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
             if delta_type == "thinking_delta" {
-                Some("Thinking...".to_string())
-            } else {
-                None
+                // Suppress token-level thinking deltas to avoid noisy character-by-character updates.
+            } else if delta_type == "input_json_delta" && index >= 0 {
+                let partial = payload
+                    .get("delta")
+                    .and_then(|d| d.get("partial_json"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !partial.is_empty() {
+                    tool_inputs
+                        .entry(index)
+                        .and_modify(|s| s.push_str(partial))
+                        .or_insert_with(|| partial.to_string());
+                }
             }
         }
-        _ => None,
+        "content_block_stop" => {
+            let index = payload
+                .get("index")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            if index >= 0 {
+                if let (Some(tool_name), Some(input_json)) = (tool_names.remove(&index), tool_inputs.remove(&index)) {
+                    if !input_json.trim().is_empty() {
+                        if let Some(summary) = summarize_tool_call(&tool_name, &input_json) {
+                            out.push(summary);
+                        } else {
+                            out.push(format!("Tool {}", tool_name));
+                        }
+                    } else {
+                        out.push(format!("Tool {}", tool_name));
+                    }
+                }
+            }
+        }
+        _ => {}
     }
+
+    out
+}
+
+fn extract_result_text(event: &Value) -> Option<String> {
+    let payload = stream_event_payload(event);
+
+    if payload.get("type").and_then(|v| v.as_str()) != Some("result") {
+        return None;
+    }
+
+    if let Some(text) = payload.get("result").and_then(|v| v.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(text) = payload.get("output_text").and_then(|v| v.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(content) = payload.get("content").and_then(|v| v.as_array()) {
+        let mut buf = String::new();
+        for item in content {
+            if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                if !t.trim().is_empty() {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(t.trim());
+                }
+            }
+        }
+        if !buf.is_empty() {
+            return Some(buf);
+        }
+    }
+
+    None
+}
+
+fn extract_assistant_message_text(event: &Value) -> Option<String> {
+    let payload = stream_event_payload(event);
+
+    if payload.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+        return None;
+    }
+
+    let content = payload
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_array())?;
+
+    let mut buf = String::new();
+    for item in content {
+        if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    if !buf.is_empty() {
+                        buf.push('\n');
+                    }
+                    buf.push_str(trimmed);
+                }
+            }
+        }
+    }
+
+    if buf.is_empty() { None } else { Some(buf) }
 }
 
 fn run_claude_cli(
@@ -730,6 +1172,8 @@ fn run_claude_cli(
         None => {
             let msg = AgentMessage {
                 agent_id: agent_id.clone(),
+                workspace_id: Some(workspace_id.clone()),
+                role: "system".to_string(),
                 content: "Error: Claude CLI not found. Please install claude.".to_string(),
                 is_error: true,
                 timestamp: chrono::Utc::now().to_rfc3339(),
@@ -741,6 +1185,7 @@ fn run_claude_cli(
             if let Some(ws) = &ws_server {
                 ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
                     workspace_id: workspace_id.clone(),
+                    role: "system".to_string(),
                     content: msg.content,
                     is_error: true,
                     timestamp: msg.timestamp,
@@ -753,6 +1198,8 @@ fn run_claude_cli(
     // Send initial message
     let init_msg = AgentMessage {
         agent_id: agent_id.clone(),
+        workspace_id: Some(workspace_id.clone()),
+        role: "system".to_string(),
         content: format!("Launching Claude in workspace: {}", workspace_name),
         is_error: false,
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -764,6 +1211,7 @@ fn run_claude_cli(
     if let Some(ws) = &ws_server {
         ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
             workspace_id: workspace_id.clone(),
+            role: "system".to_string(),
             content: init_msg.content,
             is_error: false,
             timestamp: init_msg.timestamp,
@@ -774,6 +1222,8 @@ fn run_claude_cli(
     // wait for the user's first real message.
     let ready_msg = AgentMessage {
         agent_id: agent_id.clone(),
+        workspace_id: Some(workspace_id.clone()),
+        role: "system".to_string(),
         content: format!("Claude is ready in workspace: {}", workspace_name),
         is_error: false,
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -783,6 +1233,7 @@ fn run_claude_cli(
     if let Some(ws) = &ws_server {
         ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
             workspace_id: workspace_id.clone(),
+            role: "system".to_string(),
             content: ready_msg.content,
             is_error: false,
             timestamp: ready_msg.timestamp,
@@ -842,15 +1293,17 @@ async fn send_message_to_agent(
     agent_id: String,
     message: String,
     env_overrides: Option<HashMap<String, String>>,
+    permission_mode: Option<String>,
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    let app_state = state.inner().clone();
     // Get workspace path and session info for this agent
     let (workspace_id, workspace_path, session_id, claude_session_id) = {
-        let agents = state.agents.read();
+        let agents = app_state.agents.read();
         let agent = agents.get(&agent_id).ok_or("Agent not found")?;
         
-        let workspaces = state.workspaces.read();
+        let workspaces = app_state.workspaces.read();
         let workspace = workspaces.get(&agent.workspace_id).ok_or("Workspace not found")?;
         (agent.workspace_id.clone(), workspace.worktree_path.clone(), agent.session_id.clone(), agent.claude_session_id.clone())
     };
@@ -859,16 +1312,19 @@ async fn send_message_to_agent(
     
     // Save user message to database
     let now = chrono::Utc::now().to_rfc3339();
-    let _ = state.db.insert_message(&session_id, &agent_id, "user", &message, false, &now);
+    let _ = app_state
+        .db
+        .insert_message(&session_id, &agent_id, "user", &message, false, &now);
     
     // Get WebSocket server for broadcasting
-    let ws_server = state.ws_server.clone();
+    let ws_server = app_state.ws_server.clone();
     
     // Run claude with the message in a background thread
     let agent_id_clone = agent_id.clone();
     let message_clone = message.clone();
-    let db = state.db.clone();
+    let db = app_state.db.clone();
     let env_overrides = env_overrides.unwrap_or_default();
+    let requested_permission_mode = normalize_permission_mode(permission_mode.as_deref()).to_string();
     
     std::thread::spawn(move || {
         let claude_path = match find_claude_cli() {
@@ -876,6 +1332,8 @@ async fn send_message_to_agent(
             None => {
                 let msg = AgentMessage {
                     agent_id: agent_id_clone.clone(),
+                    workspace_id: Some(workspace_id.clone()),
+                    role: "system".to_string(),
                     content: "Error: Claude CLI not found".to_string(),
                     is_error: true,
                     timestamp: chrono::Utc::now().to_rfc3339(),
@@ -885,6 +1343,7 @@ async fn send_message_to_agent(
                 if let Some(ws) = &ws_server {
                     ws.broadcast_to_workspace(&workspace_id, &WsResponse::AgentMessage {
                         workspace_id: workspace_id.clone(),
+                        role: "system".to_string(),
                         content: msg.content,
                         is_error: true,
                         timestamp: msg.timestamp,
@@ -894,11 +1353,14 @@ async fn send_message_to_agent(
             }
         };
         
+        let effective_env = build_effective_cli_env(&env_overrides);
+        let (env_summary, env_hint) = auth_env_feedback(&effective_env);
+        let permission_mode = requested_permission_mode.as_str();
+
         // Build command - always use --resume if we have a session
         let mut cmd = Command::new(&claude_path);
         cmd.current_dir(&workspace_path);
-        configure_cli_env(&mut cmd);
-        apply_env_overrides(&mut cmd, &env_overrides);
+        configure_cli_env(&mut cmd, &effective_env);
         
         if let Some(ref claude_sid) = claude_session_id {
             cmd.args([
@@ -907,6 +1369,8 @@ async fn send_message_to_agent(
                 "--output-format",
                 "stream-json",
                 "--include-partial-messages",
+                "--permission-mode",
+                permission_mode,
                 "--resume",
                 claude_sid,
                 "-p",
@@ -919,6 +1383,8 @@ async fn send_message_to_agent(
                 "--output-format",
                 "stream-json",
                 "--include-partial-messages",
+                "--permission-mode",
+                permission_mode,
                 "-p",
                 &message_clone,
             ]);
@@ -940,12 +1406,42 @@ async fn send_message_to_agent(
                     true,
                     "error",
                 );
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    env_summary.clone(),
+                    true,
+                    "error",
+                );
+                if let Some(hint) = env_hint.clone() {
+                    emit_agent_message(
+                        &app,
+                        &db,
+                        &session_id,
+                        &agent_id_clone,
+                        &workspace_id,
+                        &ws_server,
+                        format!("Hint: {}", hint),
+                        true,
+                        "error",
+                    );
+                }
                 return;
             }
         };
 
-        let mut assistant_text = String::new();
-        let mut last_activity = String::new();
+        let mut assistant_delta_text = String::new();
+        let mut latest_assistant_snapshot: Option<String> = None;
+        let mut result_text_fallback: Option<String> = None;
+        let mut tool_names: HashMap<i64, String> = HashMap::new();
+        let mut tool_inputs: HashMap<i64, String> = HashMap::new();
+        let mut known_claude_session_id = claude_session_id.clone();
+        let allow_init_activity = known_claude_session_id.is_none();
+        let mut last_activity: Option<String> = None;
         let mut error_emitted = false;
 
         if let Some(stdout) = child.stdout.take() {
@@ -955,44 +1451,69 @@ async fn send_message_to_agent(
                     continue;
                 }
                 if let Ok(event) = serde_json::from_str::<Value>(&line) {
-                    if let Some(activity) = parse_stream_event_for_activity(&event) {
-                        if activity != last_activity {
-                            last_activity = activity.clone();
-                            emit_agent_message(
-                                &app,
-                                &db,
-                                &session_id,
-                                &agent_id_clone,
-                                &workspace_id,
-                                &ws_server,
-                                activity,
-                                false,
-                                "system",
-                            );
+                    let payload = stream_event_payload(&event);
+                    if let Some(stream_session_id) = extract_stream_session_id(&event) {
+                        if known_claude_session_id.as_deref() != Some(stream_session_id.as_str()) {
+                            known_claude_session_id = Some(stream_session_id.clone());
+                            {
+                                let mut agents = app_state.agents.write();
+                                if let Some(agent) = agents.get_mut(&agent_id_clone) {
+                                    agent.claude_session_id = Some(stream_session_id.clone());
+                                }
+                            }
+                            let _ = db.update_session_claude_id(&session_id, &stream_session_id);
                         }
                     }
 
-                    if event.get("type").and_then(|v| v.as_str()) == Some("content_block_delta") {
-                        if event
+                    for activity in parse_stream_event_for_activity(&event, &mut tool_names, &mut tool_inputs) {
+                        if !allow_init_activity && activity.starts_with("Claude initialized (") {
+                            continue;
+                        }
+                        if last_activity.as_deref() == Some(activity.as_str()) {
+                            continue;
+                        }
+                        emit_agent_message(
+                            &app,
+                            &db,
+                            &session_id,
+                            &agent_id_clone,
+                            &workspace_id,
+                            &ws_server,
+                            activity.clone(),
+                            false,
+                            "system",
+                        );
+                        last_activity = Some(activity);
+                    }
+
+                    if let Some(text) = extract_assistant_message_text(&event) {
+                        latest_assistant_snapshot = Some(text);
+                    }
+
+                    if payload.get("type").and_then(|v| v.as_str()) == Some("content_block_delta") {
+                        if payload
                             .get("delta")
                             .and_then(|d| d.get("type"))
                             .and_then(|v| v.as_str())
                             == Some("text_delta")
                         {
-                            if let Some(chunk) = event
+                            if let Some(chunk) = payload
                                 .get("delta")
                                 .and_then(|d| d.get("text"))
                                 .and_then(|v| v.as_str())
                             {
-                                assistant_text.push_str(chunk);
+                                assistant_delta_text.push_str(chunk);
                             }
                         }
                     }
 
-                    if event.get("type").and_then(|v| v.as_str()) == Some("result") {
-                        let is_error = event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if payload.get("type").and_then(|v| v.as_str()) == Some("result") {
+                        if result_text_fallback.is_none() {
+                            result_text_fallback = extract_result_text(&event);
+                        }
+                        let is_error = payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                         if is_error {
-                            let errors = event
+                            let errors = payload
                                 .get("errors")
                                 .and_then(|v| v.as_array())
                                 .map(|arr| {
@@ -1001,6 +1522,8 @@ async fn send_message_to_agent(
                                         .collect::<Vec<_>>()
                                         .join("\n")
                                 })
+                                .filter(|s| !s.trim().is_empty())
+                                .or_else(|| extract_result_text(&event))
                                 .unwrap_or_else(|| "Claude execution failed".to_string());
                             emit_agent_message(
                                 &app,
@@ -1016,6 +1539,19 @@ async fn send_message_to_agent(
                             error_emitted = true;
                         }
                     }
+                } else {
+                    // Forward non-JSON runtime output so authentication/runtime issues are visible.
+                    emit_agent_message(
+                        &app,
+                        &db,
+                        &session_id,
+                        &agent_id_clone,
+                        &workspace_id,
+                        &ws_server,
+                        format!("cli: {}", line),
+                        false,
+                        "system",
+                    );
                 }
             }
         }
@@ -1044,7 +1580,7 @@ async fn send_message_to_agent(
             }
         };
 
-        if !assistant_text.trim().is_empty() {
+        if let Some(assistant_text) = choose_assistant_text(&assistant_delta_text, latest_assistant_snapshot.as_ref()) {
             emit_agent_message(
                 &app,
                 &db,
@@ -1053,6 +1589,30 @@ async fn send_message_to_agent(
                 &workspace_id,
                 &ws_server,
                 assistant_text,
+                false,
+                "assistant",
+            );
+        } else if let Some(fallback) = result_text_fallback {
+            emit_agent_message(
+                &app,
+                &db,
+                &session_id,
+                &agent_id_clone,
+                &workspace_id,
+                &ws_server,
+                fallback,
+                false,
+                "assistant",
+            );
+        } else if status.success() && !error_emitted {
+            emit_agent_message(
+                &app,
+                &db,
+                &session_id,
+                &agent_id_clone,
+                &workspace_id,
+                &ws_server,
+                "Claude completed without a text response.".to_string(),
                 false,
                 "assistant",
             );
@@ -1075,6 +1635,30 @@ async fn send_message_to_agent(
                 true,
                 "error",
             );
+            emit_agent_message(
+                &app,
+                &db,
+                &session_id,
+                &agent_id_clone,
+                &workspace_id,
+                &ws_server,
+                env_summary.clone(),
+                true,
+                "error",
+            );
+            if let Some(hint) = env_hint {
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    format!("Hint: {}", hint),
+                    true,
+                    "error",
+                );
+            }
         }
     });
     
@@ -1388,6 +1972,10 @@ async fn handle_ws_commands(
 ) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
+            ServerCommand::ClientCountChanged { connected_clients } => {
+                *state.ws_connected_clients.write() = connected_clients;
+                let _ = app.emit("remote-clients-updated", connected_clients);
+            }
             ServerCommand::ListWorkspaces { response_tx } => {
                 let workspaces = state.workspaces.read();
                 let agents = state.agents.read();
@@ -1418,6 +2006,7 @@ async fn handle_ws_commands(
                             .into_iter()
                             .map(|m| MessageInfo {
                                 agent_id: m.agent_id,
+                                role: m.role,
                                 content: m.content,
                                 is_error: m.is_error,
                                 timestamp: m.timestamp,
@@ -1684,7 +2273,12 @@ async fn handle_ws_commands(
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
             
-            ServerCommand::SendMessage { workspace_id, message, response_tx: _ } => {
+            ServerCommand::SendMessage {
+                workspace_id,
+                message,
+                permission_mode,
+                response_tx: _,
+            } => {
                 // Find agent for workspace
                 let agent_id = {
                     let agents = state.agents.read();
@@ -1718,14 +2312,21 @@ async fn handle_ws_commands(
                         let ws_server = state.ws_server.clone();
                         let db = state.db.clone();
                         let app_clone = app.clone();
+                        let app_state_clone = state.clone();
                         let workspace_id_clone = workspace_id.clone();
                         let agent_id_clone = agent_id.clone();
+                        let env_overrides: HashMap<String, String> = HashMap::new();
+                        let requested_permission_mode =
+                            normalize_permission_mode(permission_mode.as_deref()).to_string();
                         
                         std::thread::spawn(move || {
                             if let Some(claude_path) = find_claude_cli() {
                                 let mut cmd = Command::new(&claude_path);
                                 cmd.current_dir(&workspace_path);
-                                configure_cli_env(&mut cmd);
+                                let effective_env = build_effective_cli_env(&env_overrides);
+                                let (env_summary, env_hint) = auth_env_feedback(&effective_env);
+                                let permission_mode = requested_permission_mode.as_str();
+                                configure_cli_env(&mut cmd, &effective_env);
                                 
                                 if let Some(ref claude_sid) = claude_session_id {
                                     cmd.args([
@@ -1734,6 +2335,8 @@ async fn handle_ws_commands(
                                         "--output-format",
                                         "stream-json",
                                         "--include-partial-messages",
+                                        "--permission-mode",
+                                        permission_mode,
                                         "--resume",
                                         claude_sid,
                                         "-p",
@@ -1746,6 +2349,8 @@ async fn handle_ws_commands(
                                         "--output-format",
                                         "stream-json",
                                         "--include-partial-messages",
+                                        "--permission-mode",
+                                        permission_mode,
                                         "-p",
                                         &message,
                                     ]);
@@ -1767,12 +2372,42 @@ async fn handle_ws_commands(
                                             true,
                                             "error",
                                         );
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            env_summary.clone(),
+                                            true,
+                                            "error",
+                                        );
+                                        if let Some(hint) = env_hint.clone() {
+                                            emit_agent_message(
+                                                &app_clone,
+                                                &db,
+                                                &session_id,
+                                                &agent_id_clone,
+                                                &workspace_id_clone,
+                                                &ws_server,
+                                                format!("Hint: {}", hint),
+                                                true,
+                                                "error",
+                                            );
+                                        }
                                         return;
                                     }
                                 };
 
-                                let mut assistant_text = String::new();
-                                let mut last_activity = String::new();
+                                let mut assistant_delta_text = String::new();
+                                let mut latest_assistant_snapshot: Option<String> = None;
+                                let mut result_text_fallback: Option<String> = None;
+                                let mut tool_names: HashMap<i64, String> = HashMap::new();
+                                let mut tool_inputs: HashMap<i64, String> = HashMap::new();
+                                let mut known_claude_session_id = claude_session_id.clone();
+                                let allow_init_activity = known_claude_session_id.is_none();
+                                let mut last_activity: Option<String> = None;
                                 let mut error_emitted = false;
 
                                 if let Some(stdout) = child.stdout.take() {
@@ -1782,39 +2417,75 @@ async fn handle_ws_commands(
                                             continue;
                                         }
                                         if let Ok(event) = serde_json::from_str::<Value>(&line) {
-                                            if let Some(activity) = parse_stream_event_for_activity(&event) {
-                                                if activity != last_activity {
-                                                    last_activity = activity.clone();
-                                                    emit_agent_message(
-                                                        &app_clone,
-                                                        &db,
+                                            let payload = stream_event_payload(&event);
+                                            if let Some(stream_session_id) = extract_stream_session_id(&event) {
+                                                if known_claude_session_id.as_deref()
+                                                    != Some(stream_session_id.as_str())
+                                                {
+                                                    known_claude_session_id = Some(stream_session_id.clone());
+                                                    {
+                                                        let mut agents = app_state_clone.agents.write();
+                                                        if let Some(agent) = agents.get_mut(&agent_id_clone) {
+                                                            agent.claude_session_id = Some(stream_session_id.clone());
+                                                        }
+                                                    }
+                                                    let _ = db.update_session_claude_id(
                                                         &session_id,
-                                                        &agent_id_clone,
-                                                        &workspace_id_clone,
-                                                        &ws_server,
-                                                        activity,
-                                                        false,
-                                                        "system",
+                                                        &stream_session_id,
                                                     );
                                                 }
                                             }
 
-                                            if event.get("type").and_then(|v| v.as_str()) == Some("content_block_delta")
-                                                && event.get("delta").and_then(|d| d.get("type")).and_then(|v| v.as_str())
+                                            for activity in parse_stream_event_for_activity(
+                                                &event,
+                                                &mut tool_names,
+                                                &mut tool_inputs,
+                                            ) {
+                                                if !allow_init_activity
+                                                    && activity.starts_with("Claude initialized (")
+                                                {
+                                                    continue;
+                                                }
+                                                if last_activity.as_deref() == Some(activity.as_str()) {
+                                                    continue;
+                                                }
+                                                emit_agent_message(
+                                                    &app_clone,
+                                                    &db,
+                                                    &session_id,
+                                                    &agent_id_clone,
+                                                    &workspace_id_clone,
+                                                    &ws_server,
+                                                    activity.clone(),
+                                                    false,
+                                                    "system",
+                                                );
+                                                last_activity = Some(activity);
+                                            }
+
+                                            if let Some(text) = extract_assistant_message_text(&event) {
+                                                latest_assistant_snapshot = Some(text);
+                                            }
+
+                                            if payload.get("type").and_then(|v| v.as_str()) == Some("content_block_delta")
+                                                && payload.get("delta").and_then(|d| d.get("type")).and_then(|v| v.as_str())
                                                     == Some("text_delta")
                                             {
                                                 if let Some(chunk) =
-                                                    event.get("delta").and_then(|d| d.get("text")).and_then(|v| v.as_str())
+                                                    payload.get("delta").and_then(|d| d.get("text")).and_then(|v| v.as_str())
                                                 {
-                                                    assistant_text.push_str(chunk);
+                                                    assistant_delta_text.push_str(chunk);
                                                 }
                                             }
 
-                                            if event.get("type").and_then(|v| v.as_str()) == Some("result") {
+                                            if payload.get("type").and_then(|v| v.as_str()) == Some("result") {
+                                                if result_text_fallback.is_none() {
+                                                    result_text_fallback = extract_result_text(&event);
+                                                }
                                                 let is_error =
-                                                    event.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                                                    payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                                                 if is_error {
-                                                    let errors = event
+                                                    let errors = payload
                                                         .get("errors")
                                                         .and_then(|v| v.as_array())
                                                         .map(|arr| {
@@ -1823,6 +2494,8 @@ async fn handle_ws_commands(
                                                                 .collect::<Vec<_>>()
                                                                 .join("\n")
                                                         })
+                                                        .filter(|s| !s.trim().is_empty())
+                                                        .or_else(|| extract_result_text(&event))
                                                         .unwrap_or_else(|| "Claude execution failed".to_string());
                                                     emit_agent_message(
                                                         &app_clone,
@@ -1838,6 +2511,18 @@ async fn handle_ws_commands(
                                                     error_emitted = true;
                                                 }
                                             }
+                                        } else {
+                                            emit_agent_message(
+                                                &app_clone,
+                                                &db,
+                                                &session_id,
+                                                &agent_id_clone,
+                                                &workspace_id_clone,
+                                                &ws_server,
+                                                format!("cli: {}", line),
+                                                false,
+                                                "system",
+                                            );
                                         }
                                     }
                                 }
@@ -1866,7 +2551,9 @@ async fn handle_ws_commands(
                                     }
                                 };
 
-                                if !assistant_text.trim().is_empty() {
+                                if let Some(assistant_text) =
+                                    choose_assistant_text(&assistant_delta_text, latest_assistant_snapshot.as_ref())
+                                {
                                     emit_agent_message(
                                         &app_clone,
                                         &db,
@@ -1875,6 +2562,30 @@ async fn handle_ws_commands(
                                         &workspace_id_clone,
                                         &ws_server,
                                         assistant_text,
+                                        false,
+                                        "assistant",
+                                    );
+                                } else if let Some(fallback) = result_text_fallback {
+                                    emit_agent_message(
+                                        &app_clone,
+                                        &db,
+                                        &session_id,
+                                        &agent_id_clone,
+                                        &workspace_id_clone,
+                                        &ws_server,
+                                        fallback,
+                                        false,
+                                        "assistant",
+                                    );
+                                } else if status.success() && !error_emitted {
+                                    emit_agent_message(
+                                        &app_clone,
+                                        &db,
+                                        &session_id,
+                                        &agent_id_clone,
+                                        &workspace_id_clone,
+                                        &ws_server,
+                                        "Claude completed without a text response.".to_string(),
                                         false,
                                         "assistant",
                                     );
@@ -1897,6 +2608,30 @@ async fn handle_ws_commands(
                                         true,
                                         "error",
                                     );
+                                    emit_agent_message(
+                                        &app_clone,
+                                        &db,
+                                        &session_id,
+                                        &agent_id_clone,
+                                        &workspace_id_clone,
+                                        &ws_server,
+                                        env_summary.clone(),
+                                        true,
+                                        "error",
+                                    );
+                                    if let Some(hint) = env_hint {
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            format!("Hint: {}", hint),
+                                            true,
+                                            "error",
+                                        );
+                                    }
                                 }
                             }
                         });
@@ -2115,6 +2850,7 @@ pub fn run() {
             list_workspaces,
             create_workspace,
             remove_workspace,
+            rename_workspace,
             list_agents,
             start_agent,
             stop_agent,
@@ -2125,7 +2861,60 @@ pub fn run() {
             read_workspace_file,
             list_workspace_changes,
             run_workspace_checks,
+            run_workspace_terminal_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_permission_mode_defaults_to_bypass() {
+        assert_eq!(normalize_permission_mode(None), "bypassPermissions");
+        assert_eq!(
+            normalize_permission_mode(Some("bypassPermissions")),
+            "bypassPermissions"
+        );
+        assert_eq!(normalize_permission_mode(Some("plan")), "plan");
+    }
+
+    #[test]
+    fn choose_assistant_text_prefers_more_complete_snapshot() {
+        let delta = "I'll explore";
+        let snapshot = Some("I'll explore the person package and create a comprehensive overview.".to_string());
+        assert_eq!(
+            choose_assistant_text(delta, snapshot.as_ref()),
+            Some("I'll explore the person package and create a comprehensive overview.".to_string())
+        );
+    }
+
+    #[test]
+    fn summarize_tool_task_uses_description() {
+        let input = r#"{"description":"Explore person package structure","prompt":"..."}"#;
+        assert_eq!(
+            summarize_tool_call("Task", input),
+            Some("Task Explore person package structure".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_init_activity_includes_permission_mode() {
+        let event = json!({
+            "type": "system",
+            "subtype": "init",
+            "model": "claude-sonnet-4-6",
+            "permissionMode": "plan"
+        });
+        let mut tool_names = HashMap::new();
+        let mut tool_inputs = HashMap::new();
+        let activities = parse_stream_event_for_activity(&event, &mut tool_names, &mut tool_inputs);
+        assert_eq!(
+            activities,
+            vec!["Claude initialized (claude-sonnet-4-6, permission=plan)".to_string()]
+        );
+    }
 }

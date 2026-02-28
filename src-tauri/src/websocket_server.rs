@@ -36,7 +36,7 @@ pub enum WsMessage {
     RunChecks { workspace_id: String },
     Subscribe { workspace_id: String },
     Unsubscribe { workspace_id: String },
-    SendMessage { workspace_id: String, message: String },
+    SendMessage { workspace_id: String, message: String, permission_mode: Option<String> },
     StartAgent { workspace_id: String },
     StopAgent { workspace_id: String },
 }
@@ -81,6 +81,7 @@ pub enum WsResponse {
     },
     AgentMessage {
         workspace_id: String,
+        role: String,
         content: String,
         is_error: bool,
         timestamp: String,
@@ -109,6 +110,7 @@ pub struct WorkspaceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageInfo {
     pub agent_id: String,
+    pub role: String,
     pub content: String,
     pub is_error: bool,
     pub timestamp: String,
@@ -142,7 +144,12 @@ pub struct CheckInfo {
 
 // Commands from WebSocket to main app
 pub enum ServerCommand {
-    SendMessage { workspace_id: String, message: String, response_tx: mpsc::UnboundedSender<String> },
+    SendMessage {
+        workspace_id: String,
+        message: String,
+        permission_mode: Option<String>,
+        response_tx: mpsc::UnboundedSender<String>,
+    },
     StartAgent { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     StopAgent { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     ListWorkspaces { response_tx: mpsc::UnboundedSender<String> },
@@ -151,6 +158,7 @@ pub enum ServerCommand {
     ReadFile { workspace_id: String, relative_path: String, max_bytes: Option<usize>, response_tx: mpsc::UnboundedSender<String> },
     ListChanges { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     RunChecks { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
+    ClientCountChanged { connected_clients: usize },
 }
 
 impl WebSocketServer {
@@ -245,6 +253,10 @@ async fn handle_connection(
                 sender: tx.clone(),
             },
         );
+    }
+    {
+        let connected_clients = clients.read().len();
+        let _ = message_tx.send(ServerCommand::ClientCountChanged { connected_clients });
     }
 
     // Send welcome message
@@ -361,11 +373,16 @@ async fn handle_connection(
                             let _ = tx.send(serde_json::to_string(&response).unwrap());
                         }
                         
-                        WsMessage::SendMessage { workspace_id, message } => {
+                        WsMessage::SendMessage {
+                            workspace_id,
+                            message,
+                            permission_mode,
+                        } => {
                             let (response_tx, mut response_rx) = mpsc::unbounded_channel();
                             if message_tx.send(ServerCommand::SendMessage { 
                                 workspace_id, 
                                 message,
+                                permission_mode,
                                 response_tx 
                             }).is_ok() {
                                 // Response will come via broadcast
@@ -422,6 +439,10 @@ async fn handle_connection(
     {
         let mut clients = clients.write();
         clients.remove(&client_id);
+    }
+    {
+        let connected_clients = clients.read().len();
+        let _ = message_tx.send(ServerCommand::ClientCountChanged { connected_clients });
     }
     
     send_task.abort();
