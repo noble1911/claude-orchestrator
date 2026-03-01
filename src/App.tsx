@@ -144,14 +144,6 @@ type ChatRow =
   | { kind: "message"; id: string; message: AgentMessage }
   | { kind: "activity"; id: string; group: ActivityGroup };
 
-interface ChangeTreeNode {
-  name: string;
-  path: string;
-  isDir: boolean;
-  change?: WorkspaceChangeEntry;
-  children: ChangeTreeNode[];
-}
-
 function compactActivityLines(messages: AgentMessage[]): ActivityLine[] {
   const lines: ActivityLine[] = [];
 
@@ -174,74 +166,6 @@ function compactActivityLines(messages: AgentMessage[]): ActivityLine[] {
 function shortText(value: string, maxLength = 120): string {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, maxLength)}...`;
-}
-
-function buildChangeTree(changes: WorkspaceChangeEntry[]): ChangeTreeNode[] {
-  type MutableNode = {
-    name: string;
-    path: string;
-    isDir: boolean;
-    change?: WorkspaceChangeEntry;
-    children: Map<string, MutableNode>;
-  };
-
-  const root: MutableNode = {
-    name: "",
-    path: "",
-    isDir: true,
-    children: new Map(),
-  };
-
-  for (const change of changes) {
-    const parts = change.path.split("/").filter(Boolean);
-    if (parts.length === 0) continue;
-
-    let current = root;
-    let currentPath = "";
-
-    for (let idx = 0; idx < parts.length; idx += 1) {
-      const part = parts[idx];
-      currentPath = currentPath ? `${currentPath}/${part}` : part;
-      const isLeaf = idx === parts.length - 1;
-
-      let child = current.children.get(part);
-      if (!child) {
-        child = {
-          name: part,
-          path: currentPath,
-          isDir: !isLeaf,
-          children: new Map(),
-        };
-        current.children.set(part, child);
-      }
-
-      if (isLeaf) {
-        child.isDir = false;
-        child.change = change;
-      } else {
-        child.isDir = true;
-      }
-
-      current = child;
-    }
-  }
-
-  const toImmutableNodes = (nodeMap: Map<string, MutableNode>): ChangeTreeNode[] => {
-    return Array.from(nodeMap.values())
-      .map((node) => ({
-        name: node.name,
-        path: node.path,
-        isDir: node.isDir,
-        change: node.change,
-        children: toImmutableNodes(node.children),
-      }))
-      .sort((a, b) => {
-        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      });
-  };
-
-  return toImmutableNodes(root.children);
 }
 
 function toWorkspaceRelativePath(absolutePath: string, workspaceRoot: string): string | null {
@@ -430,7 +354,6 @@ function App() {
   const [centerTabs, setCenterTabs] = useState<CenterTab[]>([{ id: "chat", type: "chat", title: "Chat" }]);
   const [activeCenterTabId, setActiveCenterTabId] = useState("chat");
   const [workspaceChanges, setWorkspaceChanges] = useState<WorkspaceChangeEntry[]>([]);
-  const [expandedChangePaths, setExpandedChangePaths] = useState<Set<string>>(new Set([""]));
   const [isLoadingChanges, setIsLoadingChanges] = useState(false);
   const [checkResults, setCheckResults] = useState<WorkspaceCheckResult[]>([]);
   const [detectedChecks, setDetectedChecks] = useState<WorkspaceCheckDefinition[]>([]);
@@ -767,7 +690,6 @@ function App() {
       setCenterTabs([{ id: "chat", type: "chat", title: "Chat" }]);
       setActiveCenterTabId("chat");
       setWorkspaceChanges([]);
-      setExpandedChangePaths(new Set([""]));
       setCheckResults([]);
       setDetectedChecks([]);
       setTerminalInput("");
@@ -785,7 +707,6 @@ function App() {
     setCenterTabs([{ id: "chat", type: "chat", title: "Chat" }]);
     setActiveCenterTabId("chat");
     setWorkspaceChanges([]);
-    setExpandedChangePaths(new Set([""]));
     setCheckResults([]);
     setDetectedChecks([]);
     setTerminalInput("");
@@ -1736,19 +1657,6 @@ function App() {
     return "md-text-muted";
   }
 
-  function toggleChangeDirectory(path: string) {
-    const isExpanded = expandedChangePaths.has(path);
-    setExpandedChangePaths((prev) => {
-      const next = new Set(prev);
-      if (isExpanded) {
-        next.delete(path);
-      } else {
-        next.add(path);
-      }
-      return next;
-    });
-  }
-
   async function openChangedFile(change: WorkspaceChangeEntry) {
     if (!selectedWorkspace) return;
 
@@ -1799,65 +1707,6 @@ function App() {
       return "md-text-muted";
     }
     return "md-text-primary";
-  }
-
-  function renderChangeTree(nodes: ChangeTreeNode[], depth: number) {
-    return nodes.map((node) => {
-      const isExpanded = expandedChangePaths.has(node.path);
-      if (node.isDir) {
-        return (
-          <div key={`dir-${node.path}`}>
-            <button
-              onClick={() => toggleChangeDirectory(node.path)}
-              className="flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
-              style={{ paddingLeft: `${depth * 14 + 8}px` }}
-            >
-              <span className="w-3 md-text-muted">{isExpanded ? "▾" : "▸"}</span>
-              <span className="material-symbols-rounded !text-base md-text-primary">
-                {isExpanded ? "folder_open" : "folder"}
-              </span>
-              <span className="truncate">{node.name}</span>
-            </button>
-            {isExpanded && node.children.length > 0 && renderChangeTree(node.children, depth + 1)}
-          </div>
-        );
-      }
-
-      const change = node.change;
-      if (!change) return <div key={`file-${node.path}`} />;
-      const statusLabel = normalizeChangeStatus(change.status);
-
-      return (
-        <div key={`file-${node.path}`}>
-          <button
-            onClick={() => {
-              void openChangedFile(change);
-            }}
-            className={`flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle ${
-              activeCenterTabId === `diff:${change.status}:${change.oldPath ?? ""}:${change.path}`
-                ? "md-surface-strong md-text-strong"
-                : "md-text-secondary"
-            }`}
-            style={{ paddingLeft: `${depth * 14 + 8}px` }}
-          >
-            <span className="w-3 md-text-muted"> </span>
-            <span className="material-symbols-rounded !text-base md-text-dim">description</span>
-            <span className="truncate">{node.name}</span>
-            <span className={`ml-auto w-8 flex-none text-right font-mono text-[11px] ${getChangeStatusClass(change.status)}`}>
-              {statusLabel}
-            </span>
-          </button>
-          {change.oldPath && (
-            <p
-              className="truncate pl-7 text-[11px] md-text-muted"
-              style={{ paddingLeft: `${depth * 14 + 34}px` }}
-            >
-              from: {change.oldPath}
-            </p>
-          )}
-        </div>
-      );
-    });
   }
 
   function renderFileTree(path: string, depth: number) {
@@ -2021,7 +1870,15 @@ function App() {
     flushSystemBuffer();
     return rows;
   }, [workspaceMessages]);
-  const changeTreeNodes = useMemo(() => buildChangeTree(workspaceChanges), [workspaceChanges]);
+  const sortedWorkspaceChanges = useMemo(
+    () =>
+      [...workspaceChanges].sort((a, b) => {
+        const byPath = a.path.localeCompare(b.path);
+        if (byPath !== 0) return byPath;
+        return a.status.localeCompare(b.status);
+      }),
+    [workspaceChanges],
+  );
   if (isLoading) {
     return (
       <div className="md-surface flex h-screen items-center justify-center md-text-primary">
@@ -2856,31 +2713,55 @@ function App() {
             <div className="space-y-2 text-sm">
               <p className="md-label-medium">Workspace Changes</p>
               <div className="md-card p-3 md-text-secondary">
-              <div className="mb-2 flex items-center justify-between">
-                <span className="md-text-secondary">Git status</span>
-                <button
-                  onClick={() => selectedWorkspace && loadWorkspaceChanges(selectedWorkspace)}
-                  className="md-btn"
-                >
-                  Refresh
-                </button>
-              </div>
-              <p className="truncate text-xs md-text-muted">
-                {currentWorkspace?.worktreePath || currentRepo?.path || "No active workspace"}
-              </p>
-
-              {isLoadingChanges && <p className="md-text-muted">Loading changes...</p>}
-              {!isLoadingChanges && workspaceChanges.length === 0 && (
-                <p className="md-text-muted">Working tree is clean.</p>
-              )}
-              {!isLoadingChanges && workspaceChanges.length > 0 && (
-                <div className="mt-3">
-                  {renderChangeTree(changeTreeNodes, 0)}
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="md-text-secondary">Changed files ({workspaceChanges.length})</span>
+                  <button
+                    onClick={() => selectedWorkspace && loadWorkspaceChanges(selectedWorkspace)}
+                    className="md-btn"
+                  >
+                    Refresh
+                  </button>
                 </div>
-              )}
+                <p className="truncate text-xs md-text-muted">
+                  {currentWorkspace?.worktreePath || currentRepo?.path || "No active workspace"}
+                </p>
+
+                {isLoadingChanges && <p className="md-text-muted">Loading changes...</p>}
+                {!isLoadingChanges && workspaceChanges.length === 0 && (
+                  <p className="md-text-muted">Working tree is clean.</p>
+                )}
+                {!isLoadingChanges && workspaceChanges.length > 0 && (
+                  <div className="mt-3 max-h-[52vh] space-y-1 overflow-auto pr-1">
+                    {sortedWorkspaceChanges.map((change) => {
+                      const tabId = `diff:${change.status}:${change.oldPath ?? ""}:${change.path}`;
+                      const isActive = activeCenterTabId === tabId;
+                      return (
+                        <div key={`${change.status}:${change.oldPath ?? ""}:${change.path}`}>
+                          <button
+                            onClick={() => {
+                              void openChangedFile(change);
+                            }}
+                            className={`flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle ${
+                              isActive ? "md-surface-strong md-text-strong" : "md-text-secondary"
+                            }`}
+                          >
+                            <span className="material-symbols-rounded !text-base md-text-dim">description</span>
+                            <span className="truncate">{change.path}</span>
+                            <span className={`ml-auto w-8 flex-none text-right font-mono text-[11px] ${getChangeStatusClass(change.status)}`}>
+                              {normalizeChangeStatus(change.status)}
+                            </span>
+                          </button>
+                          {change.oldPath && (
+                            <p className="truncate pl-7 text-[11px] md-text-muted">from: {change.oldPath}</p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
-              <p className="text-xs md-text-muted">Click a changed file to open a diff tab in the center pane.</p>
+              <p className="text-xs md-text-muted">Click any file here to open its diff in the center pane.</p>
             </div>
           )}
 

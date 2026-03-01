@@ -125,6 +125,7 @@ const MODEL_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "sonnet", label: "Sonnet" },
   { value: "haiku", label: "Haiku" },
 ];
+const THINKING_LEVELS: Array<"off" | "low" | "medium" | "high"> = ["off", "low", "medium", "high"];
 const DRAWER_ANIMATION_MS = 220;
 const NAME_ADJECTIVES = ["swift", "brisk", "neat", "solid", "lively", "calm", "bold", "quiet"];
 const NAME_NOUNS = ["otter", "falcon", "maple", "harbor", "comet", "forest", "breeze", "ember"];
@@ -223,6 +224,7 @@ function App() {
   const [fileEntries, setFileEntries] = useState<FileEntryInfo[]>([]);
   const [selectedFilePath, setSelectedFilePath] = useState("");
   const [selectedFileContent, setSelectedFileContent] = useState("");
+  const [loadingChangedFilePath, setLoadingChangedFilePath] = useState<string | null>(null);
   const [changes, setChanges] = useState<ChangeInfo[]>([]);
   const [checks, setChecks] = useState<CheckInfo[]>([]);
   const [promptShortcuts, setPromptShortcuts] = useState<PromptShortcut[]>([]);
@@ -320,6 +322,10 @@ function App() {
   const expandedActivityIds = selectedWorkspaceId
     ? expandedActivityIdsByWorkspace[selectedWorkspaceId] || []
     : [];
+  const selectedModelLabel = useMemo(
+    () => MODEL_OPTIONS.find((model) => model.value === selectedModel)?.label ?? "Opus",
+    [selectedModel],
+  );
   const chatRows = useMemo<ChatRow[]>(() => {
     const rows: ChatRow[] = [];
     let systemBuffer: MessageInfo[] = [];
@@ -361,6 +367,15 @@ function App() {
     flushSystemBuffer();
     return rows;
   }, [currentMessages]);
+  const sortedChanges = useMemo(
+    () =>
+      [...changes].sort((a, b) => {
+        const byPath = a.path.localeCompare(b.path);
+        if (byPath !== 0) return byPath;
+        return a.status.localeCompare(b.status);
+      }),
+    [changes],
+  );
 
   useEffect(() => {
     return () => {
@@ -538,6 +553,7 @@ function App() {
         if (parsed.workspace_id !== selectedWorkspaceId) return;
         setSelectedFilePath(parsed.path);
         setSelectedFileContent(parsed.content || "");
+        setLoadingChangedFilePath((prev) => (prev === parsed.path ? null : prev));
         return;
       }
 
@@ -565,6 +581,7 @@ function App() {
         setFilesLoading(false);
         setChangesLoading(false);
         setChecksRunning(false);
+        setLoadingChangedFilePath(null);
         setStatusText(parsed.message || "Request failed");
       }
     };
@@ -752,6 +769,19 @@ function App() {
     });
   }
 
+  function openChangedFile(change: ChangeInfo) {
+    if (!selectedWorkspaceId) return;
+    setSelectedFilePath(change.path);
+    setSelectedFileContent("");
+    setLoadingChangedFilePath(change.path);
+    sendJson({
+      type: "read_file",
+      workspace_id: selectedWorkspaceId,
+      relative_path: change.path,
+      max_bytes: 120000,
+    });
+  }
+
   function runChecks() {
     if (!selectedWorkspaceId || checksRunning) return;
     setChecksRunning(true);
@@ -777,6 +807,26 @@ function App() {
       const current = prev[selectedWorkspaceId] || [];
       if (current.includes(timestamp)) return prev;
       return { ...prev, [selectedWorkspaceId]: [...current, timestamp] };
+    });
+  }
+
+  function cycleModel() {
+    setSelectedModel((prev) => {
+      const index = MODEL_OPTIONS.findIndex((model) => model.value === prev);
+      if (index < 0) return MODEL_OPTIONS[0].value;
+      return MODEL_OPTIONS[(index + 1) % MODEL_OPTIONS.length].value;
+    });
+  }
+
+  function cycleMode() {
+    setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"));
+  }
+
+  function cycleThinking() {
+    setThinkingMode((prev) => {
+      const index = THINKING_LEVELS.indexOf(prev);
+      if (index < 0) return "off";
+      return THINKING_LEVELS[(index + 1) % THINKING_LEVELS.length];
     });
   }
 
@@ -913,53 +963,32 @@ function App() {
           }}
         />
 
-        <View style={styles.inputRow}>
-          <TextInput
-            value={input}
-            onChangeText={setInput}
-            style={styles.messageInput}
-            placeholder="Ask to make changes..."
-            placeholderTextColor="#7a7a7a"
-            multiline
-          />
-          <TouchableOpacity style={styles.sendButton} onPress={() => sendMessage()}>
-            <Text style={styles.sendButtonText}>Send</Text>
-          </TouchableOpacity>
-        </View>
-        <View style={styles.composerOptionsRow}>
-          <View style={styles.optionGroup}>
-            {MODEL_OPTIONS.map((model) => (
-              <TouchableOpacity
-                key={model.value}
-                style={[styles.optionChip, selectedModel === model.value && styles.optionChipActive]}
-                onPress={() => setSelectedModel(model.value)}
-              >
-                <Text style={[styles.optionChipText, selectedModel === model.value && styles.optionChipTextActive]}>
-                  {model.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-          <View style={styles.optionGroup}>
+        <View style={styles.composerCard}>
+          <View style={styles.inputRow}>
+            <TextInput
+              value={input}
+              onChangeText={setInput}
+              style={styles.messageInput}
+              placeholder="Ask to make changes..."
+              placeholderTextColor="#7a7a7a"
+              multiline
+            />
             <TouchableOpacity
-              style={[styles.optionChip, claudeMode === "plan" && styles.optionChipActive]}
-              onPress={() => setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"))}
+              style={[styles.sendButton, !input.trim() ? styles.sendButtonDisabled : null]}
+              onPress={() => sendMessage()}
             >
-              <Text style={[styles.optionChipText, claudeMode === "plan" && styles.optionChipTextActive]}>
-                {claudeMode === "plan" ? "Plan" : "Normal"}
-              </Text>
+              <Text style={styles.sendButtonText}>➤</Text>
             </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.optionChip, thinkingMode !== "off" && styles.optionChipActive]}
-              onPress={() =>
-                setThinkingMode((prev) =>
-                  prev === "off" ? "low" : prev === "low" ? "medium" : prev === "medium" ? "high" : "off",
-                )
-              }
-            >
-              <Text style={[styles.optionChipText, thinkingMode !== "off" && styles.optionChipTextActive]}>
-                Think {thinkingMode}
-              </Text>
+          </View>
+          <View style={styles.composerMetaRow}>
+            <TouchableOpacity style={styles.metaChip} onPress={cycleModel}>
+              <Text style={styles.metaChipText}>Model {selectedModelLabel}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.metaChip} onPress={cycleMode}>
+              <Text style={styles.metaChipText}>{claudeMode === "plan" ? "Plan on" : "Plan off"}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.metaChip} onPress={cycleThinking}>
+              <Text style={styles.metaChipText}>Think {thinkingMode}</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -1253,16 +1282,43 @@ function App() {
                       <Text style={styles.secondaryButtonText}>Refresh</Text>
                     </TouchableOpacity>
                   </View>
+                  <Text style={styles.pathText}>Changed files ({changes.length})</Text>
                   {changesLoading ? <Text style={styles.drawerText}>Loading changes...</Text> : null}
-                  <ScrollView>
+                  <ScrollView style={styles.changesList}>
                     {changes.length === 0 ? <Text style={styles.drawerText}>No local changes.</Text> : null}
-                    {changes.map((c, idx) => (
-                      <View key={`${c.path}-${idx}`} style={styles.changeItem}>
-                        <Text style={styles.changeStatus}>{c.status}</Text>
-                        <Text style={styles.changePath}>{c.path}</Text>
-                      </View>
-                    ))}
+                    {sortedChanges.map((c, idx) => {
+                      const isSelected = selectedFilePath === c.path;
+                      return (
+                        <View key={`${c.path}-${idx}`}>
+                          <TouchableOpacity
+                            style={[styles.changeItem, isSelected ? styles.changeItemActive : null]}
+                            onPress={() => openChangedFile(c)}
+                          >
+                            <Text style={styles.changePath} numberOfLines={1}>
+                              {c.path}
+                            </Text>
+                            <Text style={styles.changeStatus}>{c.status}</Text>
+                          </TouchableOpacity>
+                          {c.old_path ? (
+                            <Text style={styles.changeOldPath} numberOfLines={1}>
+                              from: {c.old_path}
+                            </Text>
+                          ) : null}
+                        </View>
+                      );
+                    })}
                   </ScrollView>
+                  {loadingChangedFilePath ? (
+                    <Text style={styles.drawerText}>Loading {loadingChangedFilePath}...</Text>
+                  ) : null}
+                  {!!selectedFilePath && rightTab === "changes" && (
+                    <>
+                      <Text style={styles.fileTitle}>{selectedFilePath}</Text>
+                      <ScrollView style={styles.fileContentBox}>
+                        <Text style={styles.fileContentText}>{selectedFileContent}</Text>
+                      </ScrollView>
+                    </>
+                  )}
                 </>
               )}
               {rightTab === "checks" && (
@@ -1379,41 +1435,59 @@ const styles = StyleSheet.create({
   questionOptionDisabled: { opacity: 0.5 },
   questionOptionText: { color: "#d8d0c8", fontSize: 12 },
   questionHint: { color: "#9a9088", fontSize: 12, marginTop: 2 },
-  inputRow: { flexDirection: "row", padding: 10, gap: 8, borderTopWidth: 1, borderTopColor: "#2b2623" },
-  messageInput: {
-    flex: 1,
-    minHeight: 42,
-    maxHeight: 120,
-    borderWidth: 1,
-    borderColor: "#3a332f",
-    borderRadius: 8,
-    backgroundColor: "#1c1815",
-    color: "#e6e0da",
-    paddingHorizontal: 10,
-    paddingTop: 10,
-  },
-  sendButton: { alignSelf: "flex-end", backgroundColor: "#2b5d8a", borderRadius: 8, paddingHorizontal: 14, paddingVertical: 10 },
-  sendButtonText: { color: "#fff", fontWeight: "600" },
-  composerOptionsRow: {
+  composerCard: {
     borderTopWidth: 1,
     borderTopColor: "#2b2623",
     paddingHorizontal: 10,
+    paddingTop: 9,
     paddingBottom: 8,
-    paddingTop: 6,
+    backgroundColor: "#15110f",
     gap: 8,
   },
-  optionGroup: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  optionChip: {
+  inputRow: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
+  messageInput: {
+    flex: 1,
+    minHeight: 40,
+    maxHeight: 120,
     borderWidth: 1,
-    borderColor: "#464039",
-    borderRadius: 999,
+    borderColor: "#3a332f",
+    borderRadius: 12,
+    backgroundColor: "#1c1815",
+    color: "#e6e0da",
     paddingHorizontal: 10,
-    paddingVertical: 5,
+    paddingTop: 9,
+    paddingBottom: 9,
+    fontSize: 14,
+  },
+  sendButton: {
+    alignSelf: "flex-end",
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "#2b5d8a",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "#3a6f9d",
+  },
+  sendButtonDisabled: {
+    opacity: 0.55,
+  },
+  sendButtonText: { color: "#fff", fontWeight: "700", fontSize: 14, marginLeft: 1 },
+  composerMetaRow: {
+    flexDirection: "row",
+    gap: 6,
+    flexWrap: "wrap",
+  },
+  metaChip: {
+    borderWidth: 1,
+    borderColor: "#3f3832",
+    borderRadius: 999,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
     backgroundColor: "#1b1714",
   },
-  optionChipActive: { borderColor: "#7a6d62", backgroundColor: "#2a2320" },
-  optionChipText: { color: "#b8aea7", fontSize: 11 },
-  optionChipTextActive: { color: "#eee7e1" },
+  metaChipText: { color: "#beb4ac", fontSize: 11, fontWeight: "600" },
   overlay: { ...StyleSheet.absoluteFillObject, zIndex: 30 },
   backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.5)" },
   leftDrawer: {
@@ -1543,9 +1617,23 @@ const styles = StyleSheet.create({
   fileTitle: { color: "#ece8e4", fontSize: 12, fontWeight: "600", marginBottom: 6 },
   fileContentBox: { maxHeight: 220, borderWidth: 1, borderColor: "#2f2925", borderRadius: 6, backgroundColor: "#161311", padding: 8 },
   fileContentText: { color: "#c7beb7", fontSize: 12, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
-  changeItem: { paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: "#2b2623" },
-  changeStatus: { color: "#dfc27d", fontSize: 12, marginBottom: 2 },
-  changePath: { color: "#ddd4cd", fontSize: 12 },
+  changesList: { maxHeight: 250, marginBottom: 8 },
+  changeItem: {
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+    borderWidth: 1,
+    borderColor: "#2f2925",
+    borderRadius: 8,
+    backgroundColor: "#171411",
+    marginBottom: 6,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  changeItemActive: { borderColor: "#5a4f47", backgroundColor: "#221d19" },
+  changeStatus: { color: "#dfc27d", fontSize: 11, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
+  changePath: { color: "#ddd4cd", fontSize: 12, flex: 1 },
+  changeOldPath: { color: "#8d847d", fontSize: 11, marginBottom: 6, marginLeft: 8 },
   checkItem: { marginBottom: 10, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: "#2b2623" },
   checkTitle: { color: "#ece8e4", fontSize: 12, fontWeight: "700" },
   checkMeta: { color: "#8d847d", fontSize: 11, marginTop: 3 },
