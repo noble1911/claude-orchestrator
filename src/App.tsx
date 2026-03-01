@@ -2123,7 +2123,7 @@ function App() {
                       <button onClick={() => setActiveCenterTabId(tab.id)} className="whitespace-nowrap">
                         {tab.title}
                       </button>
-                      {tab.type === "file" && (
+                      {(tab.type === "file" || tab.type === "diff") && (
                         <button
                           onClick={() => closeCenterTab(tab.id)}
                           className="md-text-muted transition hover:md-text-primary"
