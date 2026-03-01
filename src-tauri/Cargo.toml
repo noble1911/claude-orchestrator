@@ -29,6 +29,9 @@ futures-util = "0.3"
 # Database
 rusqlite = { version = "0.34", features = ["bundled"] }
 
+# Process signals
+libc = "0.2"
+
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

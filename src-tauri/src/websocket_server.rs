@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 pub struct WebSocketServer {
@@ -17,6 +18,8 @@ pub struct WebSocketServer {
     subscriptions: Arc<RwLock<HashMap<String, HashSet<String>>>>, // workspace_id -> client_ids
     port: u16,
     message_tx: mpsc::UnboundedSender<ServerCommand>,
+    accept_task: Arc<RwLock<Option<JoinHandle<()>>>>,
+    connection_tasks: Arc<RwLock<Vec<JoinHandle<()>>>>,
 }
 
 struct ClientHandle {
@@ -29,9 +32,20 @@ struct ClientHandle {
 pub enum WsMessage {
     Connect { client_name: String },
     ListWorkspaces,
+    GetMessages { workspace_id: String },
+    ListFiles { workspace_id: String, relative_path: Option<String> },
+    ReadFile { workspace_id: String, relative_path: String, max_bytes: Option<usize> },
+    ListChanges { workspace_id: String },
+    RunChecks { workspace_id: String },
     Subscribe { workspace_id: String },
     Unsubscribe { workspace_id: String },
-    SendMessage { workspace_id: String, message: String },
+    SendMessage {
+        workspace_id: String,
+        message: String,
+        permission_mode: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    },
     StartAgent { workspace_id: String },
     StopAgent { workspace_id: String },
 }
@@ -46,6 +60,28 @@ pub enum WsResponse {
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
     },
+    MessageHistory {
+        workspace_id: String,
+        messages: Vec<MessageInfo>,
+    },
+    FilesList {
+        workspace_id: String,
+        relative_path: String,
+        entries: Vec<FileEntryInfo>,
+    },
+    FileContent {
+        workspace_id: String,
+        path: String,
+        content: String,
+    },
+    ChangesList {
+        workspace_id: String,
+        changes: Vec<ChangeInfo>,
+    },
+    ChecksResult {
+        workspace_id: String,
+        checks: Vec<CheckInfo>,
+    },
     Subscribed {
         workspace_id: String,
     },
@@ -54,6 +90,7 @@ pub enum WsResponse {
     },
     AgentMessage {
         workspace_id: String,
+        role: String,
         content: String,
         is_error: bool,
         timestamp: String,
@@ -79,12 +116,60 @@ pub struct WorkspaceInfo {
     pub has_agent: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageInfo {
+    pub agent_id: String,
+    pub role: String,
+    pub content: String,
+    pub is_error: bool,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntryInfo {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeInfo {
+    pub status: String,
+    pub path: String,
+    pub old_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckInfo {
+    pub name: String,
+    pub command: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u128,
+    pub skipped: bool,
+}
+
 // Commands from WebSocket to main app
 pub enum ServerCommand {
-    SendMessage { workspace_id: String, message: String, response_tx: mpsc::UnboundedSender<String> },
+    SendMessage {
+        workspace_id: String,
+        message: String,
+        permission_mode: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+        response_tx: mpsc::UnboundedSender<String>,
+    },
     StartAgent { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     StopAgent { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     ListWorkspaces { response_tx: mpsc::UnboundedSender<String> },
+    GetMessages { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
+    ListFiles { workspace_id: String, relative_path: Option<String>, response_tx: mpsc::UnboundedSender<String> },
+    ReadFile { workspace_id: String, relative_path: String, max_bytes: Option<usize>, response_tx: mpsc::UnboundedSender<String> },
+    ListChanges { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
+    RunChecks { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
+    ClientCountChanged { connected_clients: usize },
 }
 
 impl WebSocketServer {
@@ -94,10 +179,18 @@ impl WebSocketServer {
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             port,
             message_tx,
+            accept_task: Arc::new(RwLock::new(None)),
+            connection_tasks: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     pub async fn start(&self) -> Result<(), String> {
+        if let Some(handle) = self.accept_task.read().as_ref() {
+            if !handle.is_finished() {
+                return Ok(());
+            }
+        }
+
         let addr = format!("0.0.0.0:{}", self.port);
         let listener = TcpListener::bind(&addr)
             .await
@@ -108,17 +201,40 @@ impl WebSocketServer {
         let clients = self.clients.clone();
         let subscriptions = self.subscriptions.clone();
         let message_tx = self.message_tx.clone();
+        let connection_tasks = self.connection_tasks.clone();
 
-        tokio::spawn(async move {
+        let accept_handle = tokio::spawn(async move {
             while let Ok((stream, addr)) = listener.accept().await {
                 let clients = clients.clone();
                 let subscriptions = subscriptions.clone();
                 let message_tx = message_tx.clone();
-                tokio::spawn(handle_connection(stream, addr, clients, subscriptions, message_tx));
+                let handle = tokio::spawn(handle_connection(stream, addr, clients, subscriptions, message_tx));
+                let mut tasks = connection_tasks.write();
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(handle);
             }
         });
+        *self.accept_task.write() = Some(accept_handle);
 
         Ok(())
+    }
+
+    pub fn stop(&self) {
+        if let Some(handle) = self.accept_task.write().take() {
+            handle.abort();
+        }
+
+        let mut tasks = self.connection_tasks.write();
+        for task in tasks.drain(..) {
+            task.abort();
+        }
+
+        self.subscriptions.write().clear();
+        self.clients.write().clear();
+        let _ = self
+            .message_tx
+            .send(ServerCommand::ClientCountChanged { connected_clients: 0 });
+        tracing::info!("WebSocket server stopped");
     }
 
     pub fn broadcast_to_workspace(&self, workspace_id: &str, message: &WsResponse) {
@@ -180,11 +296,22 @@ async fn handle_connection(
             },
         );
     }
+    {
+        let connected_clients = clients.read().len();
+        let _ = message_tx.send(ServerCommand::ClientCountChanged { connected_clients });
+    }
 
     // Send welcome message
     let welcome = WsResponse::Connected {
         server_name: "Claude Orchestrator".to_string(),
-        features: vec!["workspaces".to_string(), "streaming".to_string(), "agents".to_string()],
+        features: vec![
+            "workspaces".to_string(),
+            "streaming".to_string(),
+            "agents".to_string(),
+            "files".to_string(),
+            "changes".to_string(),
+            "checks".to_string(),
+        ],
     };
     let _ = ws_sender
         .send(Message::Text(serde_json::to_string(&welcome).unwrap().into()))
@@ -220,6 +347,51 @@ async fn handle_connection(
                                 }
                             }
                         }
+
+                        WsMessage::GetMessages { workspace_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::GetMessages { workspace_id, response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::ListFiles { workspace_id, relative_path } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::ListFiles { workspace_id, relative_path, response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::ReadFile { workspace_id, relative_path, max_bytes } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::ReadFile { workspace_id, relative_path, max_bytes, response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::ListChanges { workspace_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::ListChanges { workspace_id, response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::RunChecks { workspace_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::RunChecks { workspace_id, response_tx }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
                         
                         WsMessage::Subscribe { workspace_id } => {
                             {
@@ -243,11 +415,20 @@ async fn handle_connection(
                             let _ = tx.send(serde_json::to_string(&response).unwrap());
                         }
                         
-                        WsMessage::SendMessage { workspace_id, message } => {
+                        WsMessage::SendMessage {
+                            workspace_id,
+                            message,
+                            permission_mode,
+                            model,
+                            effort,
+                        } => {
                             let (response_tx, mut response_rx) = mpsc::unbounded_channel();
                             if message_tx.send(ServerCommand::SendMessage { 
                                 workspace_id, 
                                 message,
+                                permission_mode,
+                                model,
+                                effort,
                                 response_tx 
                             }).is_ok() {
                                 // Response will come via broadcast
@@ -304,6 +485,10 @@ async fn handle_connection(
     {
         let mut clients = clients.write();
         clients.remove(&client_id);
+    }
+    {
+        let connected_clients = clients.read().len();
+        let _ = message_tx.send(ServerCommand::ClientCountChanged { connected_clients });
     }
     
     send_task.abort();
