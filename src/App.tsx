@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -674,7 +674,10 @@ function App() {
     }
   }, [thinkingMode]);
 
-  useEffect(() => {
+  // useLayoutEffect prevents a visual flash when switching workspaces:
+  // it clears stale state synchronously before the browser paints,
+  // so the user never sees the previous workspace's data under the new name.
+  useLayoutEffect(() => {
     if (!selectedWorkspace) {
       setWorkspaceFilesByPath({});
       setExpandedPaths(new Set());
@@ -931,6 +934,7 @@ function App() {
         }));
       }
       setSelectedWorkspace(workspace.id);
+      setIsLeftPanelOpen(false);
     } catch (err) {
       console.error("Failed to create workspace:", err);
       setError(String(err));
