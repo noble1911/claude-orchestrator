@@ -2630,6 +2630,18 @@ function App() {
                     <span className="material-symbols-rounded !text-base md-text-muted">merge</span>
                     <span className="md-text-primary">Open Pull Request</span>
                   </button>
+                  <button
+                    onClick={() => {
+                      sendMessage(
+                        `Review the code changes on this branch. Use \`git diff main\` to see what changed. For each file, analyze the changes and provide feedback on:\n- Correctness and potential bugs\n- Code quality and readability\n- Performance concerns\n- Security issues\n- Suggestions for improvement\n\nBe specific with line references and provide actionable feedback. Summarize with an overall assessment.`,
+                        "Code Review"
+                      );
+                    }}
+                    className="md-list-item flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
+                  >
+                    <span className="material-symbols-rounded !text-base md-text-muted">rate_review</span>
+                    <span className="md-text-primary">Code Review</span>
+                  </button>
                 </div>
               )}
             </div>

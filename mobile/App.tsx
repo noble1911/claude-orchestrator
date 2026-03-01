@@ -1241,6 +1241,35 @@ function App() {
                       </View>
                     ))}
                   </ScrollView>
+                  {selectedWorkspaceId ? (
+                    <View style={styles.actionsSection}>
+                      <Text style={styles.actionsSectionTitle}>Actions</Text>
+                      <TouchableOpacity
+                        style={styles.actionItem}
+                        onPress={() => {
+                          sendMessage(
+                            "Push this branch to origin and create a pull request using `gh pr create`. Write a clear, descriptive PR title and body based on the changes on this branch. Use `git log main..HEAD` and `git diff main` to understand what changed."
+                          );
+                          setRightOpen(false);
+                        }}
+                      >
+                        <Text style={styles.actionIcon}>⎇</Text>
+                        <Text style={styles.actionLabel}>Open Pull Request</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.actionItem}
+                        onPress={() => {
+                          sendMessage(
+                            "Review the code changes on this branch. Use `git diff main` to see what changed. For each file, analyze the changes and provide feedback on:\n- Correctness and potential bugs\n- Code quality and readability\n- Performance concerns\n- Security issues\n- Suggestions for improvement\n\nBe specific with line references and provide actionable feedback. Summarize with an overall assessment."
+                          );
+                          setRightOpen(false);
+                        }}
+                      >
+                        <Text style={styles.actionIcon}>✎</Text>
+                        <Text style={styles.actionLabel}>Code Review</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : null}
                 </>
               )}
               {rightTab === "all_files" && (
@@ -1676,6 +1705,32 @@ const styles = StyleSheet.create({
   },
   promptMainButton: { flex: 1 },
   promptName: { color: "#ece8e4", fontSize: 13, fontWeight: "600" },
+  actionsSection: {
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#2b2623",
+  },
+  actionsSectionTitle: {
+    color: "#cfc7c1",
+    fontSize: 13,
+    fontWeight: "700",
+    marginBottom: 8,
+  },
+  actionItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    borderWidth: 1,
+    borderColor: "#35302b",
+    borderRadius: 10,
+    backgroundColor: "#171411",
+    marginBottom: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  actionIcon: { color: "#918880", fontSize: 15 },
+  actionLabel: { color: "#ece8e4", fontSize: 13, fontWeight: "500" },
 });
 
 export default App;
