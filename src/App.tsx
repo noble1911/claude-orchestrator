@@ -961,8 +961,10 @@ function App() {
         return next;
       });
       if (selectedWorkspace === workspaceId) {
-        setSelectedWorkspace(null);
-        setMessages([]);
+        const remaining = workspaces.filter(w => w.id !== workspaceId);
+        const next = remaining.length > 0 ? remaining[0].id : null;
+        setSelectedWorkspace(next);
+        if (!next) setMessages([]);
       }
       if (renameWorkspaceId === workspaceId) {
         setShowRenameForm(false);
