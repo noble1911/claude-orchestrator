@@ -20,6 +20,7 @@ impl Database {
         let conn = Connection::open(path)?;
         let db = Self { conn: Mutex::new(conn) };
         db.init_schema()?;
+        db.migrate()?;
         Ok(db)
     }
 
@@ -43,6 +44,7 @@ impl Database {
                 worktree_path TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL DEFAULT 'idle',
                 last_activity TEXT,
+                pr_url TEXT,
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             );
 
@@ -68,6 +70,20 @@ impl Database {
             );
             "#,
         )?;
+        Ok(())
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        // Add pr_url column if missing (existing databases)
+        let has_pr_url = conn
+            .prepare("SELECT pr_url FROM workspaces LIMIT 0")
+            .is_ok();
+        if !has_pr_url {
+            conn.execute_batch("ALTER TABLE workspaces ADD COLUMN pr_url TEXT")?;
+        }
+        // Normalize legacy 'error' status to 'idle'
+        conn.execute("UPDATE workspaces SET status = 'idle' WHERE status = 'error'", [])?;
         Ok(())
     }
 
@@ -122,14 +138,10 @@ impl Database {
     // Workspace CRUD
     pub fn insert_workspace(&self, ws: &Workspace) -> Result<()> {
         let conn = self.conn.lock();
-        let status_str = match ws.status {
-            WorkspaceStatus::Idle => "idle",
-            WorkspaceStatus::Running => "running",
-            WorkspaceStatus::Error => "error",
-        };
+        let status_str = workspace_status_to_str(&ws.status);
         conn.execute(
-            "INSERT OR REPLACE INTO workspaces (id, repo_id, name, branch, worktree_path, status, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![ws.id, ws.repo_id, ws.name, ws.branch, ws.worktree_path, status_str, ws.last_activity],
+            "INSERT OR REPLACE INTO workspaces (id, repo_id, name, branch, worktree_path, status, last_activity, pr_url) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![ws.id, ws.repo_id, ws.name, ws.branch, ws.worktree_path, status_str, ws.last_activity, ws.pr_url],
         )?;
         Ok(())
     }
@@ -137,24 +149,20 @@ impl Database {
     pub fn get_workspaces_by_repo(&self, repo_id: &str) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity FROM workspaces WHERE repo_id = ?1 ORDER BY name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url FROM workspaces WHERE repo_id = ?1 ORDER BY name"
         )?;
 
         let workspaces = stmt.query_map(params![repo_id], |row| {
             let status_str: String = row.get(5)?;
-            let status = match status_str.as_str() {
-                "running" => WorkspaceStatus::Running,
-                "error" => WorkspaceStatus::Error,
-                _ => WorkspaceStatus::Idle,
-            };
             Ok(Workspace {
                 id: row.get(0)?,
                 repo_id: row.get(1)?,
                 name: row.get(2)?,
                 branch: row.get(3)?,
                 worktree_path: row.get(4)?,
-                status,
+                status: workspace_status_from_str(&status_str),
                 last_activity: row.get(6)?,
+                pr_url: row.get(7)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -164,24 +172,20 @@ impl Database {
     pub fn get_all_workspaces(&self) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity FROM workspaces ORDER BY name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url FROM workspaces ORDER BY name"
         )?;
 
         let workspaces = stmt.query_map([], |row| {
             let status_str: String = row.get(5)?;
-            let status = match status_str.as_str() {
-                "running" => WorkspaceStatus::Running,
-                "error" => WorkspaceStatus::Error,
-                _ => WorkspaceStatus::Idle,
-            };
             Ok(Workspace {
                 id: row.get(0)?,
                 repo_id: row.get(1)?,
                 name: row.get(2)?,
                 branch: row.get(3)?,
                 worktree_path: row.get(4)?,
-                status,
+                status: workspace_status_from_str(&status_str),
                 last_activity: row.get(6)?,
+                pr_url: row.get(7)?,
             })
         })?.collect::<Result<Vec<_>>>()?;
 
@@ -190,14 +194,20 @@ impl Database {
 
     pub fn update_workspace_status(&self, id: &str, status: &WorkspaceStatus, last_activity: Option<&str>) -> Result<()> {
         let conn = self.conn.lock();
-        let status_str = match status {
-            WorkspaceStatus::Idle => "idle",
-            WorkspaceStatus::Running => "running",
-            WorkspaceStatus::Error => "error",
-        };
+        let status_str = workspace_status_to_str(status);
         conn.execute(
             "UPDATE workspaces SET status = ?1, last_activity = ?2 WHERE id = ?3",
             params![status_str, last_activity, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_workspace_pr_url(&self, id: &str, pr_url: &str, status: &WorkspaceStatus) -> Result<()> {
+        let conn = self.conn.lock();
+        let status_str = workspace_status_to_str(status);
+        conn.execute(
+            "UPDATE workspaces SET pr_url = ?1, status = ?2 WHERE id = ?3",
+            params![pr_url, status_str, id],
         )?;
         Ok(())
     }
@@ -338,5 +348,23 @@ impl Database {
         })?.collect::<Result<Vec<_>>>()?;
 
         Ok(messages)
+    }
+}
+
+fn workspace_status_to_str(status: &WorkspaceStatus) -> &'static str {
+    match status {
+        WorkspaceStatus::Idle => "idle",
+        WorkspaceStatus::Running => "running",
+        WorkspaceStatus::InReview => "inReview",
+        WorkspaceStatus::Merged => "merged",
+    }
+}
+
+fn workspace_status_from_str(s: &str) -> WorkspaceStatus {
+    match s {
+        "running" => WorkspaceStatus::Running,
+        "inReview" | "in_review" => WorkspaceStatus::InReview,
+        "merged" => WorkspaceStatus::Merged,
+        _ => WorkspaceStatus::Idle,
     }
 }

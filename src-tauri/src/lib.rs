@@ -44,6 +44,7 @@ pub struct Workspace {
     pub worktree_path: String,
     pub status: WorkspaceStatus,
     pub last_activity: Option<String>,
+    pub pr_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +52,9 @@ pub struct Workspace {
 pub enum WorkspaceStatus {
     Idle,
     Running,
-    Error,
+    #[serde(rename = "inReview")]
+    InReview,
+    Merged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +157,8 @@ pub struct AppState {
     repositories: RwLock<HashMap<String, Repository>>,
     workspaces: RwLock<HashMap<String, Workspace>>,
     agents: RwLock<HashMap<String, Agent>>,
+    /// Tracks child process PIDs per agent so we can send SIGINT to interrupt.
+    child_pids: RwLock<HashMap<String, u32>>,
     ws_server: Option<Arc<WebSocketServer>>,
     ws_server_running: RwLock<bool>,
     ws_connected_clients: RwLock<usize>,
@@ -167,6 +172,7 @@ impl AppState {
             repositories: RwLock::new(HashMap::new()),
             workspaces: RwLock::new(HashMap::new()),
             agents: RwLock::new(HashMap::new()),
+            child_pids: RwLock::new(HashMap::new()),
             ws_server: None,
             ws_server_running: RwLock::new(false),
             ws_connected_clients: RwLock::new(0),
@@ -506,6 +512,7 @@ async fn create_workspace(
         worktree_path: worktree_path_str,
         status: WorkspaceStatus::Idle,
         last_activity: None,
+        pr_url: None,
     };
     
     // Save to database
@@ -692,7 +699,7 @@ async fn start_agent(
     let session_id_clone = session_id.clone();
     let workspace_id_clone = workspace_id.clone();
     let env_overrides_clone = env_overrides.unwrap_or_default();
-    
+
     std::thread::spawn(move || {
         run_claude_cli(
             app,
@@ -1446,9 +1453,9 @@ fn extract_assistant_message_text(event: &Value) -> Option<String> {
 }
 
 fn run_claude_cli(
-    app: tauri::AppHandle, 
-    agent_id: String, 
-    workspace_path: String, 
+    app: tauri::AppHandle,
+    agent_id: String,
+    workspace_path: String,
     workspace_name: String,
     existing_session: Option<String>,
     db: Arc<Database>,
@@ -1579,6 +1586,30 @@ async fn stop_agent(
     Ok(())
 }
 
+/// Interrupt the currently running Claude CLI process for an agent by sending
+/// SIGINT.  The agent and session remain alive so the user can send follow-up
+/// messages.
+#[tauri::command]
+async fn interrupt_agent(
+    agent_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let pid = {
+        let pids = state.child_pids.read();
+        pids.get(&agent_id).copied()
+    };
+    match pid {
+        Some(pid) => {
+            // Send SIGINT (graceful interrupt) to the child process
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGINT);
+            }
+            Ok(())
+        }
+        None => Err("No running process found for this agent".into()),
+    }
+}
+
 #[tauri::command]
 async fn send_message_to_agent(
     agent_id: String,
@@ -1616,11 +1647,12 @@ async fn send_message_to_agent(
     let agent_id_clone = agent_id.clone();
     let message_clone = message.clone();
     let db = app_state.db.clone();
+    let app_state_for_pids = app_state.clone();
     let env_overrides = env_overrides.unwrap_or_default();
     let requested_permission_mode = normalize_permission_mode(permission_mode.as_deref()).to_string();
     let requested_model = normalize_model(model.as_deref());
     let requested_effort = normalize_effort(effort.as_deref()).map(str::to_string);
-    
+
     std::thread::spawn(move || {
         let effective_env = build_effective_cli_env(&env_overrides);
         let claude_path = match find_claude_cli_with_env(Some(&effective_env)) {
@@ -1728,6 +1760,9 @@ async fn send_message_to_agent(
                 return;
             }
         };
+
+        // Store child PID so we can send SIGINT to interrupt
+        app_state_for_pids.child_pids.write().insert(agent_id_clone.clone(), child.id());
 
         let mut assistant_delta_text = String::new();
         let mut latest_assistant_snapshot: Option<String> = None;
@@ -1860,6 +1895,7 @@ async fn send_message_to_agent(
         let status = match child.wait() {
             Ok(s) => s,
             Err(e) => {
+                app_state_for_pids.child_pids.write().remove(&agent_id_clone);
                 emit_agent_message(
                     &app,
                     &db,
@@ -1874,6 +1910,9 @@ async fn send_message_to_agent(
                 return;
             }
         };
+
+        // Clean up stored PID now that process has exited
+        app_state_for_pids.child_pids.write().remove(&agent_id_clone);
 
         if let Some(assistant_text) = choose_assistant_text(&assistant_delta_text, latest_assistant_snapshot.as_ref()) {
             emit_agent_message(
@@ -2026,7 +2065,62 @@ async fn create_pull_request(
     }
     
     let pr_url = String::from_utf8_lossy(&pr_output.stdout).trim().to_string();
+
+    // Transition workspace to InReview and store PR URL
+    {
+        let mut workspaces = state.workspaces.write();
+        if let Some(workspace) = workspaces.get_mut(&workspace_id) {
+            workspace.status = WorkspaceStatus::InReview;
+            workspace.pr_url = Some(pr_url.clone());
+        }
+    }
+    let _ = state.db.update_workspace_pr_url(&workspace_id, &pr_url, &WorkspaceStatus::InReview);
+
     Ok(pr_url)
+}
+
+/// Check PR status for all InReview workspaces using `gh pr view`.
+/// Returns a list of workspace IDs that transitioned to Merged.
+#[tauri::command]
+async fn sync_pr_statuses(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<String>, String> {
+    // Collect InReview workspaces with PR URLs
+    let to_check: Vec<(String, String, String)> = {
+        let workspaces = state.workspaces.read();
+        let repos = state.repositories.read();
+        workspaces.values()
+            .filter(|ws| matches!(ws.status, WorkspaceStatus::InReview))
+            .filter_map(|ws| {
+                let pr_url = ws.pr_url.as_ref()?;
+                let repo = repos.get(&ws.repo_id)?;
+                Some((ws.id.clone(), pr_url.clone(), repo.path.clone()))
+            })
+            .collect()
+    };
+
+    let mut merged_ids = Vec::new();
+    for (ws_id, pr_url, repo_path) in to_check {
+        // gh pr view <url> --json state -q .state
+        let output = Command::new("gh")
+            .args(["pr", "view", &pr_url, "--json", "state", "-q", ".state"])
+            .current_dir(&repo_path)
+            .output();
+        if let Ok(output) = output {
+            let state_str = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+            if state_str == "merged" {
+                {
+                    let mut workspaces = state.workspaces.write();
+                    if let Some(ws) = workspaces.get_mut(&ws_id) {
+                        ws.status = WorkspaceStatus::Merged;
+                    }
+                }
+                let _ = state.db.update_workspace_status(&ws_id, &WorkspaceStatus::Merged, None);
+                merged_ids.push(ws_id);
+            }
+        }
+    }
+    Ok(merged_ids)
 }
 
 #[tauri::command]
@@ -2449,7 +2543,8 @@ async fn handle_ws_commands(
                         status: match ws.status {
                             WorkspaceStatus::Idle => "idle".to_string(),
                             WorkspaceStatus::Running => "running".to_string(),
-                            WorkspaceStatus::Error => "error".to_string(),
+                            WorkspaceStatus::InReview => "inReview".to_string(),
+                            WorkspaceStatus::Merged => "merged".to_string(),
                         },
                         has_agent,
                     }
@@ -2857,6 +2952,9 @@ async fn handle_ws_commands(
                                     }
                                 };
 
+                                // Store child PID for interrupt support
+                                app_state_clone.child_pids.write().insert(agent_id_clone.clone(), child.id());
+
                                 let mut assistant_delta_text = String::new();
                                 let mut latest_assistant_snapshot: Option<String> = None;
                                 let mut result_text_fallback: Option<String> = None;
@@ -2993,6 +3091,7 @@ async fn handle_ws_commands(
                                 let status = match child.wait() {
                                     Ok(s) => s,
                                     Err(e) => {
+                                        app_state_clone.child_pids.write().remove(&agent_id_clone);
                                         emit_agent_message(
                                             &app_clone,
                                             &db,
@@ -3007,6 +3106,8 @@ async fn handle_ws_commands(
                                         return;
                                     }
                                 };
+
+                                app_state_clone.child_pids.write().remove(&agent_id_clone);
 
                                 if let Some(assistant_text) =
                                     choose_assistant_text(&assistant_delta_text, latest_assistant_snapshot.as_ref())
@@ -3330,9 +3431,11 @@ pub fn run() {
             list_agents,
             start_agent,
             stop_agent,
+            interrupt_agent,
             send_message_to_agent,
             get_agent_messages,
             create_pull_request,
+            sync_pr_statuses,
             list_workspace_files,
             read_workspace_file,
             list_workspace_changes,

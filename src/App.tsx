@@ -17,8 +17,9 @@ interface Workspace {
   name: string;
   branch: string;
   worktreePath: string;
-  status: "idle" | "running" | "error";
+  status: "idle" | "running" | "inReview" | "merged";
   lastActivity?: string;
+  prUrl?: string;
 }
 
 interface Agent {
@@ -339,6 +340,8 @@ function App() {
   const [isResizingRight, setIsResizingRight] = useState(false);
   const [isResizingTerminal, setIsResizingTerminal] = useState(false);
   const [terminalInput, setTerminalInput] = useState("");
+  const [terminalHistoryByWorkspace, setTerminalHistoryByWorkspace] = useState<Record<string, string[]>>({});
+  const [terminalHistoryIndex, setTerminalHistoryIndex] = useState<number | null>(null);
   const [terminalLinesByWorkspace, setTerminalLinesByWorkspace] = useState<Record<string, TerminalLine[]>>({});
   const [isRunningTerminalCommand, setIsRunningTerminalCommand] = useState(false);
   const [isTogglingRemoteServer, setIsTogglingRemoteServer] = useState(false);
@@ -451,6 +454,29 @@ function App() {
   useEffect(() => {
     terminalEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [terminalLinesByWorkspace, selectedWorkspace, isRunningTerminalCommand]);
+
+  // Periodically sync PR statuses for InReview workspaces
+  useEffect(() => {
+    const hasInReview = workspaces.some((ws) => ws.status === "inReview");
+    if (!hasInReview) return;
+    const sync = async () => {
+      try {
+        const mergedIds = await invoke<string[]>("sync_pr_statuses");
+        if (mergedIds.length > 0) {
+          setWorkspaces((prev) =>
+            prev.map((ws) =>
+              mergedIds.includes(ws.id) ? { ...ws, status: "merged" as const } : ws
+            )
+          );
+        }
+      } catch {
+        // Silently ignore — gh CLI may not be available
+      }
+    };
+    void sync();
+    const interval = setInterval(() => void sync(), 60_000);
+    return () => clearInterval(interval);
+  }, [workspaces.filter((ws) => ws.status === "inReview").length]);
 
   useEffect(() => {
     const onMouseMove = (event: MouseEvent) => {
@@ -967,6 +993,19 @@ function App() {
     }
   }
 
+  async function interruptAgent(agentId: string) {
+    try {
+      await invoke("interrupt_agent", { agentId });
+      const ws = agents.find((a) => a.id === agentId)?.workspaceId ?? null;
+      if (ws) {
+        setThinkingSinceByWorkspace((prev) => ({ ...prev, [ws]: null }));
+      }
+    } catch (err) {
+      console.error("Failed to interrupt agent:", err);
+      setError(String(err));
+    }
+  }
+
   function normalizePromptName(value: string) {
     return value.trim().toLowerCase().replace(/\s+/g, " ");
   }
@@ -1130,12 +1169,19 @@ function App() {
       setShowPRForm(false);
       setPrTitle("");
       setPrBody("");
-      
+
+      // Update workspace status locally
+      setWorkspaces((prev) =>
+        prev.map((ws) =>
+          ws.id === selectedWorkspace ? { ...ws, status: "inReview" as const, prUrl } : ws
+        )
+      );
+
       // Show success message
       setMessages(prev => [...prev, {
         agentId: "system",
         role: "system",
-        content: `✅ Pull request created: ${prUrl}`,
+        content: `Pull request created: ${prUrl}`,
         isError: false,
         timestamp: new Date().toISOString(),
       }]);
@@ -1474,6 +1520,13 @@ function App() {
   async function runTerminalCommand() {
     if (!selectedWorkspace || !terminalInput.trim() || isRunningTerminalCommand) return;
     const command = terminalInput.trim();
+    if (selectedWorkspace) {
+      setTerminalHistoryByWorkspace((prev) => ({
+        ...prev,
+        [selectedWorkspace]: [...(prev[selectedWorkspace] || []), command],
+      }));
+    }
+    setTerminalHistoryIndex(null);
     setTerminalInput("");
     appendTerminalLine(selectedWorkspace, "command", `$ ${command}`);
     setIsRunningTerminalCommand(true);
@@ -1725,40 +1778,34 @@ function App() {
 
   const getStatusColor = (status: string) => {
     switch (status) {
-      case "running": return "md-status-running";
-      case "starting": return "md-status-starting";
-      case "idle": return "md-status-idle";
-      case "stopped": return "md-status-stopped";
-      case "error": return "md-status-error";
-      default: return "md-status-idle";
+      case "running": return "bg-emerald-400";
+      case "inReview": return "bg-amber-400";
+      case "merged": return "bg-violet-400";
+      case "idle": return "bg-zinc-500";
+      default: return "bg-zinc-500";
     }
   };
 
   const workspaceGroups = [
     {
-      key: "done",
-      label: "Done",
-      items: workspaces.filter((workspace) => workspace.status === "idle"),
+      key: "in-progress",
+      label: "In progress",
+      items: workspaces.filter((ws) => ws.status === "running"),
     },
     {
       key: "in-review",
       label: "In review",
-      items: [] as Workspace[],
+      items: workspaces.filter((ws) => ws.status === "inReview"),
     },
     {
-      key: "in-progress",
-      label: "In progress",
-      items: workspaces.filter((workspace) => workspace.status === "running"),
+      key: "ready",
+      label: "Ready",
+      items: workspaces.filter((ws) => ws.status === "idle"),
     },
     {
-      key: "backlog",
-      label: "Backlog",
-      items: [] as Workspace[],
-    },
-    {
-      key: "canceled",
-      label: "Canceled",
-      items: workspaces.filter((workspace) => workspace.status === "error"),
+      key: "done",
+      label: "Done",
+      items: workspaces.filter((ws) => ws.status === "merged"),
     },
   ];
 
@@ -2028,7 +2075,7 @@ function App() {
       </aside>
 
       <div
-        className="hidden w-1 cursor-col-resize md-resizer transition hover:bg-violet-400/60 lg:block"
+        className="relative -ml-px z-10 hidden w-0.5 cursor-col-resize transition hover:w-1 hover:bg-violet-400/60 lg:block"
         onMouseDown={() => setIsResizingLeft(true)}
         title="Resize sidebar"
       />
@@ -2054,30 +2101,23 @@ function App() {
                 Tools
               </button>
             </div>
-            <span className="truncate md-title-small">{currentWorkspace?.name || "Select workspace"}</span>
+            <span
+              className="truncate md-title-small"
+              onDoubleClick={() => currentWorkspace && openRenameWorkspaceForm(currentWorkspace)}
+              title={currentWorkspace ? "Double-click to rename" : undefined}
+              style={currentWorkspace ? { cursor: "text" } : undefined}
+            >{currentWorkspace?.name || "Select workspace"}</span>
             {currentWorkspace && <span className="truncate md-label-large">{currentWorkspace.branch}</span>}
           </div>
-          <div className="flex items-center gap-2 pt-1">
-            {currentWorkspace && (
-              <button
-                onClick={() => {
-                  setPrTitle(`${currentWorkspace.name}`);
-                  setPrBody(`## Summary\n\nChanges from workspace: ${currentWorkspace.name}\n\n## Test Plan\n\n- [ ] Manual testing`);
-                  setShowPRForm(true);
-                }}
-                className="md-btn md-btn-tonal whitespace-nowrap !min-h-[30px] !px-3 text-xs"
-              >
-                <span className="material-symbols-rounded !text-base">merge</span>
-                Open PR
-              </button>
-            )}
+          <div className="flex items-center gap-1">
             {currentWorkspace && workspaceAgents.length > 0 && (
               <button
                 onClick={() => stopAgent(workspaceAgents[0].id)}
-                className="md-btn md-btn-danger !min-h-[30px] !px-3 text-xs"
+                className="md-icon-plain !h-7 !w-7 md-text-muted hover:text-rose-300"
+                title="End agent session"
+                aria-label="End agent session"
               >
-                <span className="material-symbols-rounded !text-base">stop_circle</span>
-                Stop
+                <span className="material-symbols-rounded !text-[18px]">archive</span>
               </button>
             )}
           </div>
@@ -2123,8 +2163,8 @@ function App() {
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto md-px-5 md-py-4">
-                <div className="space-y-2">
+              <div className="flex-1 overflow-y-auto md-px-3 md-py-3">
+                <div className="space-y-1">
                   {activeCenterTab.type === "chat" && workspaceMessages.length === 0 ? (
                     <div className="flex h-[55vh] items-center justify-center md-text-muted">
                       {workspaceAgents.length > 0 || isAutoStartingCurrentWorkspace ? (
@@ -2142,37 +2182,33 @@ function App() {
                         const isLatestRunningActivity = isThinkingCurrentWorkspace && rowIdx === chatRows.length - 1;
                         const expanded = isActivityExpanded(row.id) || isLatestRunningActivity;
                         return (
-                          <div key={row.id} className="overflow-hidden rounded-md border md-outline md-surface-subtle">
+                          <div key={row.id}>
                             <button
                               onClick={() => toggleActivityGroup(row.id)}
-                              className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left transition hover:bg-white/5"
+                              className="flex w-full items-center gap-2 py-1 text-left transition hover:bg-white/5"
                             >
-                              <span className="inline-flex items-center gap-2">
-                                <span className="material-symbols-rounded !text-base md-text-muted">
-                                  {expanded ? "expand_more" : "chevron_right"}
+                              <span className="text-xs md-text-faint">
+                                Agent activity ({row.group.messages.length} events)
+                              </span>
+                              {isLatestRunningActivity && (
+                                <span className="inline-flex items-center gap-1 rounded-full border border-amber-700/60 bg-amber-950/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
+                                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-300" />
+                                  running
                                 </span>
-                                <span className="text-xs md-text-muted">
-                                  Agent activity ({row.group.messages.length} events)
-                                </span>
-                                {isLatestRunningActivity && (
-                                  <span className="inline-flex items-center gap-1 rounded-full border border-amber-700/60 bg-amber-950/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
-                                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-300" />
-                                    running
-                                  </span>
-                                )}
+                              )}
+                              <span className="material-symbols-rounded ml-auto !text-sm md-text-faint">
+                                {expanded ? "expand_more" : "chevron_right"}
                               </span>
                             </button>
 
                             {expanded && (
-                              <div className="space-y-1 border-t md-outline px-3 py-2">
+                              <div className="space-y-1 pl-2 pt-1 pb-1">
                                 {row.group.lines.map((line, lineIdx) => (
-                                  <div key={`${row.id}-line-${lineIdx}`} className="flex items-start gap-2 text-xs md-text-muted">
-                                    <span className="mt-1 h-1.5 w-1.5 flex-none rounded-full bg-white/25" />
+                                  <div key={`${row.id}-line-${lineIdx}`} className="flex items-start gap-2 text-xs md-text-faint">
+                                    <span className="mt-1 h-1 w-1 flex-none rounded-full bg-white/20" />
                                     <span className="break-all font-mono">{line.text}</span>
                                     {line.count > 1 && (
-                                      <span className="md-chip border-white/20 bg-white/5 !px-1.5 !py-0 text-[10px]">
-                                        x{line.count}
-                                      </span>
+                                      <span className="text-[10px] md-text-faint">x{line.count}</span>
                                     )}
                                   </div>
                                 ))}
@@ -2190,7 +2226,7 @@ function App() {
 
                       if (msg.isError) {
                         return (
-                          <div key={row.id} className="border-l-2 border-rose-700 pl-3">
+                          <div key={row.id} className="mt-3 border-l-2 border-rose-700 pl-3">
                             <div className="mb-1 text-[11px] uppercase tracking-wide text-rose-300">Error</div>
                             <pre className="overflow-x-auto whitespace-pre-wrap text-sm text-rose-200">{msg.content}</pre>
                           </div>
@@ -2199,17 +2235,18 @@ function App() {
 
                       if (isUser) {
                         return (
-                          <div key={row.id} className="border-l-2 border-sky-700 pl-3">
-                            <div className="mb-1 text-[11px] uppercase tracking-wide text-sky-300">You</div>
-                            <pre className="overflow-x-auto whitespace-pre-wrap text-sm md-text-strong">
-                              {msg.content.replace(/^>\s?/, "")}
-                            </pre>
+                          <div key={row.id} className="flex justify-end">
+                            <div className="max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-2.5">
+                              <pre className="overflow-x-auto whitespace-pre-wrap text-sm md-text-strong">
+                                {msg.content.replace(/^>\s?/, "")}
+                              </pre>
+                            </div>
                           </div>
                         );
                       }
 
                       return (
-                        <div key={row.id} className="border-l-2 md-outline pl-3">
+                        <div key={row.id} className="mt-3">
                           <pre className="overflow-x-auto whitespace-pre-wrap text-sm md-text-primary">{msg.content}</pre>
                         </div>
                       );
@@ -2269,8 +2306,8 @@ function App() {
               </div>
 
               {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && (
-                <div className="border-t md-outline md-surface-container-high md-px-5 md-py-3">
-                  <div className="rounded-2xl border md-outline md-surface-container md-px-3 md-py-3">
+                <div className="border-t md-outline md-surface-container-high md-px-3 md-py-2">
+                  <div className="rounded-2xl border md-outline md-surface-container md-px-3 md-py-2">
                     <textarea
                       value={inputMessage}
                       onChange={(e) => setInputMessage(e.target.value)}
@@ -2280,8 +2317,8 @@ function App() {
                           void sendMessage();
                         }
                       }}
-                      rows={4}
-                      placeholder="Ask to make changes... or run shortcut with /prompt name"
+                      rows={2}
+                      placeholder="Ask to make changes... or /prompt name"
                       className="w-full resize-none border-0 bg-transparent text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted"
                     />
 
@@ -2309,74 +2346,77 @@ function App() {
                       </div>
                     )}
 
-                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t md-outline pt-2">
-                      <div className="flex flex-wrap items-center gap-2">
+                    <div className="mt-1.5 flex items-center gap-1.5 border-t md-outline pt-1.5">
                         <button
                           type="button"
                           onClick={() => void addFilesToComposer()}
-                          className="md-btn md-icon-btn"
-                          title="Attach files from workspace"
+                          className="md-icon-plain !h-7 !w-7"
+                          title="Attach files"
                           aria-label="Attach files"
                         >
-                          <span className="material-symbols-rounded !text-base">add</span>
+                          <span className="material-symbols-rounded !text-[18px]">attach_file</span>
                         </button>
-                        <label className="flex items-center gap-1">
-                          <span className="material-symbols-rounded !text-base md-text-muted">model_training</span>
-                          <select
-                            value={selectedModel}
-                            onChange={(e) => setSelectedModel(e.target.value)}
-                            className="md-select min-h-[34px] py-1 pl-3 pr-8 text-xs"
-                            style={{ width: "auto" }}
-                            aria-label="Model selection"
-                          >
-                            {MODEL_OPTIONS.map((option) => (
-                              <option key={option.value} value={option.value}>
-                                {option.label}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <label className="flex items-center gap-1">
-                          <span className="material-symbols-rounded !text-base md-text-muted">psychology</span>
-                          <select
-                            value={thinkingMode}
-                            onChange={(e) => setThinkingMode(e.target.value as "off" | "low" | "medium" | "high")}
-                            className="md-select min-h-[34px] py-1 pl-3 pr-8 text-xs"
-                            style={{ width: "auto" }}
-                            aria-label="Thinking mode"
-                          >
-                            <option value="off">Thinking off</option>
-                            <option value="low">Thinking low</option>
-                            <option value="medium">Thinking medium</option>
-                            <option value="high">Thinking high</option>
-                          </select>
-                        </label>
-                      </div>
-
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"))}
-                          className={`md-btn ${claudeMode === "plan" ? "md-btn-tonal" : ""}`}
-                          title={claudeMode === "plan" ? "Planning mode enabled (click for normal mode)" : "Normal mode enabled (click for planning mode)"}
-                          aria-label={claudeMode === "plan" ? "Switch to normal mode" : "Switch to planning mode"}
+                        <select
+                          value={selectedModel}
+                          onChange={(e) => setSelectedModel(e.target.value)}
+                          className="md-select !min-h-0 h-7 py-0 pl-2 pr-6 text-[11px]"
+                          style={{ width: "auto" }}
+                          aria-label="Model selection"
                         >
-                          <span className="material-symbols-rounded !text-base">
-                            {claudeMode === "plan" ? "schema" : "bolt"}
-                          </span>
-                          {claudeMode === "plan" ? "Planning mode" : "Normal mode"}
-                        </button>
-
-                        <button
-                          onClick={() => {
-                            void sendMessage();
-                          }}
-                          disabled={!inputMessage.trim() || isThinkingCurrentWorkspace}
-                          className="md-btn md-btn-tonal disabled:cursor-not-allowed disabled:opacity-40"
+                          {MODEL_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          value={thinkingMode}
+                          onChange={(e) => setThinkingMode(e.target.value as "off" | "low" | "medium" | "high")}
+                          className="md-select !min-h-0 h-7 py-0 pl-2 pr-6 text-[11px]"
+                          style={{ width: "auto" }}
+                          aria-label="Thinking mode"
                         >
-                          <span className="material-symbols-rounded !text-base">send</span>
-                          Send
-                        </button>
-                      </div>
+                          <option value="off">Think off</option>
+                          <option value="low">Think low</option>
+                          <option value="medium">Think med</option>
+                          <option value="high">Think high</option>
+                        </select>
+
+                        <div className="ml-auto flex items-center gap-1">
+                          <button
+                            onClick={() => setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"))}
+                            className={`md-icon-plain !h-7 !w-7 ${claudeMode === "plan" ? "text-violet-300" : ""}`}
+                            title={claudeMode === "plan" ? "Planning mode (click for normal)" : "Normal mode (click for plan)"}
+                            aria-label={claudeMode === "plan" ? "Switch to normal mode" : "Switch to planning mode"}
+                          >
+                            <span className="material-symbols-rounded !text-[18px]">
+                              {claudeMode === "plan" ? "schema" : "bolt"}
+                            </span>
+                          </button>
+
+                          {isThinkingCurrentWorkspace && workspaceAgents.length > 0 ? (
+                            <button
+                              onClick={() => interruptAgent(workspaceAgents[0].id)}
+                              className="md-icon-plain !h-7 !w-7 text-amber-400 hover:text-amber-300"
+                              title="Interrupt current prompt"
+                              aria-label="Interrupt agent"
+                            >
+                              <span className="material-symbols-rounded !text-[18px]">pause_circle</span>
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => {
+                                void sendMessage();
+                              }}
+                              disabled={!inputMessage.trim()}
+                              className="md-icon-plain !h-7 !w-7 text-sky-300 disabled:cursor-not-allowed disabled:opacity-30"
+                              title="Send message"
+                              aria-label="Send message"
+                            >
+                              <span className="material-symbols-rounded !text-[18px]">send</span>
+                            </button>
+                          )}
+                        </div>
                     </div>
                   </div>
                 </div>
@@ -2536,6 +2576,23 @@ function App() {
               <p className="text-xs md-text-muted">
                 Click a prompt to run it. Use `/prompt name` in chat, or enable auto-run for new workspaces.
               </p>
+
+              {currentWorkspace && (
+                <div className="mt-4 border-t md-outline pt-3">
+                  <p className="mb-2 md-label-medium">Actions</p>
+                  <button
+                    onClick={() => {
+                      setPrTitle(`${currentWorkspace.name}`);
+                      setPrBody(`## Summary\n\nChanges from workspace: ${currentWorkspace.name}\n\n## Test Plan\n\n- [ ] Manual testing`);
+                      setShowPRForm(true);
+                    }}
+                    className="md-list-item flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
+                  >
+                    <span className="material-symbols-rounded !text-base md-text-muted">merge</span>
+                    <span className="md-text-primary">Open Pull Request</span>
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -2674,8 +2731,8 @@ function App() {
           onMouseDown={() => setIsResizingTerminal(true)}
           title="Resize terminal"
         />
-        <div className="border-t md-outline md-px-4 md-py-3" style={{ height: `${terminalHeight}px` }}>
-          <div className="mb-2 flex items-center justify-between text-xs md-text-muted">
+        <div className="flex flex-col overflow-hidden border-t md-outline md-px-4 md-py-2" style={{ height: `${terminalHeight}px` }}>
+          <div className="mb-1 flex shrink-0 items-center justify-between text-xs md-text-muted">
             <div className="md-segmented">
               <button
                 onClick={() => setTerminalTab("setup")}
@@ -2696,10 +2753,9 @@ function App() {
                 Terminal
               </button>
             </div>
-            <span>{serverStatus?.running ? "Server online" : "Server offline"}</span>
           </div>
           {terminalTab === "setup" && (
-            <div className="md-card h-[calc(100%-24px)] space-y-3 overflow-auto p-3 text-xs md-text-secondary">
+            <div className="md-card min-h-0 flex-1 space-y-3 overflow-auto p-3 text-xs md-text-secondary">
               <div>
                 <p className="md-text-dim">Workspace</p>
                 <p className="mb-3 md-text-strong">{currentWorkspace?.name || "-"}</p>
@@ -2723,7 +2779,7 @@ function App() {
             </div>
           )}
           {terminalTab === "terminal" && (
-            <div className="h-[calc(100%-24px)]">
+            <div className="min-h-0 flex-1">
               <div
                 className="md-card flex h-full flex-col overflow-auto bg-black/55 p-2 font-mono text-xs"
                 onClick={() => terminalInputRef.current?.focus()}
@@ -2758,6 +2814,31 @@ function App() {
                       if (e.key === "Enter") {
                         e.preventDefault();
                         void runTerminalCommand();
+                      } else if (e.key === "ArrowUp") {
+                        e.preventDefault();
+                        const history = selectedWorkspace ? (terminalHistoryByWorkspace[selectedWorkspace] || []) : [];
+                        if (history.length === 0) return;
+                        const newIndex = terminalHistoryIndex === null
+                          ? history.length - 1
+                          : Math.max(0, terminalHistoryIndex - 1);
+                        setTerminalHistoryIndex(newIndex);
+                        setTerminalInput(history[newIndex]);
+                      } else if (e.key === "ArrowDown") {
+                        e.preventDefault();
+                        const history = selectedWorkspace ? (terminalHistoryByWorkspace[selectedWorkspace] || []) : [];
+                        if (terminalHistoryIndex === null) return;
+                        const newIndex = terminalHistoryIndex + 1;
+                        if (newIndex >= history.length) {
+                          setTerminalHistoryIndex(null);
+                          setTerminalInput("");
+                        } else {
+                          setTerminalHistoryIndex(newIndex);
+                          setTerminalInput(history[newIndex]);
+                        }
+                      } else {
+                        if (terminalHistoryIndex !== null) {
+                          setTerminalHistoryIndex(null);
+                        }
                       }
                     }}
                     placeholder={currentWorkspace ? "type command and press Enter" : "select workspace"}
@@ -2770,7 +2851,7 @@ function App() {
             </div>
           )}
           {terminalTab === "remote" && (
-            <div className="md-card h-[calc(100%-24px)] space-y-4 overflow-auto p-3 text-xs md-text-secondary">
+            <div className="md-card min-h-0 flex-1 space-y-4 overflow-auto p-3 text-xs md-text-secondary">
               <div className="flex items-start justify-between gap-4">
                 <div className="space-y-1">
                   <p className="md-text-dim">Server status</p>
