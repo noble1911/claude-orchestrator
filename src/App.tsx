@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 interface Repository {
   id: string;
@@ -41,6 +42,7 @@ interface ServerStatus {
   running: boolean;
   port: number;
   connectedClients: number;
+  connectUrl: string;
 }
 
 interface AppStatus {
@@ -71,6 +73,12 @@ interface WorkspaceCheckResult {
   skipped: boolean;
 }
 
+interface WorkspaceCheckDefinition {
+  name: string;
+  command: string;
+  description: string;
+}
+
 interface TerminalCommandResult {
   command: string;
   cwd: string;
@@ -90,13 +98,16 @@ interface PromptShortcut {
   id: string;
   name: string;
   prompt: string;
+  autoRunOnCreate?: boolean;
 }
 
 interface CenterTab {
   id: string;
-  type: "chat" | "file";
+  type: "chat" | "file" | "diff";
   title: string;
   path?: string;
+  status?: string;
+  oldPath?: string;
 }
 
 type ClaudeMode = "normal" | "plan";
@@ -115,6 +126,14 @@ interface ActivityGroup {
 type ChatRow =
   | { kind: "message"; id: string; message: AgentMessage }
   | { kind: "activity"; id: string; group: ActivityGroup };
+
+interface ChangeTreeNode {
+  name: string;
+  path: string;
+  isDir: boolean;
+  change?: WorkspaceChangeEntry;
+  children: ChangeTreeNode[];
+}
 
 function compactActivityLines(messages: AgentMessage[]): ActivityLine[] {
   const lines: ActivityLine[] = [];
@@ -140,6 +159,87 @@ function shortText(value: string, maxLength = 120): string {
   return `${value.slice(0, maxLength)}...`;
 }
 
+function buildChangeTree(changes: WorkspaceChangeEntry[]): ChangeTreeNode[] {
+  type MutableNode = {
+    name: string;
+    path: string;
+    isDir: boolean;
+    change?: WorkspaceChangeEntry;
+    children: Map<string, MutableNode>;
+  };
+
+  const root: MutableNode = {
+    name: "",
+    path: "",
+    isDir: true,
+    children: new Map(),
+  };
+
+  for (const change of changes) {
+    const parts = change.path.split("/").filter(Boolean);
+    if (parts.length === 0) continue;
+
+    let current = root;
+    let currentPath = "";
+
+    for (let idx = 0; idx < parts.length; idx += 1) {
+      const part = parts[idx];
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      const isLeaf = idx === parts.length - 1;
+
+      let child = current.children.get(part);
+      if (!child) {
+        child = {
+          name: part,
+          path: currentPath,
+          isDir: !isLeaf,
+          children: new Map(),
+        };
+        current.children.set(part, child);
+      }
+
+      if (isLeaf) {
+        child.isDir = false;
+        child.change = change;
+      } else {
+        child.isDir = true;
+      }
+
+      current = child;
+    }
+  }
+
+  const toImmutableNodes = (nodeMap: Map<string, MutableNode>): ChangeTreeNode[] => {
+    return Array.from(nodeMap.values())
+      .map((node) => ({
+        name: node.name,
+        path: node.path,
+        isDir: node.isDir,
+        change: node.change,
+        children: toImmutableNodes(node.children),
+      }))
+      .sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+  };
+
+  return toImmutableNodes(root.children);
+}
+
+function toWorkspaceRelativePath(absolutePath: string, workspaceRoot: string): string | null {
+  const normalizedAbsolute = absolutePath.replace(/\\/g, "/");
+  const normalizedRoot = workspaceRoot.replace(/\\/g, "/").replace(/\/$/, "");
+
+  if (normalizedAbsolute === normalizedRoot) {
+    return "";
+  }
+  if (!normalizedAbsolute.startsWith(`${normalizedRoot}/`)) {
+    return null;
+  }
+  return normalizedAbsolute.slice(normalizedRoot.length + 1);
+}
+
 const NAME_ADJECTIVES = [
   "swift",
   "brisk",
@@ -162,9 +262,19 @@ const NAME_NOUNS = [
   "ember",
 ];
 
+const MODEL_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "opus", label: "Opus" },
+  { value: "sonnet", label: "Sonnet" },
+  { value: "haiku", label: "Haiku" },
+];
+const DEFAULT_MODEL_ID = "opus";
+
 const PROMPT_SHORTCUTS_STORAGE_KEY = "claude_orchestrator_prompt_shortcuts";
 const ENV_OVERRIDES_STORAGE_KEY = "claude_orchestrator_env_overrides";
 const CLAUDE_MODE_STORAGE_KEY = "claude_orchestrator_mode";
+const MODEL_STORAGE_KEY = "claude_orchestrator_model";
+const THINKING_MODE_STORAGE_KEY = "claude_orchestrator_thinking_mode";
+const DEFAULT_REPOSITORY_STORAGE_KEY = "claude_orchestrator_default_repository";
 
 function App() {
   const [repositories, setRepositories] = useState<Repository[]>([]);
@@ -172,6 +282,7 @@ function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
+  const [defaultRepoId, setDefaultRepoId] = useState<string | null>(null);
   const [selectedWorkspace, setSelectedWorkspace] = useState<string | null>(null);
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [isLoading, setIsLoading] = useState(true);
@@ -183,26 +294,35 @@ function App() {
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [inputMessage, setInputMessage] = useState("");
   const [isCreatingPR, setIsCreatingPR] = useState(false);
-  const [activeRightTab, setActiveRightTab] = useState<"files" | "changes" | "checks">("files");
+  const [activeRightTab, setActiveRightTab] = useState<"prompts" | "files" | "changes" | "checks">("prompts");
   const [workspaceFilesByPath, setWorkspaceFilesByPath] = useState<Record<string, WorkspaceFileEntry[]>>({});
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [fileContentsByPath, setFileContentsByPath] = useState<Record<string, string>>({});
   const [isLoadingFileContent, setIsLoadingFileContent] = useState(false);
+  const [diffContentsByTab, setDiffContentsByTab] = useState<Record<string, string>>({});
+  const [loadingDiffTabId, setLoadingDiffTabId] = useState<string | null>(null);
   const [centerTabs, setCenterTabs] = useState<CenterTab[]>([{ id: "chat", type: "chat", title: "Chat" }]);
   const [activeCenterTabId, setActiveCenterTabId] = useState("chat");
   const [workspaceChanges, setWorkspaceChanges] = useState<WorkspaceChangeEntry[]>([]);
+  const [expandedChangePaths, setExpandedChangePaths] = useState<Set<string>>(new Set([""]));
   const [isLoadingChanges, setIsLoadingChanges] = useState(false);
   const [checkResults, setCheckResults] = useState<WorkspaceCheckResult[]>([]);
+  const [detectedChecks, setDetectedChecks] = useState<WorkspaceCheckDefinition[]>([]);
+  const [isLoadingDetectedChecks, setIsLoadingDetectedChecks] = useState(false);
   const [isRunningChecks, setIsRunningChecks] = useState(false);
   const [promptShortcuts, setPromptShortcuts] = useState<PromptShortcut[]>([]);
   const [showAddPromptForm, setShowAddPromptForm] = useState(false);
+  const [editingPromptId, setEditingPromptId] = useState<string | null>(null);
   const [newPromptName, setNewPromptName] = useState("");
   const [newPromptBody, setNewPromptBody] = useState("");
-  const [showEnvForm, setShowEnvForm] = useState(false);
+  const [newPromptAutoRunOnCreate, setNewPromptAutoRunOnCreate] = useState(false);
   const [envOverridesText, setEnvOverridesText] = useState("");
   const [claudeMode, setClaudeMode] = useState<ClaudeMode>("normal");
+  const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
+  const [thinkingMode, setThinkingMode] = useState<"off" | "low" | "medium" | "high">("off");
+  const [attachedFiles, setAttachedFiles] = useState<string[]>([]);
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(false);
   const [isRightPanelOpen, setIsRightPanelOpen] = useState(false);
   const [autoStartingWorkspaceId, setAutoStartingWorkspaceId] = useState<string | null>(null);
@@ -210,6 +330,7 @@ function App() {
   const [thinkingSinceByWorkspace, setThinkingSinceByWorkspace] = useState<Record<string, number | null>>({});
   const [thinkingElapsedSec, setThinkingElapsedSec] = useState(0);
   const [showRenameForm, setShowRenameForm] = useState(false);
+  const [renameWorkspaceId, setRenameWorkspaceId] = useState<string | null>(null);
   const [renameWorkspaceName, setRenameWorkspaceName] = useState("");
   const [leftPanelWidth, setLeftPanelWidth] = useState(280);
   const [rightPanelWidth, setRightPanelWidth] = useState(360);
@@ -220,7 +341,9 @@ function App() {
   const [terminalInput, setTerminalInput] = useState("");
   const [terminalLinesByWorkspace, setTerminalLinesByWorkspace] = useState<Record<string, TerminalLine[]>>({});
   const [isRunningTerminalCommand, setIsRunningTerminalCommand] = useState(false);
-  const [terminalTab, setTerminalTab] = useState<"setup" | "run" | "terminal">("terminal");
+  const [isTogglingRemoteServer, setIsTogglingRemoteServer] = useState(false);
+  const [terminalTab, setTerminalTab] = useState<"setup" | "remote" | "terminal">("terminal");
+  const [pendingAutoPromptsByWorkspace, setPendingAutoPromptsByWorkspace] = useState<Record<string, PromptShortcut[]>>({});
   const startingWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const selectedWorkspaceRef = useRef<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -270,6 +393,18 @@ function App() {
       loadWorkspaces(selectedRepo);
     }
   }, [selectedRepo]);
+
+  useEffect(() => {
+    try {
+      if (defaultRepoId) {
+        localStorage.setItem(DEFAULT_REPOSITORY_STORAGE_KEY, defaultRepoId);
+      } else {
+        localStorage.removeItem(DEFAULT_REPOSITORY_STORAGE_KEY);
+      }
+    } catch (err) {
+      console.error("Failed to persist default repository:", err);
+    }
+  }, [defaultRepoId]);
 
   useEffect(() => {
     const id = window.setInterval(async () => {
@@ -349,9 +484,26 @@ function App() {
     try {
       const raw = localStorage.getItem(PROMPT_SHORTCUTS_STORAGE_KEY);
       if (!raw) return;
-      const parsed = JSON.parse(raw) as PromptShortcut[];
+      const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        setPromptShortcuts(parsed);
+        const normalized: PromptShortcut[] = parsed
+          .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+          .map((item, index) => {
+            const name = typeof item.name === "string" ? item.name : "";
+            const prompt = typeof item.prompt === "string" ? item.prompt : "";
+            const id =
+              typeof item.id === "string" && item.id.trim()
+                ? item.id
+                : `${Date.now()}-${index}-${Math.floor(Math.random() * 100000)}`;
+            return {
+              id,
+              name,
+              prompt,
+              autoRunOnCreate: item.autoRunOnCreate === true,
+            };
+          })
+          .filter((item) => item.name.trim() && item.prompt.trim());
+        setPromptShortcuts(normalized);
       }
     } catch (err) {
       console.error("Failed to load prompt shortcuts:", err);
@@ -405,17 +557,66 @@ function App() {
   }, [claudeMode]);
 
   useEffect(() => {
+    try {
+      const raw = localStorage.getItem(MODEL_STORAGE_KEY);
+      if (raw && raw.trim().length > 0) {
+        const normalized = raw.trim();
+        const isKnownOption = MODEL_OPTIONS.some((option) => option.value === normalized);
+        if (isKnownOption) {
+          setSelectedModel(normalized);
+        } else {
+          setSelectedModel(DEFAULT_MODEL_ID);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to load model selection:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(MODEL_STORAGE_KEY, selectedModel);
+    } catch (err) {
+      console.error("Failed to persist model selection:", err);
+    }
+  }, [selectedModel]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(THINKING_MODE_STORAGE_KEY);
+      if (raw === "off" || raw === "low" || raw === "medium" || raw === "high") {
+        setThinkingMode(raw);
+      }
+    } catch (err) {
+      console.error("Failed to load thinking mode:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(THINKING_MODE_STORAGE_KEY, thinkingMode);
+    } catch (err) {
+      console.error("Failed to persist thinking mode:", err);
+    }
+  }, [thinkingMode]);
+
+  useEffect(() => {
     if (!selectedWorkspace) {
       setWorkspaceFilesByPath({});
       setExpandedPaths(new Set());
       setLoadingPaths(new Set());
       setSelectedFilePath(null);
       setFileContentsByPath({});
+      setDiffContentsByTab({});
+      setLoadingDiffTabId(null);
       setCenterTabs([{ id: "chat", type: "chat", title: "Chat" }]);
       setActiveCenterTabId("chat");
       setWorkspaceChanges([]);
+      setExpandedChangePaths(new Set([""]));
       setCheckResults([]);
+      setDetectedChecks([]);
       setTerminalInput("");
+      setAttachedFiles([]);
       return;
     }
 
@@ -424,11 +625,16 @@ function App() {
     setLoadingPaths(new Set());
     setSelectedFilePath(null);
     setFileContentsByPath({});
+    setDiffContentsByTab({});
+    setLoadingDiffTabId(null);
     setCenterTabs([{ id: "chat", type: "chat", title: "Chat" }]);
     setActiveCenterTabId("chat");
     setWorkspaceChanges([]);
+    setExpandedChangePaths(new Set([""]));
     setCheckResults([]);
+    setDetectedChecks([]);
     setTerminalInput("");
+    setAttachedFiles([]);
     loadWorkspaceFiles(selectedWorkspace, "");
   }, [selectedWorkspace]);
 
@@ -441,8 +647,60 @@ function App() {
 
   useEffect(() => {
     if (!selectedWorkspace) return;
+    if (activeRightTab === "checks") {
+      loadWorkspaceCheckDefinitions(selectedWorkspace);
+    }
+  }, [activeRightTab, selectedWorkspace]);
+
+  useEffect(() => {
+    if (!selectedWorkspace) return;
     void ensureAgentForWorkspace(selectedWorkspace);
   }, [selectedWorkspace]);
+
+  useEffect(() => {
+    if (!selectedWorkspace) return;
+    const pending = pendingAutoPromptsByWorkspace[selectedWorkspace] || [];
+    if (pending.length === 0) return;
+
+    const thinkingSince = thinkingSinceByWorkspace[selectedWorkspace] ?? null;
+    if (thinkingSince !== null) return;
+
+    const hasRunningAgent = agents.some(
+      (agent) => agent.workspaceId === selectedWorkspace && agent.status === "running",
+    );
+    if (!hasRunningAgent) return;
+
+    let cancelled = false;
+    const nextPrompt = pending[0];
+    const visibleLabel = `/auto ${nextPrompt.name}`;
+
+    const runAutoPrompt = async () => {
+      const sent = await sendMessage(nextPrompt.prompt, visibleLabel);
+      if (cancelled) return;
+      setPendingAutoPromptsByWorkspace((prev) => {
+        const current = prev[selectedWorkspace] || [];
+        if (current.length === 0) return prev;
+        const [, ...rest] = current;
+        if (rest.length === 0) {
+          const next = { ...prev };
+          delete next[selectedWorkspace];
+          return next;
+        }
+        return {
+          ...prev,
+          [selectedWorkspace]: rest,
+        };
+      });
+      if (!sent) {
+        setError(`Failed to auto-run prompt: ${nextPrompt.name}`);
+      }
+    };
+
+    void runAutoPrompt();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedWorkspace, pendingAutoPromptsByWorkspace, thinkingSinceByWorkspace, agents]);
 
   async function loadInitialState() {
     try {
@@ -451,7 +709,30 @@ function App() {
       setServerStatus(status.serverStatus);
       
       if (status.repositories.length > 0) {
-        setSelectedRepo(status.repositories[0].id);
+        let persistedDefaultRepo: string | null = null;
+        try {
+          persistedDefaultRepo = localStorage.getItem(DEFAULT_REPOSITORY_STORAGE_KEY);
+        } catch (err) {
+          console.error("Failed to read default repository:", err);
+        }
+        const hasPersistedDefault =
+          !!persistedDefaultRepo &&
+          status.repositories.some((repo) => repo.id === persistedDefaultRepo);
+
+        if (hasPersistedDefault) {
+          setDefaultRepoId(persistedDefaultRepo);
+          setSelectedRepo(persistedDefaultRepo);
+        } else {
+          setSelectedRepo(status.repositories[0].id);
+          if (persistedDefaultRepo) {
+            setDefaultRepoId(null);
+            try {
+              localStorage.removeItem(DEFAULT_REPOSITORY_STORAGE_KEY);
+            } catch (err) {
+              console.error("Failed to clear invalid default repository:", err);
+            }
+          }
+        }
       }
       
       const ag = await invoke<Agent[]>("list_agents");
@@ -494,9 +775,67 @@ function App() {
         });
         setRepositories(prev => [...prev, repo]);
         setSelectedRepo(repo.id);
+        if (repositories.length === 0) {
+          setDefaultRepoId(repo.id);
+        }
       }
     } catch (err) {
       console.error("Failed to add repository:", err);
+      setError(String(err));
+    }
+  }
+
+  function handleSelectRepository(repoId: string) {
+    if (repoId === selectedRepo) return;
+    setSelectedRepo(repoId);
+    setSelectedWorkspace(null);
+    setMessages([]);
+  }
+
+  function setDefaultRepository(repoId: string) {
+    setDefaultRepoId(repoId);
+    handleSelectRepository(repoId);
+  }
+
+  async function removeRepository(repoId: string) {
+    try {
+      const removedWorkspaceIds = new Set(
+        workspaces.filter((workspace) => workspace.repoId === repoId).map((workspace) => workspace.id),
+      );
+
+      await invoke("remove_repository", { repoId });
+
+      const remainingRepos = repositories.filter((repo) => repo.id !== repoId);
+      setRepositories(remainingRepos);
+      setWorkspaces((prev) => prev.filter((workspace) => workspace.repoId !== repoId));
+      setAgents((prev) => prev.filter((agent) => !removedWorkspaceIds.has(agent.workspaceId)));
+      setPendingAutoPromptsByWorkspace((prev) => {
+        const next = { ...prev };
+        for (const workspaceId of removedWorkspaceIds) {
+          delete next[workspaceId];
+        }
+        return next;
+      });
+      setThinkingSinceByWorkspace((prev) => {
+        const next = { ...prev };
+        for (const workspaceId of removedWorkspaceIds) {
+          delete next[workspaceId];
+        }
+        return next;
+      });
+
+      if (selectedRepo === repoId) {
+        const nextRepoId = remainingRepos[0]?.id ?? null;
+        setSelectedRepo(nextRepoId);
+        setSelectedWorkspace(null);
+        setMessages([]);
+      }
+
+      if (defaultRepoId === repoId) {
+        setDefaultRepoId(remainingRepos[0]?.id ?? null);
+      }
+    } catch (err) {
+      console.error("Failed to remove repository:", err);
       setError(String(err));
     }
   }
@@ -509,9 +848,16 @@ function App() {
         repoId: selectedRepo,
         name: newWorkspaceName.trim() 
       });
+      const autoRunPrompts = promptShortcuts.filter((shortcut) => shortcut.autoRunOnCreate);
       setWorkspaces(prev => [...prev, workspace]);
       setNewWorkspaceName("");
       setShowCreateForm(false);
+      if (autoRunPrompts.length > 0) {
+        setPendingAutoPromptsByWorkspace((prev) => ({
+          ...prev,
+          [workspace.id]: autoRunPrompts,
+        }));
+      }
       setSelectedWorkspace(workspace.id);
     } catch (err) {
       console.error("Failed to create workspace:", err);
@@ -533,9 +879,19 @@ function App() {
         delete next[workspaceId];
         return next;
       });
+      setPendingAutoPromptsByWorkspace((prev) => {
+        const next = { ...prev };
+        delete next[workspaceId];
+        return next;
+      });
       if (selectedWorkspace === workspaceId) {
         setSelectedWorkspace(null);
         setMessages([]);
+      }
+      if (renameWorkspaceId === workspaceId) {
+        setShowRenameForm(false);
+        setRenameWorkspaceId(null);
+        setRenameWorkspaceName("");
       }
     } catch (err) {
       console.error("Failed to remove workspace:", err);
@@ -543,21 +899,23 @@ function App() {
     }
   }
 
-  function openRenameWorkspaceForm() {
-    if (!currentWorkspace) return;
-    setRenameWorkspaceName(currentWorkspace.name);
+  function openRenameWorkspaceForm(workspace: Workspace) {
+    setRenameWorkspaceId(workspace.id);
+    setRenameWorkspaceName(workspace.name);
     setShowRenameForm(true);
   }
 
   async function renameWorkspace() {
-    if (!selectedWorkspace || !renameWorkspaceName.trim()) return;
+    if (!renameWorkspaceId || !renameWorkspaceName.trim()) return;
     try {
       const updated = await invoke<Workspace>("rename_workspace", {
-        workspaceId: selectedWorkspace,
+        workspaceId: renameWorkspaceId,
         name: renameWorkspaceName.trim(),
       });
       setWorkspaces((prev) => prev.map((workspace) => (workspace.id === updated.id ? updated : workspace)));
       setShowRenameForm(false);
+      setRenameWorkspaceId(null);
+      setRenameWorkspaceName("");
     } catch (err) {
       console.error("Failed to rename workspace:", err);
       setError(String(err));
@@ -676,6 +1034,49 @@ function App() {
       messageToSend = matched.prompt;
       visibleMessage = `/${matched.name}`;
     }
+
+    const workspace = workspaces.find((item) => item.id === selectedWorkspace);
+    if (!workspace) {
+      setError("Workspace not found");
+      return false;
+    }
+
+    const attachedRelativePaths: string[] = [];
+    if (attachedFiles.length > 0) {
+      try {
+        const attachmentSections: string[] = [];
+        for (const absolutePath of attachedFiles) {
+          const relativePath = toWorkspaceRelativePath(absolutePath, workspace.worktreePath);
+          if (relativePath === null || !relativePath.trim()) {
+            continue;
+          }
+
+          const content = await invoke<string>("read_workspace_file", {
+            workspaceId: workspace.id,
+            relativePath,
+            maxBytes: 200000,
+          });
+
+          attachedRelativePaths.push(relativePath);
+          attachmentSections.push(
+            `<attached_file path="${relativePath}">\n${content}\n</attached_file>`,
+          );
+        }
+
+        if (attachmentSections.length > 0) {
+          messageToSend = `${messageToSend}\n\nUse these attached files as context:\n\n${attachmentSections.join("\n\n")}`;
+        }
+      } catch (err) {
+        console.error("Failed to prepare attached files:", err);
+        setError(String(err));
+        return false;
+      }
+    }
+
+    if (attachedRelativePaths.length > 0) {
+      const fileSummary = `[Files: ${attachedRelativePaths.join(", ")}]`;
+      visibleMessage = visibleMessage ? `${visibleMessage}\n${fileSummary}` : fileSummary;
+    }
     
     // Add user message to display
     setMessages(prev => [...prev, {
@@ -695,10 +1096,13 @@ function App() {
         message: messageToSend,
         envOverrides: parseEnvOverrides(envOverridesText),
         permissionMode: claudeMode === "plan" ? "plan" : "bypassPermissions",
+        model: selectedModel,
+        effort: thinkingMode === "off" ? null : thinkingMode,
       });
       if (!rawMessage) {
         setInputMessage("");
       }
+      setAttachedFiles([]);
     } catch (err) {
       console.error("Failed to send message:", err);
       setError(String(err));
@@ -782,10 +1186,67 @@ function App() {
     });
   }
 
+  async function addFilesToComposer() {
+    const workspace = workspaces.find((item) => item.id === selectedWorkspace);
+    if (!workspace) return;
+
+    try {
+      const picked = await open({
+        multiple: true,
+        directory: false,
+        defaultPath: workspace.worktreePath,
+      });
+
+      if (!picked) return;
+
+      const pickedFiles = Array.isArray(picked) ? picked : [picked];
+      const accepted: string[] = [];
+      let ignoredCount = 0;
+
+      for (const item of pickedFiles) {
+        if (typeof item !== "string") continue;
+        const relativePath = toWorkspaceRelativePath(item, workspace.worktreePath);
+        if (relativePath === null) {
+          ignoredCount += 1;
+          continue;
+        }
+        accepted.push(item);
+      }
+
+      if (accepted.length > 0) {
+        setAttachedFiles((prev) => Array.from(new Set([...prev, ...accepted])));
+      }
+      if (ignoredCount > 0) {
+        setError(`${ignoredCount} file(s) were ignored because they are outside the workspace.`);
+      }
+    } catch (err) {
+      console.error("Failed to attach files:", err);
+      setError(String(err));
+    }
+  }
+
+  function removeAttachedFile(path: string) {
+    setAttachedFiles((prev) => prev.filter((item) => item !== path));
+  }
+
   function openAddPromptForm() {
+    setEditingPromptId(null);
     setNewPromptName("");
     setNewPromptBody("");
+    setNewPromptAutoRunOnCreate(false);
     setShowAddPromptForm(true);
+  }
+
+  function openEditPromptForm(shortcut: PromptShortcut) {
+    setEditingPromptId(shortcut.id);
+    setNewPromptName(shortcut.name);
+    setNewPromptBody(shortcut.prompt);
+    setNewPromptAutoRunOnCreate(shortcut.autoRunOnCreate === true);
+    setShowAddPromptForm(true);
+  }
+
+  function deletePromptShortcut(promptId: string) {
+    setPromptShortcuts((prev) => prev.filter((shortcut) => shortcut.id !== promptId));
   }
 
   function addPromptShortcut() {
@@ -794,20 +1255,40 @@ function App() {
     if (!name || !prompt) return;
 
     const normalized = normalizePromptName(name);
-    const hasDuplicate = promptShortcuts.some((shortcut) => normalizePromptName(shortcut.name) === normalized);
+    const hasDuplicate = promptShortcuts.some(
+      (shortcut) =>
+        shortcut.id !== editingPromptId && normalizePromptName(shortcut.name) === normalized,
+    );
     if (hasDuplicate) {
       setError(`Prompt name already exists: ${name}`);
       return;
     }
 
-    setPromptShortcuts((prev) => [
-      ...prev,
-      {
-        id: `${Date.now()}-${Math.floor(Math.random() * 100000)}`,
-        name,
-        prompt,
-      },
-    ]);
+    if (editingPromptId) {
+      setPromptShortcuts((prev) =>
+        prev.map((shortcut) =>
+          shortcut.id === editingPromptId
+            ? {
+                ...shortcut,
+                name,
+                prompt,
+                autoRunOnCreate: newPromptAutoRunOnCreate,
+              }
+            : shortcut,
+        ),
+      );
+    } else {
+      setPromptShortcuts((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+          name,
+          prompt,
+          autoRunOnCreate: newPromptAutoRunOnCreate,
+        },
+      ]);
+    }
+    setEditingPromptId(null);
     setShowAddPromptForm(false);
   }
 
@@ -917,16 +1398,57 @@ function App() {
     }
   }
 
+  async function loadWorkspaceCheckDefinitions(workspaceId: string) {
+    setIsLoadingDetectedChecks(true);
+    try {
+      const checks = await invoke<WorkspaceCheckDefinition[]>("list_workspace_checks", { workspaceId });
+      setDetectedChecks(checks);
+    } catch (err) {
+      console.error("Failed to detect workspace checks:", err);
+      setDetectedChecks([]);
+      setError(String(err));
+    } finally {
+      setIsLoadingDetectedChecks(false);
+    }
+  }
+
   async function runWorkspaceChecks() {
     if (!selectedWorkspace) return;
+    const workspaceId = selectedWorkspace;
+    setTerminalTab("terminal");
+    appendTerminalLine(workspaceId, "meta", "Running workspace checks...");
     setIsRunningChecks(true);
     try {
       const results = await invoke<WorkspaceCheckResult[]>("run_workspace_checks", {
-        workspaceId: selectedWorkspace,
+        workspaceId,
       });
       setCheckResults(results);
+      let passCount = 0;
+      for (const result of results) {
+        appendTerminalLine(workspaceId, "command", `$ ${result.command}`);
+        appendTerminalLine(
+          workspaceId,
+          "meta",
+          `${result.success ? "PASS" : "FAIL"} ${result.name} · exit ${result.exitCode ?? "?"} · ${result.durationMs}ms`,
+        );
+        if (result.stdout.trim()) {
+          appendTerminalLine(workspaceId, "stdout", result.stdout.trimEnd());
+        }
+        if (result.stderr.trim()) {
+          appendTerminalLine(workspaceId, "stderr", result.stderr.trimEnd());
+        }
+        if (result.success) {
+          passCount += 1;
+        }
+      }
+      appendTerminalLine(
+        workspaceId,
+        "meta",
+        `Checks complete: ${passCount}/${results.length} passed.`,
+      );
     } catch (err) {
       console.error("Failed to run workspace checks:", err);
+      appendTerminalLine(workspaceId, "stderr", String(err));
       setError(String(err));
     } finally {
       setIsRunningChecks(false);
@@ -980,6 +1502,169 @@ function App() {
     } finally {
       setIsRunningTerminalCommand(false);
     }
+  }
+
+  async function startRemoteServer() {
+    if (isTogglingRemoteServer) return;
+    setIsTogglingRemoteServer(true);
+    try {
+      const status = await invoke<ServerStatus>("start_remote_server");
+      setServerStatus(status);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setIsTogglingRemoteServer(false);
+    }
+  }
+
+  async function stopRemoteServer() {
+    if (isTogglingRemoteServer) return;
+    setIsTogglingRemoteServer(true);
+    try {
+      const status = await invoke<ServerStatus>("stop_remote_server");
+      setServerStatus(status);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setIsTogglingRemoteServer(false);
+    }
+  }
+
+  function normalizeChangeStatus(status: string): string {
+    return status.trim() || status;
+  }
+
+  function getChangeStatusClass(status: string): string {
+    const normalized = normalizeChangeStatus(status);
+    if (normalized === "??" || normalized.includes("A")) return "text-emerald-300";
+    if (normalized.includes("D")) return "text-rose-300";
+    if (normalized.includes("R")) return "text-amber-300";
+    if (normalized.includes("M")) return "text-sky-300";
+    return "md-text-muted";
+  }
+
+  function toggleChangeDirectory(path: string) {
+    const isExpanded = expandedChangePaths.has(path);
+    setExpandedChangePaths((prev) => {
+      const next = new Set(prev);
+      if (isExpanded) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  }
+
+  async function openChangedFile(change: WorkspaceChangeEntry) {
+    if (!selectedWorkspace) return;
+
+    const tabId = `diff:${change.status}:${change.oldPath ?? ""}:${change.path}`;
+    setCenterTabs((prev) => {
+      if (prev.some((tab) => tab.id === tabId)) return prev;
+      const title = change.path.split("/").pop() || change.path;
+      return [
+        ...prev,
+        {
+          id: tabId,
+          type: "diff",
+          title,
+          path: change.path,
+          status: change.status,
+          oldPath: change.oldPath,
+        },
+      ];
+    });
+    setActiveCenterTabId(tabId);
+
+    if (diffContentsByTab[tabId] !== undefined) return;
+
+    setLoadingDiffTabId(tabId);
+    try {
+      const diff = await invoke<string>("read_workspace_change_diff", {
+        workspaceId: selectedWorkspace,
+        path: change.path,
+        oldPath: change.oldPath ?? null,
+        status: change.status,
+      });
+      setDiffContentsByTab((prev) => ({ ...prev, [tabId]: diff }));
+    } catch (err) {
+      console.error("Failed to load workspace change diff:", err);
+      setDiffContentsByTab((prev) => ({ ...prev, [tabId]: "" }));
+      setError(String(err));
+    } finally {
+      setLoadingDiffTabId((prev) => (prev === tabId ? null : prev));
+    }
+  }
+
+  function getDiffLineClass(line: string): string {
+    if (line.startsWith("+++ ") || line.startsWith("--- ")) return "text-indigo-300";
+    if (line.startsWith("+")) return "text-emerald-300";
+    if (line.startsWith("-")) return "text-rose-300";
+    if (line.startsWith("@@")) return "text-amber-300";
+    if (line.startsWith("diff --git") || line.startsWith("index ") || line.startsWith("new file mode") || line.startsWith("deleted file mode")) {
+      return "md-text-muted";
+    }
+    return "md-text-primary";
+  }
+
+  function renderChangeTree(nodes: ChangeTreeNode[], depth: number) {
+    return nodes.map((node) => {
+      const isExpanded = expandedChangePaths.has(node.path);
+      if (node.isDir) {
+        return (
+          <div key={`dir-${node.path}`}>
+            <button
+              onClick={() => toggleChangeDirectory(node.path)}
+              className="flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
+              style={{ paddingLeft: `${depth * 14 + 8}px` }}
+            >
+              <span className="w-3 md-text-muted">{isExpanded ? "▾" : "▸"}</span>
+              <span className="material-symbols-rounded !text-base md-text-primary">
+                {isExpanded ? "folder_open" : "folder"}
+              </span>
+              <span className="truncate">{node.name}</span>
+            </button>
+            {isExpanded && node.children.length > 0 && renderChangeTree(node.children, depth + 1)}
+          </div>
+        );
+      }
+
+      const change = node.change;
+      if (!change) return <div key={`file-${node.path}`} />;
+      const statusLabel = normalizeChangeStatus(change.status);
+
+      return (
+        <div key={`file-${node.path}`}>
+          <button
+            onClick={() => {
+              void openChangedFile(change);
+            }}
+            className={`flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle ${
+              activeCenterTabId === `diff:${change.status}:${change.oldPath ?? ""}:${change.path}`
+                ? "md-surface-strong md-text-strong"
+                : "md-text-secondary"
+            }`}
+            style={{ paddingLeft: `${depth * 14 + 8}px` }}
+          >
+            <span className="w-3 md-text-muted"> </span>
+            <span className="material-symbols-rounded !text-base md-text-dim">description</span>
+            <span className="truncate">{node.name}</span>
+            <span className={`ml-auto w-8 flex-none text-right font-mono text-[11px] ${getChangeStatusClass(change.status)}`}>
+              {statusLabel}
+            </span>
+          </button>
+          {change.oldPath && (
+            <p
+              className="truncate pl-7 text-[11px] md-text-muted"
+              style={{ paddingLeft: `${depth * 14 + 34}px` }}
+            >
+              from: {change.oldPath}
+            </p>
+          )}
+        </div>
+      );
+    });
   }
 
   function renderFileTree(path: string, depth: number) {
@@ -1131,6 +1816,7 @@ function App() {
     flushSystemBuffer();
     return rows;
   }, [workspaceMessages]);
+  const changeTreeNodes = useMemo(() => buildChangeTree(workspaceChanges), [workspaceChanges]);
   if (isLoading) {
     return (
       <div className="md-surface flex h-screen items-center justify-center md-text-primary">
@@ -1205,11 +1891,79 @@ function App() {
         </div>
 
         <div className="flex-1 overflow-y-auto md-px-4 md-py-4">
+          <div className="mb-4">
+            <div className="mb-2 flex items-center justify-between md-px-1">
+              <h2 className="md-title-small">Repositories</h2>
+              <button
+                type="button"
+                onClick={addRepository}
+                className="md-icon-plain rounded-full border md-outline"
+                title="Add repository"
+                aria-label="Add repository"
+              >
+                <span className="material-symbols-rounded !text-[18px]">add</span>
+              </button>
+            </div>
+            {repositories.length === 0 ? (
+              <p className="px-2 text-xs md-text-muted">No repositories added.</p>
+            ) : (
+              <div className="space-y-1">
+                {repositories.map((repo) => (
+                  <div
+                    key={repo.id}
+                    className={`md-list-item flex items-center gap-2 md-px-2 md-py-1.5 ${
+                      selectedRepo === repo.id ? "md-list-item-active" : ""
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleSelectRepository(repo.id)}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <p className="truncate text-xs md-text-primary">{repo.name}</p>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDefaultRepository(repo.id)}
+                      className={`md-icon-plain ${defaultRepoId === repo.id ? "md-text-primary !bg-white/10" : ""}`}
+                      title={defaultRepoId === repo.id ? "Default repository" : "Set as default repository"}
+                      aria-label={defaultRepoId === repo.id ? "Default repository" : `Set ${repo.name} as default`}
+                    >
+                      <span
+                        className="material-symbols-rounded !text-[16px]"
+                        style={{
+                          fontVariationSettings:
+                            defaultRepoId === repo.id
+                              ? '"FILL" 1, "wght" 500, "GRAD" 0, "opsz" 24'
+                              : '"FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24',
+                        }}
+                      >
+                        star
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void removeRepository(repo.id);
+                      }}
+                      className="md-icon-plain md-icon-plain-danger"
+                      title="Remove repository"
+                      aria-label={`Remove ${repo.name}`}
+                    >
+                      <span className="material-symbols-rounded !text-[16px]">delete</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           <div className="mb-4 flex items-center justify-between md-px-1">
             <h2 className="md-title-small">Workspaces</h2>
             <button
               onClick={openCreateWorkspaceForm}
               className="md-btn"
+              disabled={!selectedRepo}
             >
               + New
             </button>
@@ -1223,35 +1977,54 @@ function App() {
               </div>
               <div className="space-y-1">
                 {group.items.map((workspace) => (
-                  <button
+                  <div
                     key={workspace.id}
-                    onClick={() => handleSelectWorkspace(workspace.id)}
-                    className={`md-list-item w-full md-px-3 md-py-2 text-left ${
+                    className={`md-list-item flex items-center gap-2 md-px-3 md-py-2 ${
                       selectedWorkspace === workspace.id
                         ? "md-list-item-active"
                         : ""
                     }`}
                   >
-                    <div className="flex items-center gap-2">
-                      <span className={`h-2 w-2 rounded-full ${getStatusColor(workspace.status)}`} />
-                      <span className="truncate md-body-small md-text-primary">{workspace.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => handleSelectWorkspace(workspace.id)}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className={`h-2 w-2 rounded-full ${getStatusColor(workspace.status)}`} />
+                        <span className="truncate md-body-small md-text-primary">{workspace.name}</span>
+                      </div>
+                      <p className="mt-1 truncate md-body-small md-text-muted">{workspace.branch}</p>
+                    </button>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => openRenameWorkspaceForm(workspace)}
+                        className="md-icon-plain"
+                        title="Rename workspace"
+                        aria-label={`Rename ${workspace.name}`}
+                      >
+                        <span className="material-symbols-rounded !text-[16px]">edit</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void removeWorkspace(workspace.id);
+                        }}
+                        className="md-icon-plain md-icon-plain-danger"
+                        title="Delete workspace"
+                        aria-label={`Delete ${workspace.name}`}
+                      >
+                        <span className="material-symbols-rounded !text-[16px]">delete</span>
+                      </button>
                     </div>
-                    <p className="mt-1 truncate md-body-small md-text-muted">{workspace.branch}</p>
-                  </button>
+                  </div>
                 ))}
               </div>
             </div>
           ))}
         </div>
 
-        <div className="border-t md-outline md-px-4 md-py-3">
-          <button
-            onClick={addRepository}
-            className="md-btn w-full"
-          >
-            + Add repository
-          </button>
-        </div>
       </aside>
 
       <div
@@ -1281,57 +2054,10 @@ function App() {
                 Tools
               </button>
             </div>
-            <span className="md-label-large">{currentRepo?.name || "No repo"}</span>
-            <span className="md-text-faint">/</span>
             <span className="truncate md-title-small">{currentWorkspace?.name || "Select workspace"}</span>
             {currentWorkspace && <span className="truncate md-label-large">{currentWorkspace.branch}</span>}
-            {currentWorkspace && (
-              <button
-                onClick={openRenameWorkspaceForm}
-                title="Rename workspace"
-                className="md-icon-plain"
-                aria-label="Rename workspace"
-              >
-                <span className="material-symbols-rounded !text-[18px]">edit</span>
-              </button>
-            )}
-            {currentWorkspace && (
-              <button
-                onClick={() => removeWorkspace(selectedWorkspace!)}
-                title="Delete workspace"
-                className="md-icon-plain md-icon-plain-danger"
-                aria-label="Delete workspace"
-              >
-                <span className="material-symbols-rounded !text-[18px]">delete</span>
-              </button>
-            )}
           </div>
-          <div className="flex items-center gap-2">
-            <span
-              className={`md-chip ${
-                (serverStatus?.connectedClients || 0) > 0
-                  ? "border-emerald-700/60 bg-emerald-950/30 text-emerald-300"
-                  : "md-text-dim"
-              }`}
-              title="Connected remote clients"
-            >
-              Remote clients: {serverStatus?.connectedClients || 0}
-            </span>
-            <select
-              value={selectedRepo || ""}
-              onChange={(e) => {
-                setSelectedRepo(e.target.value);
-                setSelectedWorkspace(null);
-                setMessages([]);
-              }}
-              className="md-select max-w-[220px]"
-            >
-              {repositories.map((repo) => (
-                <option key={repo.id} value={repo.id}>
-                  {repo.name}
-                </option>
-              ))}
-            </select>
+          <div className="flex items-center gap-2 pt-1">
             {currentWorkspace && (
               <button
                 onClick={() => {
@@ -1339,7 +2065,7 @@ function App() {
                   setPrBody(`## Summary\n\nChanges from workspace: ${currentWorkspace.name}\n\n## Test Plan\n\n- [ ] Manual testing`);
                   setShowPRForm(true);
                 }}
-                className="md-btn md-btn-tonal whitespace-nowrap"
+                className="md-btn md-btn-tonal whitespace-nowrap !min-h-[30px] !px-3 text-xs"
               >
                 <span className="material-symbols-rounded !text-base">merge</span>
                 Open PR
@@ -1348,7 +2074,7 @@ function App() {
             {currentWorkspace && workspaceAgents.length > 0 && (
               <button
                 onClick={() => stopAgent(workspaceAgents[0].id)}
-                className="md-btn md-btn-danger"
+                className="md-btn md-btn-danger !min-h-[30px] !px-3 text-xs"
               >
                 <span className="material-symbols-rounded !text-base">stop_circle</span>
                 Stop
@@ -1488,7 +2214,7 @@ function App() {
                         </div>
                       );
                     })
-                  ) : (
+                  ) : activeCenterTab.type === "file" ? (
                     <div>
                       <p className="mb-2 truncate text-xs md-text-muted">{activeCenterTab.path}</p>
                       {isLoadingFileContent && selectedFilePath === activeCenterTab.path ? (
@@ -1496,6 +2222,33 @@ function App() {
                       ) : (
                         <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap font-mono text-sm md-text-primary">
                           {(activeCenterTab.path && fileContentsByPath[activeCenterTab.path]) || "(empty file)"}
+                        </pre>
+                      )}
+                    </div>
+                  ) : (
+                    <div>
+                      <div className="mb-2 flex flex-wrap items-center gap-2">
+                        <p className="truncate text-xs md-text-muted">{activeCenterTab.path}</p>
+                        {activeCenterTab.status && (
+                          <span className={`md-chip !px-2 !py-0 text-[10px] font-mono ${getChangeStatusClass(activeCenterTab.status)}`}>
+                            {normalizeChangeStatus(activeCenterTab.status)}
+                          </span>
+                        )}
+                      </div>
+                      {activeCenterTab.oldPath && (
+                        <p className="mb-2 truncate text-[11px] md-text-faint">from: {activeCenterTab.oldPath}</p>
+                      )}
+                      {loadingDiffTabId === activeCenterTab.id ? (
+                        <p className="text-xs md-text-muted">Loading diff...</p>
+                      ) : (
+                        <pre className="max-h-[70vh] overflow-auto whitespace-pre font-mono text-sm">
+                          {(diffContentsByTab[activeCenterTab.id] || "(no diff output)")
+                            .split("\n")
+                            .map((line, idx) => (
+                              <div key={`${activeCenterTab.id}-${idx}`} className={getDiffLineClass(line)}>
+                                {line || " "}
+                              </div>
+                            ))}
                         </pre>
                       )}
                     </div>
@@ -1517,7 +2270,7 @@ function App() {
 
               {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && (
                 <div className="border-t md-outline md-surface-container-high md-px-5 md-py-3">
-                  <div className="flex gap-2">
+                  <div className="rounded-2xl border md-outline md-surface-container md-px-3 md-py-3">
                     <textarea
                       value={inputMessage}
                       onChange={(e) => setInputMessage(e.target.value)}
@@ -1527,31 +2280,103 @@ function App() {
                           void sendMessage();
                         }
                       }}
-                      rows={3}
+                      rows={4}
                       placeholder="Ask to make changes... or run shortcut with /prompt name"
-                      className="md-field flex-1 resize-none"
+                      className="w-full resize-none border-0 bg-transparent text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted"
                     />
-                    <div className="flex flex-col items-end justify-end gap-2">
-                      <button
-                        onClick={() => setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"))}
-                        className={`md-btn md-icon-btn ${claudeMode === "plan" ? "md-btn-tonal" : ""}`}
-                        title={claudeMode === "plan" ? "Plan mode enabled (click for normal mode)" : "Normal mode enabled (click for plan mode)"}
-                        aria-label={claudeMode === "plan" ? "Switch to normal mode" : "Switch to plan mode"}
-                      >
-                        <span className="material-symbols-rounded !text-base">
-                          {claudeMode === "plan" ? "schema" : "bolt"}
-                        </span>
-                      </button>
-                      <button
-                        onClick={() => {
-                          void sendMessage();
-                        }}
-                        disabled={!inputMessage.trim() || isThinkingCurrentWorkspace}
-                        className="md-btn md-btn-tonal disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        <span className="material-symbols-rounded !text-base">send</span>
-                        Send
-                      </button>
+
+                    {attachedFiles.length > 0 && (
+                      <div className="flex flex-wrap gap-2 border-t md-outline pt-2">
+                        {attachedFiles.map((path) => {
+                          const relativePath = currentWorkspace
+                            ? toWorkspaceRelativePath(path, currentWorkspace.worktreePath) ?? path.split("/").pop() ?? path
+                            : path.split("/").pop() ?? path;
+                          return (
+                            <span key={path} className="md-chip gap-1">
+                              <span className="material-symbols-rounded !text-sm">description</span>
+                              <span className="max-w-[240px] truncate">{relativePath}</span>
+                              <button
+                                type="button"
+                                className="md-icon-plain !h-4 !w-4"
+                                onClick={() => removeAttachedFile(path)}
+                                title="Remove attached file"
+                              >
+                                <span className="material-symbols-rounded !text-sm">close</span>
+                              </button>
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t md-outline pt-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void addFilesToComposer()}
+                          className="md-btn md-icon-btn"
+                          title="Attach files from workspace"
+                          aria-label="Attach files"
+                        >
+                          <span className="material-symbols-rounded !text-base">add</span>
+                        </button>
+                        <label className="flex items-center gap-1">
+                          <span className="material-symbols-rounded !text-base md-text-muted">model_training</span>
+                          <select
+                            value={selectedModel}
+                            onChange={(e) => setSelectedModel(e.target.value)}
+                            className="md-select min-h-[34px] py-1 pl-3 pr-8 text-xs"
+                            style={{ width: "auto" }}
+                            aria-label="Model selection"
+                          >
+                            {MODEL_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="flex items-center gap-1">
+                          <span className="material-symbols-rounded !text-base md-text-muted">psychology</span>
+                          <select
+                            value={thinkingMode}
+                            onChange={(e) => setThinkingMode(e.target.value as "off" | "low" | "medium" | "high")}
+                            className="md-select min-h-[34px] py-1 pl-3 pr-8 text-xs"
+                            style={{ width: "auto" }}
+                            aria-label="Thinking mode"
+                          >
+                            <option value="off">Thinking off</option>
+                            <option value="low">Thinking low</option>
+                            <option value="medium">Thinking medium</option>
+                            <option value="high">Thinking high</option>
+                          </select>
+                        </label>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"))}
+                          className={`md-btn ${claudeMode === "plan" ? "md-btn-tonal" : ""}`}
+                          title={claudeMode === "plan" ? "Planning mode enabled (click for normal mode)" : "Normal mode enabled (click for planning mode)"}
+                          aria-label={claudeMode === "plan" ? "Switch to normal mode" : "Switch to planning mode"}
+                        >
+                          <span className="material-symbols-rounded !text-base">
+                            {claudeMode === "plan" ? "schema" : "bolt"}
+                          </span>
+                          {claudeMode === "plan" ? "Planning mode" : "Normal mode"}
+                        </button>
+
+                        <button
+                          onClick={() => {
+                            void sendMessage();
+                          }}
+                          disabled={!inputMessage.trim() || isThinkingCurrentWorkspace}
+                          className="md-btn md-btn-tonal disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          <span className="material-symbols-rounded !text-base">send</span>
+                          Send
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -1591,6 +2416,14 @@ function App() {
         <div className="flex h-14 items-center border-b md-outline md-px-4">
           <div className="md-segmented text-xs">
             <button
+              onClick={() => setActiveRightTab("prompts")}
+              className={`md-segmented-btn ${
+                activeRightTab === "prompts" ? "md-segmented-btn-active" : ""
+              }`}
+            >
+              Prompts
+            </button>
+            <button
               onClick={() => setActiveRightTab("files")}
               className={`md-segmented-btn ${
                 activeRightTab === "files" ? "md-segmented-btn-active" : ""
@@ -1624,44 +2457,87 @@ function App() {
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto md-px-4 md-py-4">
-          <div className="md-card mb-4 p-4">
-            <div className="mb-2 flex items-center justify-between">
-              <p className="md-label-medium">Prompts</p>
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => setShowEnvForm(true)}
-                  className="md-btn"
-                  title="Edit environment overrides"
-                >
-                  Env
-                </button>
-                <button
-                  onClick={openAddPromptForm}
-                  className="md-btn md-btn-tonal"
-                  title="Add prompt shortcut"
-                >
-                  <span className="material-symbols-rounded !text-base">add</span>
-                  Add
-                </button>
-              </div>
-            </div>
-            {promptShortcuts.length === 0 ? (
-              <p className="text-xs md-text-muted">No prompt shortcuts yet.</p>
-            ) : (
-              <div className="flex flex-wrap gap-2">
-                {promptShortcuts.map((shortcut) => (
+          {activeRightTab === "prompts" && (
+            <div className="space-y-2 text-sm">
+              <p className="md-label-medium">Prompt Library</p>
+              <div className="md-card p-3 md-text-secondary">
+                {promptShortcuts.length === 0 ? (
+                  <p className="text-xs md-text-muted">No prompt shortcuts yet.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {promptShortcuts.map((shortcut) => (
+                      <div
+                        key={shortcut.id}
+                        className="md-card cursor-pointer md-px-2 md-py-2 transition hover:md-surface-subtle"
+                        onClick={() => {
+                          void runPromptShortcut(shortcut);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            void runPromptShortcut(shortcut);
+                          }
+                        }}
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`Run prompt ${shortcut.name}`}
+                        title={shortcut.prompt}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="truncate text-sm md-text-strong">{shortcut.name}</span>
+                            {shortcut.autoRunOnCreate && (
+                              <span className="md-chip !px-2 !py-0 text-[10px]">Auto-run on create</span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openEditPromptForm(shortcut);
+                              }}
+                              className="md-icon-plain"
+                              title="Edit prompt"
+                              aria-label={`Edit ${shortcut.name}`}
+                            >
+                              <span className="material-symbols-rounded !text-[16px]">edit</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                deletePromptShortcut(shortcut.id);
+                              }}
+                              className="md-icon-plain md-icon-plain-danger"
+                              title="Delete prompt"
+                              aria-label={`Delete ${shortcut.name}`}
+                            >
+                              <span className="material-symbols-rounded !text-[16px]">delete</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="mt-3 flex justify-center">
                   <button
-                    key={shortcut.id}
-                    onClick={() => runPromptShortcut(shortcut)}
-                    className="md-btn"
-                    title={shortcut.prompt}
+                    type="button"
+                    onClick={openAddPromptForm}
+                    className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle"
+                    title="Add prompt shortcut"
+                    aria-label="Add prompt shortcut"
                   >
-                    {shortcut.name}
+                    <span className="material-symbols-rounded !text-[18px]">add</span>
                   </button>
-                ))}
+                </div>
               </div>
-            )}
-          </div>
+              <p className="text-xs md-text-muted">
+                Click a prompt to run it. Use `/prompt name` in chat, or enable auto-run for new workspaces.
+              </p>
+            </div>
+          )}
 
           {activeRightTab === "files" && (
             <div className="space-y-2 text-sm">
@@ -1695,7 +2571,9 @@ function App() {
           )}
 
           {activeRightTab === "changes" && (
-            <div className="md-card p-3 text-xs">
+            <div className="space-y-2 text-sm">
+              <p className="md-label-medium">Workspace Changes</p>
+              <div className="md-card p-3 md-text-secondary">
               <div className="mb-2 flex items-center justify-between">
                 <span className="md-text-secondary">Git status</span>
                 <button
@@ -1705,26 +2583,22 @@ function App() {
                   Refresh
                 </button>
               </div>
+              <p className="truncate text-xs md-text-muted">
+                {currentWorkspace?.worktreePath || currentRepo?.path || "No active workspace"}
+              </p>
 
               {isLoadingChanges && <p className="md-text-muted">Loading changes...</p>}
               {!isLoadingChanges && workspaceChanges.length === 0 && (
                 <p className="md-text-muted">Working tree is clean.</p>
               )}
               {!isLoadingChanges && workspaceChanges.length > 0 && (
-                <div className="space-y-1">
-                  {workspaceChanges.map((change) => (
-                    <div key={`${change.status}-${change.path}`} className="md-card md-px-2 md-py-1.5">
-                      <div className="flex items-center gap-2">
-                        <span className="w-10 font-mono text-[11px] text-amber-300">{change.status}</span>
-                        <span className="truncate md-text-primary">{change.path}</span>
-                      </div>
-                      {change.oldPath && (
-                        <p className="mt-0.5 truncate pl-12 text-[11px] md-text-muted">from: {change.oldPath}</p>
-                      )}
-                    </div>
-                  ))}
+                <div className="mt-3">
+                  {renderChangeTree(changeTreeNodes, 0)}
                 </div>
               )}
+              </div>
+
+              <p className="text-xs md-text-muted">Click a changed file to open a diff tab in the center pane.</p>
             </div>
           )}
 
@@ -1739,6 +2613,27 @@ function App() {
                 >
                   {isRunningChecks ? "Running..." : "Run checks"}
                 </button>
+              </div>
+
+              <div className="mb-3 border-b pb-3 md-outline">
+                <p className="mb-2 md-text-dim">Detected checks</p>
+                {isLoadingDetectedChecks && <p className="md-text-muted">Detecting checks...</p>}
+                {!isLoadingDetectedChecks && detectedChecks.length === 0 && (
+                  <p className="md-text-muted">No checks detected for this workspace.</p>
+                )}
+                {!isLoadingDetectedChecks && detectedChecks.length > 0 && (
+                  <div className="space-y-2">
+                    {detectedChecks.map((check) => (
+                      <div key={`${check.name}-${check.command}`} className="md-card p-2">
+                        <div className="mb-1 flex items-center justify-between gap-2">
+                          <span className="md-text-secondary">{check.name}</span>
+                        </div>
+                        <p className="truncate font-mono text-[11px] md-text-muted">{check.command}</p>
+                        <p className="mt-1 text-[11px] md-text-muted">{check.description}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {!isRunningChecks && checkResults.length === 0 && (
@@ -1756,6 +2651,11 @@ function App() {
                         <span className="text-[11px] md-text-muted">{check.durationMs}ms</span>
                       </div>
                       <p className="truncate font-mono text-[11px] md-text-muted">{check.command}</p>
+                      {!!check.stdout && (
+                        <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap text-[11px] text-emerald-200">
+                          {check.stdout}
+                        </pre>
+                      )}
                       {!!check.stderr && (
                         <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap text-[11px] text-rose-300">
                           {check.stderr}
@@ -1784,10 +2684,10 @@ function App() {
                 Setup
               </button>
               <button
-                onClick={() => setTerminalTab("run")}
-                className={`md-segmented-btn ${terminalTab === "run" ? "md-segmented-btn-active" : ""}`}
+                onClick={() => setTerminalTab("remote")}
+                className={`md-segmented-btn ${terminalTab === "remote" ? "md-segmented-btn-active" : ""}`}
               >
-                Run
+                Remote
               </button>
               <button
                 onClick={() => setTerminalTab("terminal")}
@@ -1799,23 +2699,27 @@ function App() {
             <span>{serverStatus?.running ? "Server online" : "Server offline"}</span>
           </div>
           {terminalTab === "setup" && (
-            <div className="md-card h-[calc(100%-24px)] overflow-auto p-3 text-xs md-text-secondary">
-              <p className="md-text-dim">Workspace</p>
-              <p className="mb-3 md-text-strong">{currentWorkspace?.name || "-"}</p>
-              <p className="md-text-dim">Path</p>
-              <p className="break-all md-text-strong">{currentWorkspace?.worktreePath || "-"}</p>
-            </div>
-          )}
-          {terminalTab === "run" && (
-            <div className="md-card h-[calc(100%-24px)] overflow-auto p-3 text-xs">
-              <p className="mb-2 md-text-secondary">Quick actions</p>
-              <button
-                onClick={runWorkspaceChecks}
-                disabled={!selectedWorkspace || isRunningChecks}
-                className="md-btn md-btn-tonal disabled:opacity-40"
-              >
-                {isRunningChecks ? "Running checks..." : "Run workspace checks"}
-              </button>
+            <div className="md-card h-[calc(100%-24px)] space-y-3 overflow-auto p-3 text-xs md-text-secondary">
+              <div>
+                <p className="md-text-dim">Workspace</p>
+                <p className="mb-3 md-text-strong">{currentWorkspace?.name || "-"}</p>
+                <p className="md-text-dim">Path</p>
+                <p className="break-all md-text-strong">{currentWorkspace?.worktreePath || "-"}</p>
+              </div>
+
+              <div className="border-t md-outline pt-3">
+                <p className="md-text-dim">Environment overrides (app-wide)</p>
+                <p className="mb-2 text-[11px] md-text-muted">
+                  Supports lines like `export KEY=VALUE` or `KEY=VALUE`. Applied to agents, chat and terminal commands.
+                </p>
+                <textarea
+                  value={envOverridesText}
+                  onChange={(e) => setEnvOverridesText(e.target.value)}
+                  rows={6}
+                  className="md-field font-mono"
+                  placeholder={"export CLAUDE_CODE_USE_BEDROCK=1\nexport AWS_PROFILE=your-profile"}
+                />
+              </div>
             </div>
           )}
           {terminalTab === "terminal" && (
@@ -1862,6 +2766,52 @@ function App() {
                   />
                 </div>
                 <div ref={terminalEndRef} />
+              </div>
+            </div>
+          )}
+          {terminalTab === "remote" && (
+            <div className="md-card h-[calc(100%-24px)] space-y-4 overflow-auto p-3 text-xs md-text-secondary">
+              <div className="flex items-start justify-between gap-4">
+                <div className="space-y-1">
+                  <p className="md-text-dim">Server status</p>
+                  <p className={`text-sm ${serverStatus?.running ? "text-emerald-300" : "text-rose-300"}`}>
+                    {serverStatus?.running ? "Running" : "Stopped"}
+                  </p>
+                </div>
+                <div className="text-right">
+                  <p className="md-text-dim">Connected clients</p>
+                  <p className="text-sm md-text-strong">{serverStatus?.connectedClients ?? 0}</p>
+                </div>
+              </div>
+
+              <div className="border-t md-outline pt-3">
+                <p className="md-text-dim">Connection URL</p>
+                <p className="mt-1 break-all font-mono text-[11px] md-text-strong">
+                  {serverStatus?.connectUrl || "ws://localhost:3001"}
+                </p>
+              </div>
+
+              <div className="border-t md-outline pt-3">
+                <p className="mb-2 md-text-dim">Server controls</p>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={startRemoteServer}
+                    disabled={isTogglingRemoteServer || !!serverStatus?.running}
+                    className="md-icon-plain !h-8 !w-8 rounded-full border md-outline disabled:cursor-not-allowed disabled:opacity-40"
+                    title="Start remote server"
+                  >
+                    <span className="material-symbols-rounded !text-[16px]">play_arrow</span>
+                  </button>
+                  <button
+                    onClick={stopRemoteServer}
+                    disabled={isTogglingRemoteServer || !serverStatus?.running}
+                    className="md-icon-plain !h-8 !w-8 rounded-full border md-outline disabled:cursor-not-allowed disabled:opacity-40"
+                    title="Stop remote server"
+                  >
+                    <span className="material-symbols-rounded !text-[16px]">stop</span>
+                  </button>
+                  {isTogglingRemoteServer && <span className="text-[11px] md-text-muted">Updating...</span>}
+                </div>
               </div>
             </div>
           )}
@@ -1919,6 +2869,7 @@ function App() {
               <button
                 onClick={() => {
                   setShowRenameForm(false);
+                  setRenameWorkspaceId(null);
                   setRenameWorkspaceName("");
                 }}
                 className="md-btn flex-1"
@@ -1996,9 +2947,13 @@ function App() {
         <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
           <div className="md-dialog mx-4 w-full max-w-lg">
             <div className="border-b md-outline p-4">
-              <h3 className="text-lg font-semibold md-text-strong">Add Prompt Shortcut</h3>
+              <h3 className="text-lg font-semibold md-text-strong">
+                {editingPromptId ? "Edit Prompt Shortcut" : "Add Prompt Shortcut"}
+              </h3>
               <p className="mt-1 text-sm md-text-muted">
-                Create a reusable prompt button and slash command.
+                {editingPromptId
+                  ? "Update a reusable prompt button and slash command."
+                  : "Create a reusable prompt button and slash command."}
               </p>
             </div>
 
@@ -2023,11 +2978,28 @@ function App() {
                   placeholder="Write the full prompt to execute"
                 />
               </div>
+              <label className="flex items-start gap-2 rounded-lg border md-outline p-3 text-sm">
+                <input
+                  type="checkbox"
+                  checked={newPromptAutoRunOnCreate}
+                  onChange={(e) => setNewPromptAutoRunOnCreate(e.target.checked)}
+                  className="mt-0.5 h-4 w-4"
+                />
+                <span>
+                  <span className="block md-text-secondary">Auto-run on workspace creation</span>
+                  <span className="block text-xs md-text-muted">
+                    Execute this prompt automatically after a new workspace is created and its agent is ready.
+                  </span>
+                </span>
+              </label>
             </div>
 
             <div className="flex justify-end gap-2 border-t md-outline p-4">
               <button
-                onClick={() => setShowAddPromptForm(false)}
+                onClick={() => {
+                  setShowAddPromptForm(false);
+                  setEditingPromptId(null);
+                }}
                 className="md-btn"
               >
                 Cancel
@@ -2037,42 +3009,13 @@ function App() {
                 disabled={!newPromptName.trim() || !newPromptBody.trim()}
                 className="md-btn md-btn-tonal disabled:opacity-50"
               >
-                Add Prompt
+                {editingPromptId ? "Save Prompt" : "Add Prompt"}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {showEnvForm && (
-        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
-          <div className="md-dialog mx-4 w-full max-w-xl">
-            <div className="border-b md-outline p-4">
-              <h3 className="text-lg font-semibold md-text-strong">Environment Overrides</h3>
-              <p className="mt-1 text-sm md-text-muted">
-                Paste freeform env lines. Supports `export KEY=VALUE` and `KEY=VALUE`.
-              </p>
-            </div>
-            <div className="p-4">
-              <textarea
-                value={envOverridesText}
-                onChange={(e) => setEnvOverridesText(e.target.value)}
-                rows={12}
-                className="md-field font-mono"
-                placeholder={"export CLAUDE_CODE_USE_BEDROCK=1\nexport AWS_PROFILE=your-profile"}
-              />
-            </div>
-            <div className="flex justify-end gap-2 border-t md-outline p-4">
-              <button
-                onClick={() => setShowEnvForm(false)}
-                className="md-btn"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

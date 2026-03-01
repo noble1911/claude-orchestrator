@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::net::{IpAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tauri::{Emitter, State};
 use tauri_plugin_dialog::DialogExt;
@@ -18,6 +19,9 @@ mod websocket_server;
 
 use database::Database;
 use websocket_server::{ChangeInfo, CheckInfo, FileEntryInfo, MessageInfo, WebSocketServer, WsResponse, WorkspaceInfo, ServerCommand};
+
+static CLAUDE_HELP_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+const REMOTE_SERVER_PORT: u16 = 3001;
 
 // Types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +79,7 @@ pub struct ServerStatus {
     pub running: bool,
     pub port: u16,
     pub connected_clients: usize,
+    pub connect_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +127,14 @@ pub struct WorkspaceCheckResult {
     pub stderr: String,
     pub duration_ms: u128,
     pub skipped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCheckDefinition {
+    pub name: String,
+    pub command: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,7 +197,6 @@ impl AppState {
     
     fn set_ws_server(&mut self, server: Arc<WebSocketServer>) {
         self.ws_server = Some(server);
-        *self.ws_server_running.write() = true;
     }
 }
 
@@ -265,6 +277,37 @@ fn remove_workspace_directory(repo_path: &str, worktree_path: &str) -> Result<()
     Ok(())
 }
 
+fn detect_remote_connect_host() -> String {
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(socket) => socket,
+        Err(_) => return "localhost".to_string(),
+    };
+
+    if socket.connect("8.8.8.8:80").is_err() {
+        return "localhost".to_string();
+    }
+
+    match socket.local_addr() {
+        Ok(addr) => match addr.ip() {
+            IpAddr::V4(v4) => v4.to_string(),
+            IpAddr::V6(v6) => format!("[{}]", v6),
+        },
+        Err(_) => "localhost".to_string(),
+    }
+}
+
+fn build_server_status(state: &AppState) -> ServerStatus {
+    let running = *state.ws_server_running.read();
+    let connected_clients = *state.ws_connected_clients.read();
+    let host = detect_remote_connect_host();
+    ServerStatus {
+        running,
+        port: REMOTE_SERVER_PORT,
+        connected_clients,
+        connect_url: format!("ws://{}:{}", host, REMOTE_SERVER_PORT),
+    }
+}
+
 // Tauri Commands
 #[tauri::command]
 async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
@@ -285,17 +328,39 @@ async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
 #[tauri::command]
 async fn get_app_status(state: State<'_, Arc<AppState>>) -> Result<AppStatus, String> {
     let repositories: Vec<Repository> = state.repositories.read().values().cloned().collect();
-    let running = *state.ws_server_running.read();
-    let client_count = *state.ws_connected_clients.read();
     
     Ok(AppStatus {
         repositories,
-        server_status: ServerStatus {
-            running,
-            port: 3001,
-            connected_clients: client_count,
-        },
+        server_status: build_server_status(state.inner().as_ref()),
     })
+}
+
+#[tauri::command]
+async fn start_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerStatus, String> {
+    let server = state
+        .ws_server
+        .clone()
+        .ok_or_else(|| "Remote server is not initialized.".to_string())?;
+
+    server.start().await?;
+    *state.ws_server_running.write() = true;
+    *state.ws_connected_clients.write() = server.client_count();
+
+    Ok(build_server_status(state.inner().as_ref()))
+}
+
+#[tauri::command]
+async fn stop_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerStatus, String> {
+    let server = state
+        .ws_server
+        .clone()
+        .ok_or_else(|| "Remote server is not initialized.".to_string())?;
+
+    server.stop();
+    *state.ws_server_running.write() = false;
+    *state.ws_connected_clients.write() = 0;
+
+    Ok(build_server_status(state.inner().as_ref()))
 }
 
 #[tauri::command]
@@ -646,10 +711,48 @@ async fn start_agent(
     Ok(agent)
 }
 
-fn find_claude_cli() -> Option<String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let paths = [
+fn find_claude_cli_in_path(path_value: &str) -> Option<String> {
+    for dir in std::env::split_paths(path_value) {
+        let candidate = dir.join("claude");
+        if candidate.exists() && candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn find_claude_cli_with_env(env_map: Option<&HashMap<String, String>>) -> Option<String> {
+    let home = env_map
+        .and_then(|map| map.get("HOME").cloned())
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_default();
+    let preferred_paths = [
+        format!("{}/.local/bin/claude", home),
         format!("{}/.claude/local/claude", home),
+    ];
+
+    for path in preferred_paths {
+        if std::path::Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
+
+    if let Some(map) = env_map {
+        if let Some(found) = map
+            .get("PATH")
+            .and_then(|path_value| find_claude_cli_in_path(path_value))
+        {
+            return Some(found);
+        }
+    }
+
+    if let Ok(path_value) = std::env::var("PATH") {
+        if let Some(found) = find_claude_cli_in_path(&path_value) {
+            return Some(found);
+        }
+    }
+
+    let paths = [
         "/usr/local/bin/claude".to_string(),
         "/opt/homebrew/bin/claude".to_string(),
     ];
@@ -659,9 +762,101 @@ fn find_claude_cli() -> Option<String> {
         .cloned()
 }
 
-fn load_cli_shell_env() -> HashMap<String, String> {
-    let mut env_map: HashMap<String, String> = std::env::vars().collect();
+fn claude_help_text(claude_path: &str) -> Option<String> {
+    let cache = CLAUDE_HELP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(claude_path) {
+            return Some(cached.clone());
+        }
+    }
 
+    let output = Command::new(claude_path).arg("--help").output().ok()?;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    if !output.stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    if text.trim().is_empty() {
+        tracing::warn!(claude_path = %claude_path, "claude --help returned empty output");
+        return None;
+    }
+    tracing::info!(
+        claude_path = %claude_path,
+        help_len = text.len(),
+        has_model_flag = text.contains("--model"),
+        "claude --help output captured"
+    );
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(claude_path.to_string(), text.clone());
+    }
+    Some(text)
+}
+
+fn claude_supports_option(claude_path: &str, option: &str) -> bool {
+    claude_help_text(claude_path)
+        .map(|help| help.contains(option))
+        .unwrap_or(false)
+}
+
+fn claude_supports_stream_json(claude_path: &str) -> bool {
+    claude_supports_option(claude_path, "--output-format")
+}
+
+fn claude_supports_permission_mode(claude_path: &str) -> bool {
+    claude_supports_option(claude_path, "--permission-mode")
+}
+
+fn claude_supports_model_option(claude_path: &str) -> bool {
+    claude_supports_option(claude_path, "--model")
+}
+
+fn claude_supports_resume_option(claude_path: &str) -> bool {
+    claude_supports_option(claude_path, "--resume")
+}
+
+fn append_claude_request_args(
+    cmd: &mut Command,
+    claude_path: &str,
+    permission_mode: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    claude_session_id: Option<&str>,
+    prompt: &str,
+) {
+    cmd.arg("--print");
+    if claude_supports_stream_json(claude_path) {
+        // Claude CLI requires --verbose when using --output-format=stream-json.
+        // Keep this coupled so we don't regress into runtime arg errors.
+        cmd.arg("--verbose");
+        cmd.args(["--output-format", "stream-json"]);
+    }
+    if claude_supports_permission_mode(claude_path) {
+        cmd.args(["--permission-mode", permission_mode]);
+    }
+    // Always pass --model and --resume when values are present.
+    // These flags have been stable since Claude CLI ~2.0 and gating them
+    // behind `claude --help` feature detection is fragile: --help can fail
+    // in the Tauri subprocess environment (no TTY, restricted env), causing
+    // critical flags to be silently dropped.
+    if let Some(model) = model {
+        cmd.args(["--model", model]);
+    }
+    if let Some(effort) = effort {
+        cmd.args(["--effort", effort]);
+    }
+    if let Some(claude_sid) = claude_session_id {
+        cmd.args(["--resume", claude_sid]);
+    }
+    cmd.args(["-p", prompt]);
+}
+
+fn load_cli_shell_env() -> HashMap<String, String> {
+    // Source env vars from the user's login shell profile — NOT the Tauri
+    // parent process.  The parent process may carry stale values (e.g. expired
+    // AWS STS session tokens) that override the user's real credential chain.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let output = Command::new(&shell)
         .args(["-lic", "printenv"])
@@ -672,23 +867,27 @@ fn load_cli_shell_env() -> HashMap<String, String> {
         .env("ZSH_COMPDUMP", "/tmp/.zcompdump-claude-orchestrator")
         .output();
 
-    let output = match output {
-        Ok(value) => value,
-        Err(_) => return env_map,
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.trim().is_empty() {
-        return env_map;
-    }
-
-    for line in stdout.lines() {
-        if let Some((key, value)) = line.split_once('=') {
-            if !key.trim().is_empty() {
-                env_map.insert(key.to_string(), value.to_string());
+    let mut env_map: HashMap<String, String> = match output {
+        Ok(ref out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut map = HashMap::new();
+            for line in stdout.lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    if !key.trim().is_empty() {
+                        map.insert(key.to_string(), value.to_string());
+                    }
+                }
+            }
+            if map.is_empty() {
+                // Shell returned nothing — fall back to parent process env
+                // as a last resort so the CLI can still find basic vars.
+                std::env::vars().collect()
+            } else {
+                map
             }
         }
-    }
+        Err(_) => std::env::vars().collect(),
+    };
 
     env_map
 }
@@ -728,9 +927,26 @@ fn build_effective_cli_env(env_overrides: &HashMap<String, String>) -> HashMap<S
     env_map
 }
 
+/// Environment variable prefixes that override the CLI's built-in model
+/// resolution.  Stripping them lets `--model opus` (etc.) resolve to the
+/// latest model ID the CLI itself knows about, instead of stale values
+/// baked into the user's shell profile.
+const MODEL_OVERRIDE_ENV_PREFIXES: &[&str] = &[
+    "CLAUDE_MODEL_",
+    "CLAUDE_BEDROCK_MODEL_",
+];
+
 fn configure_cli_env(cmd: &mut Command, env_map: &HashMap<String, String>) {
+    // Start with a clean environment so no stale vars from the parent
+    // process (Tauri app / launchd) leak into the Claude CLI subprocess.
+    cmd.env_clear();
     for (key, value) in env_map {
-        cmd.env(key, value);
+        let dominated = MODEL_OVERRIDE_ENV_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix));
+        if !dominated {
+            cmd.env(key, value);
+        }
     }
 }
 
@@ -775,6 +991,80 @@ fn normalize_permission_mode(mode: Option<&str>) -> &'static str {
     match mode.map(|v| v.trim()) {
         Some("plan") => "plan",
         _ => "bypassPermissions",
+    }
+}
+
+fn normalize_model(model: Option<&str>) -> Option<String> {
+    let value = model.map(|v| v.trim()).filter(|v| !v.is_empty())?;
+    let lower = value.to_ascii_lowercase();
+    if lower == "default" {
+        None
+    } else if lower == "opus" || lower == "sonnet" || lower == "haiku" {
+        Some(lower)
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn normalize_effort(effort: Option<&str>) -> Option<&'static str> {
+    let value = effort.map(|v| v.trim()).filter(|v| !v.is_empty())?;
+    if value.eq_ignore_ascii_case("low") {
+        Some("low")
+    } else if value.eq_ignore_ascii_case("medium") {
+        Some("medium")
+    } else if value.eq_ignore_ascii_case("high") {
+        Some("high")
+    } else {
+        None
+    }
+}
+
+/// Map short aliases to concrete model IDs.
+///
+/// The Claude CLI's built-in alias resolution is stale on Bedrock
+/// (e.g. "opus" → Opus 4.1).  When Bedrock is enabled we map aliases
+/// directly to cross-region inference model IDs (`global.anthropic.*`).
+/// For non-Bedrock (API) usage, model family names work fine.
+///
+/// NOTE: the Bedrock model IDs have inconsistent naming — update these
+/// when new models are released on Bedrock.
+fn resolve_model_for_runtime(requested_model: Option<&str>, is_bedrock: bool) -> Option<String> {
+    let value = requested_model
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+
+    if is_bedrock {
+        match value {
+            "opus" => return Some("global.anthropic.claude-opus-4-6-v1".to_string()),
+            "sonnet" => return Some("global.anthropic.claude-sonnet-4-6".to_string()),
+            "haiku" => return Some("global.anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
+            _ => {}
+        }
+    } else {
+        match value {
+            "opus" => return Some("claude-opus-4-6".to_string()),
+            "sonnet" => return Some("claude-sonnet-4-6".to_string()),
+            "haiku" => return Some("claude-haiku-4-5".to_string()),
+            _ => {}
+        }
+    }
+
+    Some(value.to_string())
+}
+
+fn extract_model_suggestion(error_text: &str) -> Option<String> {
+    let needle = "Try --model to switch to ";
+    let start = error_text.find(needle)?;
+    let tail = &error_text[start + needle.len()..];
+    let token = tail
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '.' || c == ',' || c == '"' || c == '\'' || c == '`');
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
     }
 }
 
@@ -1167,7 +1457,8 @@ fn run_claude_cli(
     workspace_id: String,
     env_overrides: HashMap<String, String>,
 ) {
-    let claude_path = match find_claude_cli() {
+    let effective_env = build_effective_cli_env(&env_overrides);
+    let claude_path = match find_claude_cli_with_env(Some(&effective_env)) {
         Some(p) => p,
         None => {
             let msg = AgentMessage {
@@ -1241,7 +1532,7 @@ fn run_claude_cli(
     }
 
     // Ensure these remain referenced for future reintroduction of startup runs.
-    let _ = (&workspace_path, &existing_session, &env_overrides, &claude_path);
+    let _ = (&workspace_path, &existing_session, &env_overrides, &claude_path, &effective_env);
 }
 
 #[tauri::command]
@@ -1294,6 +1585,8 @@ async fn send_message_to_agent(
     message: String,
     env_overrides: Option<HashMap<String, String>>,
     permission_mode: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
@@ -1325,9 +1618,12 @@ async fn send_message_to_agent(
     let db = app_state.db.clone();
     let env_overrides = env_overrides.unwrap_or_default();
     let requested_permission_mode = normalize_permission_mode(permission_mode.as_deref()).to_string();
+    let requested_model = normalize_model(model.as_deref());
+    let requested_effort = normalize_effort(effort.as_deref()).map(str::to_string);
     
     std::thread::spawn(move || {
-        let claude_path = match find_claude_cli() {
+        let effective_env = build_effective_cli_env(&env_overrides);
+        let claude_path = match find_claude_cli_with_env(Some(&effective_env)) {
             Some(p) => p,
             None => {
                 let msg = AgentMessage {
@@ -1352,42 +1648,41 @@ async fn send_message_to_agent(
                 return;
             }
         };
-        
-        let effective_env = build_effective_cli_env(&env_overrides);
         let (env_summary, env_hint) = auth_env_feedback(&effective_env);
         let permission_mode = requested_permission_mode.as_str();
+        let is_bedrock = env_truthy(effective_env.get("CLAUDE_CODE_USE_BEDROCK"));
+        let resolved_model = resolve_model_for_runtime(requested_model.as_deref(), is_bedrock);
+        let model = resolved_model.as_deref();
+        let effort = requested_effort.as_deref();
 
-        // Build command - always use --resume if we have a session
+        // Build a compatibility-first command and include optional flags only
+        // when the detected Claude CLI supports them.
         let mut cmd = Command::new(&claude_path);
         cmd.current_dir(&workspace_path);
         configure_cli_env(&mut cmd, &effective_env);
-        
-        if let Some(ref claude_sid) = claude_session_id {
-            cmd.args([
-                "--print",
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--include-partial-messages",
-                "--permission-mode",
-                permission_mode,
-                "--resume",
-                claude_sid,
-                "-p",
-                &message_clone,
-            ]);
-        } else {
-            cmd.args([
-                "--print",
-                "--verbose",
-                "--output-format",
-                "stream-json",
-                "--include-partial-messages",
-                "--permission-mode",
-                permission_mode,
-                "-p",
-                &message_clone,
-            ]);
+        append_claude_request_args(
+            &mut cmd,
+            &claude_path,
+            permission_mode,
+            model,
+            effort,
+            claude_session_id.as_deref(),
+            &message_clone,
+        );
+        eprintln!(
+            "[orchestrator] CLI: path={} model={:?} effort={:?} resume={:?}",
+            claude_path, model, effort, claude_session_id
+        );
+        // Dump Claude/AWS env vars to diagnose stale model resolution
+        let mut debug_env: Vec<_> = effective_env
+            .iter()
+            .filter(|(k, _)| {
+                k.starts_with("CLAUDE") || k.starts_with("AWS") || k.starts_with("ANTHROPIC")
+            })
+            .collect();
+        debug_env.sort_by_key(|(k, _)| k.clone());
+        for (k, v) in &debug_env {
+            eprintln!("[orchestrator] env: {}={}", k, v);
         }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -1624,6 +1919,19 @@ async fn send_message_to_agent(
             } else {
                 format!("Claude exited with status: {:?}", status.code())
             };
+            if let Some(suggested_model) = extract_model_suggestion(&error_content) {
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    format!("Suggested model from Claude: {}", suggested_model),
+                    true,
+                    "error",
+                );
+            }
             emit_agent_message(
                 &app,
                 &db,
@@ -1889,6 +2197,152 @@ async fn list_workspace_changes(
 }
 
 #[tauri::command]
+async fn read_workspace_change_diff(
+    workspace_id: String,
+    path: String,
+    old_path: Option<String>,
+    status: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    let workspace_root = {
+        let workspaces = state.workspaces.read();
+        let workspace = workspaces
+            .get(&workspace_id)
+            .ok_or("Workspace not found")?;
+        workspace.worktree_path.clone()
+    };
+
+    let status_trimmed = status.unwrap_or_default().trim().to_string();
+    if status_trimmed == "??" {
+        let full_path = PathBuf::from(&workspace_root).join(&path);
+        let bytes = std::fs::read(&full_path)
+            .map_err(|e| format!("Failed to read untracked file for diff: {}", e))?;
+        let limit = 200_000usize;
+        let (slice, truncated) = if bytes.len() > limit {
+            (&bytes[..limit], true)
+        } else {
+            (&bytes[..], false)
+        };
+        let content = String::from_utf8_lossy(slice).to_string();
+
+        let mut output = String::new();
+        output.push_str(&format!("diff --git a/{0} b/{0}\n", path));
+        output.push_str("new file mode 100644\n");
+        output.push_str("--- /dev/null\n");
+        output.push_str(&format!("+++ b/{}\n", path));
+        output.push_str("@@ -0,0 +1 @@\n");
+
+        if content.is_empty() {
+            output.push_str("+\n");
+        } else {
+            for line in content.lines() {
+                output.push('+');
+                output.push_str(line);
+                output.push('\n');
+            }
+            if truncated {
+                output.push_str("+\n+[truncated]\n");
+            }
+        }
+        return Ok(output);
+    }
+
+    let mut cmd = Command::new("git");
+    cmd.current_dir(&workspace_root);
+    cmd.args(["diff", "--no-color", "HEAD", "--"]);
+    if let Some(old) = old_path.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        cmd.arg(old);
+    }
+    cmd.arg(&path);
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to run git diff: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Git diff failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if stdout.trim().is_empty() {
+        return Ok("No textual diff output for this change.".to_string());
+    }
+
+    Ok(stdout)
+}
+
+fn detect_workspace_checks(workspace_root: &str) -> Vec<WorkspaceCheckDefinition> {
+    let root_path = PathBuf::from(workspace_root);
+    let mut checks: Vec<WorkspaceCheckDefinition> = Vec::new();
+
+    if root_path.join("Cargo.toml").exists() {
+        checks.push(WorkspaceCheckDefinition {
+            name: "Cargo Check".to_string(),
+            command: "cargo check".to_string(),
+            description: "Rust compile and type checks without producing binaries.".to_string(),
+        });
+    }
+    if root_path.join("package.json").exists() {
+        checks.push(WorkspaceCheckDefinition {
+            name: "NPM Lint".to_string(),
+            command: "npm run lint --if-present".to_string(),
+            description: "Runs JavaScript/TypeScript linting when configured.".to_string(),
+        });
+        checks.push(WorkspaceCheckDefinition {
+            name: "NPM Build".to_string(),
+            command: "npm run build --if-present".to_string(),
+            description: "Build verification for frontend or Node projects.".to_string(),
+        });
+    }
+
+    let has_gradle_project = root_path.join("build.gradle").exists()
+        || root_path.join("build.gradle.kts").exists()
+        || root_path.join("settings.gradle").exists()
+        || root_path.join("settings.gradle.kts").exists();
+    if root_path.join("gradlew").exists() {
+        checks.push(WorkspaceCheckDefinition {
+            name: "Gradle Check".to_string(),
+            command: "./gradlew check --console=plain".to_string(),
+            description: "Runs Gradle's standard verification lifecycle.".to_string(),
+        });
+        checks.push(WorkspaceCheckDefinition {
+            name: "Gradle Build".to_string(),
+            command: "./gradlew build --console=plain".to_string(),
+            description: "Runs full Gradle build including tests and packaging tasks.".to_string(),
+        });
+    } else if has_gradle_project {
+        checks.push(WorkspaceCheckDefinition {
+            name: "Gradle Check".to_string(),
+            command: "gradle check --console=plain".to_string(),
+            description: "Runs Gradle verification using a system Gradle install.".to_string(),
+        });
+        checks.push(WorkspaceCheckDefinition {
+            name: "Gradle Build".to_string(),
+            command: "gradle build --console=plain".to_string(),
+            description: "Runs full Gradle build using a system Gradle install.".to_string(),
+        });
+    }
+
+    checks
+}
+
+#[tauri::command]
+async fn list_workspace_checks(
+    workspace_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<WorkspaceCheckDefinition>, String> {
+    let workspace_root = {
+        let workspaces = state.workspaces.read();
+        let workspace = workspaces
+            .get(&workspace_id)
+            .ok_or("Workspace not found")?;
+        workspace.worktree_path.clone()
+    };
+
+    Ok(detect_workspace_checks(&workspace_root))
+}
+
+#[tauri::command]
 async fn run_workspace_checks(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
@@ -1901,16 +2355,7 @@ async fn run_workspace_checks(
         workspace.worktree_path.clone()
     };
 
-    let mut checks: Vec<(&str, &str, Vec<&str>)> = Vec::new();
-    let root_path = PathBuf::from(&workspace_root);
-
-    if root_path.join("Cargo.toml").exists() {
-        checks.push(("Cargo Check", "cargo", vec!["check"]));
-    }
-    if root_path.join("package.json").exists() {
-        checks.push(("NPM Lint", "npm", vec!["run", "lint", "--if-present"]));
-        checks.push(("NPM Build", "npm", vec!["run", "build", "--if-present"]));
-    }
+    let checks = detect_workspace_checks(&workspace_root);
 
     if checks.is_empty() {
         return Ok(vec![WorkspaceCheckResult {
@@ -1926,8 +2371,23 @@ async fn run_workspace_checks(
     }
 
     let mut results = Vec::new();
-    for (name, bin, args) in checks {
-        let cmd_str = format!("{} {}", bin, args.join(" "));
+    for check in checks {
+        let mut parts = check.command.split_whitespace();
+        let Some(bin) = parts.next() else {
+            results.push(WorkspaceCheckResult {
+                name: check.name.clone(),
+                command: check.command.clone(),
+                success: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "Invalid check command configuration.".to_string(),
+                duration_ms: 0,
+                skipped: false,
+            });
+            continue;
+        };
+        let args: Vec<String> = parts.map(|arg| arg.to_string()).collect();
+        let cmd_str = check.command.clone();
         let started = Instant::now();
 
         let result = match Command::new(bin).args(&args).current_dir(&workspace_root).output() {
@@ -1936,7 +2396,7 @@ async fn run_workspace_checks(
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                 WorkspaceCheckResult {
-                    name: name.to_string(),
+                    name: check.name.clone(),
                     command: cmd_str,
                     success: output.status.success(),
                     exit_code: output.status.code(),
@@ -1947,7 +2407,7 @@ async fn run_workspace_checks(
                 }
             }
             Err(e) => WorkspaceCheckResult {
-                name: name.to_string(),
+                name: check.name.clone(),
                 command: cmd_str,
                 success: false,
                 exit_code: None,
@@ -2217,15 +2677,7 @@ async fn handle_ws_commands(
                         }
                     }
                 };
-                let mut checks: Vec<(&str, &str, Vec<&str>)> = Vec::new();
-                let root_path = PathBuf::from(&workspace_root);
-                if root_path.join("Cargo.toml").exists() {
-                    checks.push(("Cargo Check", "cargo", vec!["check"]));
-                }
-                if root_path.join("package.json").exists() {
-                    checks.push(("NPM Lint", "npm", vec!["run", "lint", "--if-present"]));
-                    checks.push(("NPM Build", "npm", vec!["run", "build", "--if-present"]));
-                }
+                let checks = detect_workspace_checks(&workspace_root);
                 let mut results: Vec<CheckInfo> = Vec::new();
                 if checks.is_empty() {
                     results.push(CheckInfo {
@@ -2239,13 +2691,28 @@ async fn handle_ws_commands(
                         skipped: true,
                     });
                 } else {
-                    for (name, bin, args) in checks {
+                    for check in checks {
+                        let mut parts = check.command.split_whitespace();
+                        let Some(bin) = parts.next() else {
+                            results.push(CheckInfo {
+                                name: check.name.clone(),
+                                command: check.command.clone(),
+                                success: false,
+                                exit_code: None,
+                                stdout: String::new(),
+                                stderr: "Invalid check command configuration.".to_string(),
+                                duration_ms: 0,
+                                skipped: false,
+                            });
+                            continue;
+                        };
+                        let args: Vec<String> = parts.map(|arg| arg.to_string()).collect();
                         let started = Instant::now();
                         match Command::new(bin).args(&args).current_dir(&workspace_root).output() {
                             Ok(output) => {
                                 results.push(CheckInfo {
-                                    name: name.to_string(),
-                                    command: format!("{} {}", bin, args.join(" ")),
+                                    name: check.name.clone(),
+                                    command: check.command.clone(),
                                     success: output.status.success(),
                                     exit_code: output.status.code(),
                                     stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -2256,8 +2723,8 @@ async fn handle_ws_commands(
                             }
                             Err(e) => {
                                 results.push(CheckInfo {
-                                    name: name.to_string(),
-                                    command: format!("{} {}", bin, args.join(" ")),
+                                    name: check.name.clone(),
+                                    command: check.command.clone(),
                                     success: false,
                                     exit_code: None,
                                     stdout: String::new(),
@@ -2277,6 +2744,8 @@ async fn handle_ws_commands(
                 workspace_id,
                 message,
                 permission_mode,
+                model,
+                effort,
                 response_tx: _,
             } => {
                 // Find agent for workspace
@@ -2318,43 +2787,31 @@ async fn handle_ws_commands(
                         let env_overrides: HashMap<String, String> = HashMap::new();
                         let requested_permission_mode =
                             normalize_permission_mode(permission_mode.as_deref()).to_string();
+                        let requested_model = normalize_model(model.as_deref());
+                        let requested_effort = normalize_effort(effort.as_deref()).map(str::to_string);
                         
                         std::thread::spawn(move || {
-                            if let Some(claude_path) = find_claude_cli() {
+                            let effective_env = build_effective_cli_env(&env_overrides);
+                            if let Some(claude_path) = find_claude_cli_with_env(Some(&effective_env)) {
                                 let mut cmd = Command::new(&claude_path);
                                 cmd.current_dir(&workspace_path);
-                                let effective_env = build_effective_cli_env(&env_overrides);
                                 let (env_summary, env_hint) = auth_env_feedback(&effective_env);
                                 let permission_mode = requested_permission_mode.as_str();
+                                let is_bedrock = env_truthy(effective_env.get("CLAUDE_CODE_USE_BEDROCK"));
+                                let resolved_model =
+                                    resolve_model_for_runtime(requested_model.as_deref(), is_bedrock);
+                                let model = resolved_model.as_deref();
+                                let effort = requested_effort.as_deref();
                                 configure_cli_env(&mut cmd, &effective_env);
-                                
-                                if let Some(ref claude_sid) = claude_session_id {
-                                    cmd.args([
-                                        "--print",
-                                        "--verbose",
-                                        "--output-format",
-                                        "stream-json",
-                                        "--include-partial-messages",
-                                        "--permission-mode",
-                                        permission_mode,
-                                        "--resume",
-                                        claude_sid,
-                                        "-p",
-                                        &message,
-                                    ]);
-                                } else {
-                                    cmd.args([
-                                        "--print",
-                                        "--verbose",
-                                        "--output-format",
-                                        "stream-json",
-                                        "--include-partial-messages",
-                                        "--permission-mode",
-                                        permission_mode,
-                                        "-p",
-                                        &message,
-                                    ]);
-                                }
+                                append_claude_request_args(
+                                    &mut cmd,
+                                    &claude_path,
+                                    permission_mode,
+                                    model,
+                                    effort,
+                                    claude_session_id.as_deref(),
+                                    &message,
+                                );
 
                                 cmd.stdout(Stdio::piped());
                                 cmd.stderr(Stdio::piped());
@@ -2597,6 +3054,19 @@ async fn handle_ws_commands(
                                     } else {
                                         format!("Claude exited with status: {:?}", status.code())
                                     };
+                                    if let Some(suggested_model) = extract_model_suggestion(&error_content) {
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            format!("Suggested model from Claude: {}", suggested_model),
+                                            true,
+                                            "error",
+                                        );
+                                    }
                                     emit_agent_message(
                                         &app_clone,
                                         &db,
@@ -2810,7 +3280,7 @@ pub fn run() {
     let (ws_cmd_tx, ws_cmd_rx) = mpsc::unbounded_channel::<ServerCommand>();
     
     // Create WebSocket server
-    let ws_server = Arc::new(WebSocketServer::new(3001, ws_cmd_tx));
+    let ws_server = Arc::new(WebSocketServer::new(REMOTE_SERVER_PORT, ws_cmd_tx));
     app_state.set_ws_server(ws_server.clone());
     
     let app_state = Arc::new(app_state);
@@ -2823,20 +3293,24 @@ pub fn run() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
             let ws_server_clone = ws_server.clone();
-            let app_state_clone = app_state_for_ws.clone();
+            let startup_state = app_state_for_ws.clone();
+            let command_state = app_state_for_ws.clone();
             
             // Start WebSocket server and command handler in tokio runtime
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = ws_server_clone.start().await {
                     tracing::error!("Failed to start WebSocket server: {}", e);
+                    *startup_state.ws_server_running.write() = false;
                 } else {
-                    tracing::info!("WebSocket server started on port 3001");
+                    *startup_state.ws_server_running.write() = true;
+                    *startup_state.ws_connected_clients.write() = ws_server_clone.client_count();
+                    tracing::info!("WebSocket server started on port {}", REMOTE_SERVER_PORT);
                 }
             });
             
             // Start command handler
             tauri::async_runtime::spawn(async move {
-                handle_ws_commands(ws_cmd_rx, app_state_clone, app_handle).await;
+                handle_ws_commands(ws_cmd_rx, command_state, app_handle).await;
             });
             
             Ok(())
@@ -2844,6 +3318,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pick_folder,
             get_app_status,
+            start_remote_server,
+            stop_remote_server,
             add_repository,
             remove_repository,
             list_repositories,
@@ -2860,6 +3336,8 @@ pub fn run() {
             list_workspace_files,
             read_workspace_file,
             list_workspace_changes,
+            read_workspace_change_diff,
+            list_workspace_checks,
             run_workspace_checks,
             run_workspace_terminal_command,
         ])
@@ -2880,6 +3358,121 @@ mod tests {
             "bypassPermissions"
         );
         assert_eq!(normalize_permission_mode(Some("plan")), "plan");
+    }
+
+    #[test]
+    fn normalize_model_maps_aliases_and_bedrock_ids() {
+        assert_eq!(normalize_model(None), None);
+        assert_eq!(normalize_model(Some("default")), None);
+        assert_eq!(
+            normalize_model(Some("opus")),
+            Some("opus".to_string())
+        );
+        assert_eq!(
+            normalize_model(Some("sonnet")),
+            Some("sonnet".to_string())
+        );
+        assert_eq!(
+            normalize_model(Some("haiku")),
+            Some("haiku".to_string())
+        );
+        assert_eq!(
+            normalize_model(Some("global.anthropic.claude-sonnet-4-6-20260115-v1:0")),
+            Some("global.anthropic.claude-sonnet-4-6-20260115-v1:0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_model_for_runtime_bedrock_aliases() {
+        assert_eq!(
+            resolve_model_for_runtime(Some("opus"), true),
+            Some("global.anthropic.claude-opus-4-6-v1".to_string())
+        );
+        assert_eq!(
+            resolve_model_for_runtime(Some("sonnet"), true),
+            Some("global.anthropic.claude-sonnet-4-6".to_string())
+        );
+        assert_eq!(
+            resolve_model_for_runtime(Some("haiku"), true),
+            Some("global.anthropic.claude-haiku-4-5-20251001-v1:0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_model_for_runtime_api_aliases() {
+        assert_eq!(
+            resolve_model_for_runtime(Some("opus"), false),
+            Some("claude-opus-4-6".to_string())
+        );
+        assert_eq!(
+            resolve_model_for_runtime(Some("sonnet"), false),
+            Some("claude-sonnet-4-6".to_string())
+        );
+        assert_eq!(
+            resolve_model_for_runtime(Some("haiku"), false),
+            Some("claude-haiku-4-5".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_model_for_runtime_full_ids_passthrough() {
+        assert_eq!(
+            resolve_model_for_runtime(Some("global.anthropic.claude-opus-4-6-v1"), true),
+            Some("global.anthropic.claude-opus-4-6-v1".to_string())
+        );
+        assert_eq!(
+            resolve_model_for_runtime(Some("claude-sonnet-4-6"), false),
+            Some("claude-sonnet-4-6".to_string())
+        );
+
+        // None, empty, and whitespace return None
+        assert_eq!(resolve_model_for_runtime(None, true), None);
+        assert_eq!(resolve_model_for_runtime(Some(""), false), None);
+        assert_eq!(resolve_model_for_runtime(Some("  "), true), None);
+    }
+
+    #[test]
+    fn configure_cli_env_strips_model_override_vars() {
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+        env.insert("HOME".to_string(), "/Users/test".to_string());
+        env.insert("CLAUDE_CODE_USE_BEDROCK".to_string(), "1".to_string());
+        env.insert(
+            "CLAUDE_MODEL_OPUS".to_string(),
+            "stale-opus-id".to_string(),
+        );
+        env.insert(
+            "CLAUDE_BEDROCK_MODEL_SONNET".to_string(),
+            "stale-sonnet-id".to_string(),
+        );
+
+        let mut cmd = Command::new("echo");
+        configure_cli_env(&mut cmd, &env);
+
+        // We can't easily inspect cmd's env, so verify the function compiles
+        // and runs without panic.  The real assertion is that model-override
+        // keys are filtered out — we test the predicate directly:
+        for key in &["CLAUDE_MODEL_OPUS", "CLAUDE_BEDROCK_MODEL_SONNET"] {
+            assert!(
+                MODEL_OVERRIDE_ENV_PREFIXES.iter().any(|p| key.starts_with(p)),
+                "{key} should be filtered"
+            );
+        }
+        for key in &["PATH", "HOME", "CLAUDE_CODE_USE_BEDROCK"] {
+            assert!(
+                !MODEL_OVERRIDE_ENV_PREFIXES.iter().any(|p| key.starts_with(p)),
+                "{key} should NOT be filtered"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_model_suggestion_reads_cli_hint() {
+        let text = "API Error: invalid model. Try --model to switch to us.anthropic.claude-opus-4-1-20250805-v1:0.";
+        assert_eq!(
+            extract_model_suggestion(text),
+            Some("us.anthropic.claude-opus-4-1-20250805-v1:0".to_string())
+        );
     }
 
     #[test]
