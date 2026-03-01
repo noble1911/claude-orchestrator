@@ -1,5 +1,20 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { SafeAreaView, StatusBar, StyleSheet, Text, TextInput, TouchableOpacity, View, FlatList, KeyboardAvoidingView, Platform, ScrollView } from "react-native";
+import {
+  Animated,
+  Easing,
+  SafeAreaView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+  FlatList,
+  KeyboardAvoidingView,
+  Platform,
+  ScrollView,
+  Dimensions,
+} from "react-native";
 
 type WorkspaceInfo = {
   id: string;
@@ -11,9 +26,26 @@ type WorkspaceInfo = {
 
 type MessageInfo = {
   agent_id: string;
+  role?: string;
   content: string;
   is_error: boolean;
   timestamp: string;
+};
+
+type QuestionOption = {
+  label: string;
+  description?: string;
+};
+
+type QuestionItem = {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options?: QuestionOption[];
+};
+
+type AskUserQuestionPayload = {
+  questions: QuestionItem[];
 };
 
 type FileEntryInfo = {
@@ -48,9 +80,88 @@ type WsResponse =
   | { type: "changes_list"; workspace_id: string; changes: ChangeInfo[] }
   | { type: "checks_result"; workspace_id: string; checks: CheckInfo[] }
   | { type: "agent_started"; workspace_id: string; agent_id: string }
-  | { type: "agent_message"; workspace_id: string; content: string; is_error: boolean; timestamp: string }
+  | { type: "agent_message"; workspace_id: string; role?: string; content: string; is_error: boolean; timestamp: string }
   | { type: "error"; message: string }
   | { type: string; [key: string]: any };
+
+type ActivityLine = {
+  text: string;
+  count: number;
+};
+
+type ActivityGroup = {
+  id: string;
+  messages: MessageInfo[];
+  lines: ActivityLine[];
+};
+
+type ChatRow =
+  | { kind: "message"; id: string; message: MessageInfo }
+  | { kind: "activity"; id: string; group: ActivityGroup };
+
+const MODEL_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "opus", label: "Opus" },
+  { value: "sonnet", label: "Sonnet" },
+  { value: "haiku", label: "Haiku" },
+];
+const DRAWER_ANIMATION_MS = 220;
+
+function parseAskUserQuestionPayload(raw: string): AskUserQuestionPayload | null {
+  try {
+    const parsed = JSON.parse(raw) as { questions?: unknown };
+    if (!parsed || !Array.isArray(parsed.questions)) {
+      return null;
+    }
+
+    const questions: QuestionItem[] = [];
+    for (const item of parsed.questions) {
+      const source = item as {
+        question?: unknown;
+        header?: unknown;
+        multiSelect?: unknown;
+        options?: unknown;
+      };
+      const question = typeof source.question === "string" ? source.question.trim() : "";
+      const header = typeof source.header === "string" ? source.header.trim() : undefined;
+      const multiSelect = typeof source.multiSelect === "boolean" ? source.multiSelect : undefined;
+      const options: QuestionOption[] = [];
+      if (Array.isArray(source.options)) {
+        for (const opt of source.options) {
+          const optSource = opt as { label?: unknown; description?: unknown };
+          const label = typeof optSource.label === "string" ? optSource.label.trim() : "";
+          if (!label) continue;
+          const normalized: QuestionOption = { label };
+          if (typeof optSource.description === "string" && optSource.description.trim()) {
+            normalized.description = optSource.description.trim();
+          }
+          options.push(normalized);
+        }
+      }
+      if (question || options.length > 0) {
+        questions.push({ question, header, multiSelect, options });
+      }
+    }
+
+    return questions.length > 0 ? { questions } : null;
+  } catch {
+    return null;
+  }
+}
+
+function compactActivityLines(messages: MessageInfo[]): ActivityLine[] {
+  const lines: ActivityLine[] = [];
+  for (const message of messages) {
+    const text = message.content.trim();
+    if (!text) continue;
+    const last = lines[lines.length - 1];
+    if (last && last.text === text) {
+      last.count += 1;
+      continue;
+    }
+    lines.push({ text, count: 1 });
+  }
+  return lines;
+}
 
 function App() {
   const wsRef = useRef<WebSocket | null>(null);
@@ -60,8 +171,13 @@ function App() {
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
   const [messagesByWorkspace, setMessagesByWorkspace] = useState<Record<string, MessageInfo[]>>({});
   const [input, setInput] = useState("");
+  const [selectedModel, setSelectedModel] = useState("opus");
+  const [claudeMode, setClaudeMode] = useState<"normal" | "plan">("normal");
+  const [thinkingMode, setThinkingMode] = useState<"off" | "low" | "medium" | "high">("off");
   const [leftOpen, setLeftOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
+  const [renderLeftOverlay, setRenderLeftOverlay] = useState(false);
+  const [renderRightOverlay, setRenderRightOverlay] = useState(false);
   const [rightTab, setRightTab] = useState<"all_files" | "changes" | "checks">("all_files");
   const [statusText, setStatusText] = useState("");
   const [filesPath, setFilesPath] = useState("");
@@ -73,6 +189,11 @@ function App() {
   const [checksRunning, setChecksRunning] = useState(false);
   const [filesLoading, setFilesLoading] = useState(false);
   const [changesLoading, setChangesLoading] = useState(false);
+  const [expandedActivityIdsByWorkspace, setExpandedActivityIdsByWorkspace] = useState<Record<string, string[]>>({});
+  const [answeredQuestionTimestampsByWorkspace, setAnsweredQuestionTimestampsByWorkspace] =
+    useState<Record<string, string[]>>({});
+  const leftDrawerAnim = useRef(new Animated.Value(0)).current;
+  const rightDrawerAnim = useRef(new Animated.Value(0)).current;
 
   const selectedWorkspace = useMemo(
     () => workspaces.find((w) => w.id === selectedWorkspaceId) || null,
@@ -80,12 +201,164 @@ function App() {
   );
 
   const currentMessages = selectedWorkspaceId ? messagesByWorkspace[selectedWorkspaceId] || [] : [];
+  const topInset = Platform.OS === "android" ? StatusBar.currentHeight || 0 : 0;
+  const drawerSlideDistance = useMemo(
+    () => Math.min(420, Math.round(Dimensions.get("window").width * 0.84)),
+    [],
+  );
+  const leftDrawerTranslateX = useMemo(
+    () =>
+      leftDrawerAnim.interpolate({
+        inputRange: [0, 1],
+        outputRange: [-drawerSlideDistance, 0],
+      }),
+    [leftDrawerAnim, drawerSlideDistance],
+  );
+  const rightDrawerTranslateX = useMemo(
+    () =>
+      rightDrawerAnim.interpolate({
+        inputRange: [0, 1],
+        outputRange: [drawerSlideDistance, 0],
+      }),
+    [rightDrawerAnim, drawerSlideDistance],
+  );
+  const leftBackdropOpacity = useMemo(
+    () =>
+      leftDrawerAnim.interpolate({
+        inputRange: [0, 1],
+        outputRange: [0, 1],
+      }),
+    [leftDrawerAnim],
+  );
+  const rightBackdropOpacity = useMemo(
+    () =>
+      rightDrawerAnim.interpolate({
+        inputRange: [0, 1],
+        outputRange: [0, 1],
+      }),
+    [rightDrawerAnim],
+  );
+  const answeredQuestionSet = useMemo(() => {
+    if (!selectedWorkspaceId) return new Set<string>();
+    return new Set(answeredQuestionTimestampsByWorkspace[selectedWorkspaceId] || []);
+  }, [answeredQuestionTimestampsByWorkspace, selectedWorkspaceId]);
+  const derivedAnsweredQuestionSet = useMemo(() => {
+    const answered = new Set<string>();
+    for (let i = 0; i < currentMessages.length; i += 1) {
+      const current = currentMessages[i];
+      if (current.role !== "question") continue;
+      for (let j = i + 1; j < currentMessages.length; j += 1) {
+        const next = currentMessages[j];
+        const nextRole = next.role || (next.agent_id === "user" ? "user" : "assistant");
+        if (nextRole === "user" || next.agent_id === "user") {
+          answered.add(current.timestamp);
+          break;
+        }
+        if (nextRole === "question") {
+          break;
+        }
+      }
+    }
+    return answered;
+  }, [currentMessages]);
+  const expandedActivityIds = selectedWorkspaceId
+    ? expandedActivityIdsByWorkspace[selectedWorkspaceId] || []
+    : [];
+  const chatRows = useMemo<ChatRow[]>(() => {
+    const rows: ChatRow[] = [];
+    let systemBuffer: MessageInfo[] = [];
+    let sequence = 0;
+
+    const flushSystemBuffer = () => {
+      if (systemBuffer.length === 0) return;
+      const first = systemBuffer[0];
+      const rowId = `activity-${first.timestamp}-${sequence}`;
+      rows.push({
+        kind: "activity",
+        id: rowId,
+        group: {
+          id: rowId,
+          messages: systemBuffer,
+          lines: compactActivityLines(systemBuffer),
+        },
+      });
+      sequence += 1;
+      systemBuffer = [];
+    };
+
+    for (const message of currentMessages) {
+      const role = message.role || (message.agent_id === "user" ? "user" : "assistant");
+      const isSystemActivity = role === "system" && !message.is_error;
+      if (isSystemActivity) {
+        systemBuffer.push(message);
+        continue;
+      }
+      flushSystemBuffer();
+      rows.push({
+        kind: "message",
+        id: `message-${message.timestamp}-${sequence}`,
+        message,
+      });
+      sequence += 1;
+    }
+
+    flushSystemBuffer();
+    return rows;
+  }, [currentMessages]);
 
   useEffect(() => {
     return () => {
       wsRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    if (leftOpen) {
+      setRenderLeftOverlay(true);
+      Animated.timing(leftDrawerAnim, {
+        toValue: 1,
+        duration: DRAWER_ANIMATION_MS,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+      return;
+    }
+    if (!renderLeftOverlay) return;
+    Animated.timing(leftDrawerAnim, {
+      toValue: 0,
+      duration: DRAWER_ANIMATION_MS,
+      easing: Easing.in(Easing.cubic),
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (finished) {
+        setRenderLeftOverlay(false);
+      }
+    });
+  }, [leftOpen, leftDrawerAnim, renderLeftOverlay]);
+
+  useEffect(() => {
+    if (rightOpen) {
+      setRenderRightOverlay(true);
+      Animated.timing(rightDrawerAnim, {
+        toValue: 1,
+        duration: DRAWER_ANIMATION_MS,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+      return;
+    }
+    if (!renderRightOverlay) return;
+    Animated.timing(rightDrawerAnim, {
+      toValue: 0,
+      duration: DRAWER_ANIMATION_MS,
+      easing: Easing.in(Easing.cubic),
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (finished) {
+        setRenderRightOverlay(false);
+      }
+    });
+  }, [rightOpen, rightDrawerAnim, renderRightOverlay]);
 
   function sendJson(payload: Record<string, any>) {
     const ws = wsRef.current;
@@ -144,7 +417,8 @@ function App() {
 
       if (parsed.type === "agent_message") {
         const item: MessageInfo = {
-          agent_id: parsed.is_error ? "error" : "assistant",
+          agent_id: parsed.role === "user" ? "user" : parsed.is_error ? "error" : "assistant",
+          role: parsed.role || (parsed.is_error ? "error" : "assistant"),
           content: parsed.content,
           is_error: parsed.is_error,
           timestamp: parsed.timestamp,
@@ -240,12 +514,14 @@ function App() {
     bootstrapWorkspace(workspaceId);
   }
 
-  function sendMessage() {
-    if (!selectedWorkspaceId || !input.trim()) return;
+  function sendMessage(rawMessage?: string) {
+    if (!selectedWorkspaceId) return;
+    const messageText = (rawMessage ?? input).trim();
+    if (!messageText) return;
 
-    const messageText = input.trim();
     const localUser: MessageInfo = {
       agent_id: "user",
+      role: "user",
       content: messageText,
       is_error: false,
       timestamp: new Date().toISOString(),
@@ -256,8 +532,17 @@ function App() {
       [selectedWorkspaceId]: [...(prev[selectedWorkspaceId] || []), localUser],
     }));
 
-    sendJson({ type: "send_message", workspace_id: selectedWorkspaceId, message: messageText });
-    setInput("");
+    sendJson({
+      type: "send_message",
+      workspace_id: selectedWorkspaceId,
+      message: messageText,
+      permission_mode: claudeMode === "plan" ? "plan" : "bypassPermissions",
+      model: selectedModel,
+      effort: thinkingMode === "off" ? undefined : thinkingMode,
+    });
+    if (!rawMessage) {
+      setInput("");
+    }
   }
 
   function openRightDrawer(tab: "all_files" | "changes" | "checks") {
@@ -300,9 +585,31 @@ function App() {
     sendJson({ type: "run_checks", workspace_id: selectedWorkspaceId });
   }
 
+  function isActivityExpanded(id: string): boolean {
+    return expandedActivityIds.includes(id);
+  }
+
+  function toggleActivityGroup(id: string) {
+    if (!selectedWorkspaceId) return;
+    setExpandedActivityIdsByWorkspace((prev) => {
+      const current = prev[selectedWorkspaceId] || [];
+      const next = current.includes(id) ? current.filter((item) => item !== id) : [...current, id];
+      return { ...prev, [selectedWorkspaceId]: next };
+    });
+  }
+
+  function markQuestionAnswered(timestamp: string) {
+    if (!selectedWorkspaceId) return;
+    setAnsweredQuestionTimestampsByWorkspace((prev) => {
+      const current = prev[selectedWorkspaceId] || [];
+      if (current.includes(timestamp)) return prev;
+      return { ...prev, [selectedWorkspaceId]: [...current, timestamp] };
+    });
+  }
+
   return (
-    <SafeAreaView style={styles.safe}>
-      <StatusBar barStyle="light-content" />
+    <SafeAreaView style={[styles.safe, { paddingTop: topInset }]}>
+      <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
 
       <View style={styles.header}>
         <TouchableOpacity style={styles.smallButton} onPress={() => setLeftOpen(true)}>
@@ -338,11 +645,85 @@ function App() {
 
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.main}>
         <FlatList
-          data={currentMessages}
-          keyExtractor={(_, idx) => String(idx)}
+          data={chatRows}
+          keyExtractor={(row) => row.id}
           contentContainerStyle={styles.messagesList}
-          renderItem={({ item }) => {
-            const isUser = item.agent_id === "user";
+          renderItem={({ item: row, index }) => {
+            if (row.kind === "activity") {
+              const isLatest = index === chatRows.length - 1;
+              const expanded = isLatest || isActivityExpanded(row.id);
+              return (
+                <View style={styles.activityCard}>
+                  <TouchableOpacity style={styles.activityHeader} onPress={() => toggleActivityGroup(row.id)}>
+                    <Text style={styles.activityTitle}>Agent activity ({row.group.messages.length} events)</Text>
+                    <Text style={styles.activityChevron}>{expanded ? "▼" : "▶"}</Text>
+                  </TouchableOpacity>
+                  {expanded && (
+                    <View style={styles.activityBody}>
+                      {row.group.lines.map((line, lineIdx) => (
+                        <View key={`${row.id}-line-${lineIdx}`} style={styles.activityLineRow}>
+                          <Text style={styles.activityBullet}>•</Text>
+                          <Text style={styles.activityLineText}>{line.text}</Text>
+                          {line.count > 1 ? <Text style={styles.activityLineCount}>x{line.count}</Text> : null}
+                        </View>
+                      ))}
+                    </View>
+                  )}
+                </View>
+              );
+            }
+
+            const item = row.message;
+            const role = item.role || (item.agent_id === "user" ? "user" : "assistant");
+            const isUser = role === "user" || item.agent_id === "user";
+            if (role === "question") {
+              const payload = parseAskUserQuestionPayload(item.content);
+              const isAnswered =
+                answeredQuestionSet.has(item.timestamp) || derivedAnsweredQuestionSet.has(item.timestamp);
+              return (
+                <View style={styles.questionCard}>
+                  <Text style={styles.questionLabel}>QUESTION</Text>
+                  {payload ? (
+                    <>
+                      {payload.questions.map((question, qIdx) => (
+                        <View key={`${row.id}-q-${qIdx}`} style={styles.questionBlock}>
+                          {question.header ? <Text style={styles.questionHeader}>{question.header}</Text> : null}
+                          {question.question ? <Text style={styles.questionText}>{question.question}</Text> : null}
+                          {question.options && question.options.length > 0 ? (
+                            <View style={styles.questionOptions}>
+                              {question.options.map((option, optionIdx) => (
+                                <TouchableOpacity
+                                  key={`${row.id}-o-${qIdx}-${optionIdx}`}
+                                  style={[
+                                    styles.questionOption,
+                                    isAnswered ? styles.questionOptionDisabled : null,
+                                  ]}
+                                  disabled={isAnswered}
+                                  onPress={() => {
+                                    markQuestionAnswered(item.timestamp);
+                                    sendMessage(option.label);
+                                  }}
+                                >
+                                  <Text style={styles.questionOptionText}>{option.label}</Text>
+                                </TouchableOpacity>
+                              ))}
+                            </View>
+                          ) : null}
+                        </View>
+                      ))}
+                      {!isAnswered ? (
+                        <Text style={styles.questionHint}>
+                          Or type a custom answer in the main chat box below.
+                        </Text>
+                      ) : null}
+                    </>
+                  ) : (
+                    <Text style={styles.messageText}>{item.content}</Text>
+                  )}
+                </View>
+              );
+            }
+
             return (
               <View style={[styles.messageRow, isUser ? styles.messageRowUser : styles.messageRowAi]}>
                 <View
@@ -368,16 +749,64 @@ function App() {
             placeholderTextColor="#7a7a7a"
             multiline
           />
-          <TouchableOpacity style={styles.sendButton} onPress={sendMessage}>
+          <TouchableOpacity style={styles.sendButton} onPress={() => sendMessage()}>
             <Text style={styles.sendButtonText}>Send</Text>
           </TouchableOpacity>
         </View>
+        <View style={styles.composerOptionsRow}>
+          <View style={styles.optionGroup}>
+            {MODEL_OPTIONS.map((model) => (
+              <TouchableOpacity
+                key={model.value}
+                style={[styles.optionChip, selectedModel === model.value && styles.optionChipActive]}
+                onPress={() => setSelectedModel(model.value)}
+              >
+                <Text style={[styles.optionChipText, selectedModel === model.value && styles.optionChipTextActive]}>
+                  {model.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+          <View style={styles.optionGroup}>
+            <TouchableOpacity
+              style={[styles.optionChip, claudeMode === "plan" && styles.optionChipActive]}
+              onPress={() => setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"))}
+            >
+              <Text style={[styles.optionChipText, claudeMode === "plan" && styles.optionChipTextActive]}>
+                {claudeMode === "plan" ? "Plan" : "Normal"}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.optionChip, thinkingMode !== "off" && styles.optionChipActive]}
+              onPress={() =>
+                setThinkingMode((prev) =>
+                  prev === "off" ? "low" : prev === "low" ? "medium" : prev === "medium" ? "high" : "off",
+                )
+              }
+            >
+              <Text style={[styles.optionChipText, thinkingMode !== "off" && styles.optionChipTextActive]}>
+                Think {thinkingMode}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
       </KeyboardAvoidingView>
 
-      {leftOpen && (
+      {renderLeftOverlay && (
         <View style={styles.overlay}>
-          <TouchableOpacity style={styles.backdrop} onPress={() => setLeftOpen(false)} />
-          <View style={styles.leftDrawer}>
+          <Animated.View style={[styles.backdrop, { opacity: leftBackdropOpacity }]}>
+            <TouchableOpacity
+              style={StyleSheet.absoluteFill}
+              activeOpacity={1}
+              onPress={() => setLeftOpen(false)}
+            />
+          </Animated.View>
+          <Animated.View
+            style={[
+              styles.leftDrawer,
+              { paddingTop: topInset + 12, transform: [{ translateX: leftDrawerTranslateX }] },
+            ]}
+          >
             <Text style={styles.drawerTitle}>Workspaces</Text>
             <ScrollView>
               {workspaces.map((ws) => (
@@ -387,14 +816,25 @@ function App() {
                 </TouchableOpacity>
               ))}
             </ScrollView>
-          </View>
+          </Animated.View>
         </View>
       )}
 
-      {rightOpen && (
+      {renderRightOverlay && (
         <View style={styles.overlay}>
-          <TouchableOpacity style={styles.backdrop} onPress={() => setRightOpen(false)} />
-          <View style={styles.rightDrawer}>
+          <Animated.View style={[styles.backdrop, { opacity: rightBackdropOpacity }]}>
+            <TouchableOpacity
+              style={StyleSheet.absoluteFill}
+              activeOpacity={1}
+              onPress={() => setRightOpen(false)}
+            />
+          </Animated.View>
+          <Animated.View
+            style={[
+              styles.rightDrawer,
+              { paddingTop: topInset + 12, transform: [{ translateX: rightDrawerTranslateX }] },
+            ]}
+          >
             <View style={styles.tabRow}>
               {(["all_files", "changes", "checks"] as const).map((tab) => (
                 <TouchableOpacity key={tab} style={[styles.tabButton, rightTab === tab && styles.tabButtonActive]} onPress={() => openRightDrawer(tab)}>
@@ -477,7 +917,7 @@ function App() {
                 </>
               )}
             </View>
-          </View>
+          </Animated.View>
         </View>
       )}
     </SafeAreaView>
@@ -515,6 +955,27 @@ const styles = StyleSheet.create({
   statusText: { color: "#a79e96", fontSize: 12, paddingHorizontal: 12, paddingTop: 6 },
   main: { flex: 1 },
   messagesList: { padding: 12, gap: 8 },
+  activityCard: {
+    borderWidth: 1,
+    borderColor: "#35302b",
+    borderRadius: 10,
+    backgroundColor: "#171412",
+    marginBottom: 6,
+  },
+  activityHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  activityTitle: { color: "#b9b0a8", fontSize: 12 },
+  activityChevron: { color: "#938a83", fontSize: 12 },
+  activityBody: { paddingHorizontal: 10, paddingBottom: 8, gap: 4 },
+  activityLineRow: { flexDirection: "row", alignItems: "flex-start", gap: 6 },
+  activityBullet: { color: "#6a5f57", fontSize: 11, marginTop: 1 },
+  activityLineText: { color: "#9f968f", fontSize: 11, flex: 1, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
+  activityLineCount: { color: "#6d645e", fontSize: 10 },
   messageRow: { flexDirection: "row" },
   messageRowUser: { justifyContent: "flex-end" },
   messageRowAi: { justifyContent: "flex-start" },
@@ -523,6 +984,30 @@ const styles = StyleSheet.create({
   aiBubble: { backgroundColor: "#1c1815", borderWidth: 1, borderColor: "#39312b" },
   errorBubble: { backgroundColor: "#4a1f1f", borderColor: "#7f2f2f" },
   messageText: { color: "#ece8e4", fontSize: 14 },
+  questionCard: {
+    borderWidth: 1,
+    borderColor: "#3c332d",
+    borderRadius: 12,
+    backgroundColor: "#171412",
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+  },
+  questionLabel: { color: "#8f857d", fontSize: 11, fontWeight: "700", marginBottom: 6 },
+  questionBlock: { marginBottom: 8, gap: 4 },
+  questionHeader: { color: "#a9a099", fontSize: 12 },
+  questionText: { color: "#ece8e4", fontSize: 15, lineHeight: 20 },
+  questionOptions: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 4 },
+  questionOption: {
+    borderWidth: 1,
+    borderColor: "#4a4038",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: "#201b17",
+  },
+  questionOptionDisabled: { opacity: 0.5 },
+  questionOptionText: { color: "#d8d0c8", fontSize: 12 },
+  questionHint: { color: "#9a9088", fontSize: 12, marginTop: 2 },
   inputRow: { flexDirection: "row", padding: 10, gap: 8, borderTopWidth: 1, borderTopColor: "#2b2623" },
   messageInput: {
     flex: 1,
@@ -538,10 +1023,52 @@ const styles = StyleSheet.create({
   },
   sendButton: { alignSelf: "flex-end", backgroundColor: "#2b5d8a", borderRadius: 8, paddingHorizontal: 14, paddingVertical: 10 },
   sendButtonText: { color: "#fff", fontWeight: "600" },
-  overlay: { ...StyleSheet.absoluteFillObject, zIndex: 30, flexDirection: "row" },
-  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)" },
-  leftDrawer: { width: "72%", maxWidth: 320, backgroundColor: "#171311", padding: 12, borderRightWidth: 1, borderRightColor: "#2b2623" },
-  rightDrawer: { width: "78%", maxWidth: 340, backgroundColor: "#171311", padding: 12, borderLeftWidth: 1, borderLeftColor: "#2b2623" },
+  composerOptionsRow: {
+    borderTopWidth: 1,
+    borderTopColor: "#2b2623",
+    paddingHorizontal: 10,
+    paddingBottom: 8,
+    paddingTop: 6,
+    gap: 8,
+  },
+  optionGroup: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+  optionChip: {
+    borderWidth: 1,
+    borderColor: "#464039",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    backgroundColor: "#1b1714",
+  },
+  optionChipActive: { borderColor: "#7a6d62", backgroundColor: "#2a2320" },
+  optionChipText: { color: "#b8aea7", fontSize: 11 },
+  optionChipTextActive: { color: "#eee7e1" },
+  overlay: { ...StyleSheet.absoluteFillObject, zIndex: 30 },
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.5)" },
+  leftDrawer: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    width: "72%",
+    maxWidth: 320,
+    backgroundColor: "#171311",
+    padding: 12,
+    borderRightWidth: 1,
+    borderRightColor: "#2b2623",
+  },
+  rightDrawer: {
+    position: "absolute",
+    right: 0,
+    top: 0,
+    bottom: 0,
+    width: "78%",
+    maxWidth: 340,
+    backgroundColor: "#171311",
+    padding: 12,
+    borderLeftWidth: 1,
+    borderLeftColor: "#2b2623",
+  },
   drawerTitle: { color: "#e6e0da", fontSize: 16, fontWeight: "700", marginBottom: 10 },
   wsItem: { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: "#2b2623" },
   wsName: { color: "#ece8e4", fontSize: 14, fontWeight: "600" },

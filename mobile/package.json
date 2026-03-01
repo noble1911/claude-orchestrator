@@ -4,7 +4,7 @@
   "private": true,
   "main": "expo/AppEntry",
   "scripts": {
-    "start": "expo start",
+    "start": "expo start -c",
     "ios": "expo run:ios",
     "android": "expo run:android",
     "web": "expo start --web"
@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "@types/react": "~19.1.10",
+    "babel-preset-expo": "~54.0.10",
     "typescript": "~5.9.2"
   }
 }
