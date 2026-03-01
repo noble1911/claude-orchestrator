@@ -335,13 +335,9 @@ function App() {
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
-  const [showPRForm, setShowPRForm] = useState(false);
-  const [prTitle, setPrTitle] = useState("");
-  const [prBody, setPrBody] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [inputMessage, setInputMessage] = useState("");
-  const [isCreatingPR, setIsCreatingPR] = useState(false);
   const [activeRightTab, setActiveRightTab] = useState<"prompts" | "files" | "changes" | "checks">("prompts");
   const [workspaceFilesByPath, setWorkspaceFilesByPath] = useState<Record<string, WorkspaceFileEntry[]>>({});
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
@@ -1212,46 +1208,6 @@ function App() {
       return false;
     }
     return true;
-  }
-
-  async function createPullRequest() {
-    if (!selectedWorkspace || !prTitle.trim()) return;
-    
-    setIsCreatingPR(true);
-    setError(null);
-    
-    try {
-      const prUrl = await invoke<string>("create_pull_request", {
-        workspaceId: selectedWorkspace,
-        title: prTitle.trim(),
-        body: prBody.trim(),
-      });
-      
-      setShowPRForm(false);
-      setPrTitle("");
-      setPrBody("");
-
-      // Update workspace status locally
-      setWorkspaces((prev) =>
-        prev.map((ws) =>
-          ws.id === selectedWorkspace ? { ...ws, status: "inReview" as const, prUrl } : ws
-        )
-      );
-
-      // Show success message
-      setMessages(prev => [...prev, {
-        agentId: "system",
-        role: "system",
-        content: `Pull request created: ${prUrl}`,
-        isError: false,
-        timestamp: new Date().toISOString(),
-      }]);
-    } catch (err) {
-      console.error("Failed to create PR:", err);
-      setError(String(err));
-    } finally {
-      setIsCreatingPR(false);
-    }
   }
 
   function generateWorkspaceName() {
@@ -2664,9 +2620,10 @@ function App() {
                   <p className="mb-2 md-label-medium">Actions</p>
                   <button
                     onClick={() => {
-                      setPrTitle(`${currentWorkspace.name}`);
-                      setPrBody(`## Summary\n\nChanges from workspace: ${currentWorkspace.name}\n\n## Test Plan\n\n- [ ] Manual testing`);
-                      setShowPRForm(true);
+                      sendMessage(
+                        `Push this branch to origin and create a pull request using \`gh pr create\`. Write a clear, descriptive PR title and body based on the changes on this branch. Use \`git log main..HEAD\` and \`git diff main\` to understand what changed.`,
+                        "Open Pull Request"
+                      );
                     }}
                     className="md-list-item flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
                   >
@@ -3069,61 +3026,6 @@ function App() {
                 className="md-btn md-btn-tonal flex-1 disabled:opacity-50"
               >
                 Save
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* PR Creation Modal */}
-      {showPRForm && (
-        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
-          <div className="md-dialog mx-4 w-full max-w-lg">
-            <div className="border-b md-outline p-4">
-              <h3 className="text-lg font-semibold md-text-strong">Create Pull Request</h3>
-              <p className="mt-1 text-sm md-text-muted">
-                This will push the branch and create a PR on GitHub
-              </p>
-            </div>
-            
-            <div className="space-y-4 p-4">
-              <div>
-                <label className="mb-1 block text-sm font-medium md-text-secondary">Title</label>
-                <input
-                  type="text"
-                  value={prTitle}
-                  onChange={(e) => setPrTitle(e.target.value)}
-                  className="md-field"
-                  placeholder="PR title"
-                />
-              </div>
-              
-              <div>
-                <label className="mb-1 block text-sm font-medium md-text-secondary">Description</label>
-                <textarea
-                  value={prBody}
-                  onChange={(e) => setPrBody(e.target.value)}
-                  rows={6}
-                  className="md-field font-mono"
-                  placeholder="PR description (markdown supported)"
-                />
-              </div>
-            </div>
-            
-            <div className="flex justify-end gap-2 border-t md-outline p-4">
-              <button
-                onClick={() => { setShowPRForm(false); setPrTitle(""); setPrBody(""); }}
-                className="md-btn"
-                disabled={isCreatingPR}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={createPullRequest}
-                disabled={isCreatingPR || !prTitle.trim()}
-                className="md-btn md-btn-tonal disabled:opacity-50"
-              >
-                {isCreatingPR ? "Creating..." : "Create PR"}
               </button>
             </div>
           </div>
