@@ -124,6 +124,22 @@ interface ActivityGroup {
   lines: ActivityLine[];
 }
 
+interface QuestionOption {
+  label: string;
+  description?: string;
+}
+
+interface QuestionItem {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options?: QuestionOption[];
+}
+
+interface AskUserQuestionPayload {
+  questions: QuestionItem[];
+}
+
 type ChatRow =
   | { kind: "message"; id: string; message: AgentMessage }
   | { kind: "activity"; id: string; group: ActivityGroup };
@@ -277,6 +293,113 @@ const MODEL_STORAGE_KEY = "claude_orchestrator_model";
 const THINKING_MODE_STORAGE_KEY = "claude_orchestrator_thinking_mode";
 const DEFAULT_REPOSITORY_STORAGE_KEY = "claude_orchestrator_default_repository";
 
+function parseAskUserQuestionPayload(raw: string): AskUserQuestionPayload | null {
+  try {
+    const parsed = JSON.parse(raw) as { questions?: unknown };
+    if (!parsed || !Array.isArray(parsed.questions)) {
+      return null;
+    }
+
+    const questions: QuestionItem[] = parsed.questions
+      .map((item) => {
+        const source = item as {
+          question?: unknown;
+          header?: unknown;
+          multiSelect?: unknown;
+          options?: unknown;
+        };
+        const question = typeof source.question === "string" ? source.question.trim() : "";
+        const header = typeof source.header === "string" ? source.header.trim() : undefined;
+        const multiSelect = typeof source.multiSelect === "boolean" ? source.multiSelect : undefined;
+        const options: QuestionOption[] = [];
+        if (Array.isArray(source.options)) {
+          for (const opt of source.options) {
+            const optSource = opt as { label?: unknown; description?: unknown };
+            const label = typeof optSource.label === "string" ? optSource.label.trim() : "";
+            if (!label) continue;
+            const description =
+              typeof optSource.description === "string" ? optSource.description.trim() : undefined;
+            const normalized: QuestionOption = { label };
+            if (description) {
+              normalized.description = description;
+            }
+            options.push(normalized);
+          }
+        }
+
+        return {
+          question,
+          header,
+          multiSelect,
+          options,
+        };
+      })
+      .filter((item) => item.question.length > 0 || (item.options?.length ?? 0) > 0);
+
+    if (questions.length === 0) {
+      return null;
+    }
+
+    return { questions };
+  } catch {
+    return null;
+  }
+}
+
+interface QuestionCardProps {
+  message: AgentMessage;
+  rowId: string;
+  isAnswered: boolean;
+  onAnswer: (answer: string) => void;
+}
+
+function QuestionCard({ message, rowId, isAnswered, onAnswer }: QuestionCardProps) {
+  const payload = useMemo(() => parseAskUserQuestionPayload(message.content), [message.content]);
+
+  if (!payload) {
+    return (
+      <div className="mt-3">
+        <pre className="overflow-x-auto whitespace-pre-wrap text-sm md-text-primary">{message.content}</pre>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-3 rounded-xl border md-outline bg-white/[0.03] p-3">
+      <div className="mb-2 text-[11px] uppercase tracking-wide md-text-faint">Question</div>
+      <div className="space-y-3">
+        {payload.questions.map((question, questionIdx) => (
+          <div key={`${rowId}-question-${questionIdx}`} className="space-y-2">
+            {question.header && <div className="text-xs md-text-muted">{question.header}</div>}
+            {question.question && <div className="text-sm md-text-primary">{question.question}</div>}
+            {question.options && question.options.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {question.options.map((option, optionIdx) => (
+                  <button
+                    key={`${rowId}-option-${questionIdx}-${optionIdx}`}
+                    type="button"
+                    className="md-chip transition hover:border-white/35 disabled:cursor-not-allowed disabled:opacity-55"
+                    disabled={isAnswered}
+                    onClick={() => onAnswer(option.label)}
+                    title={option.description || option.label}
+                  >
+                    <span>{option.label}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      {!isAnswered && (
+        <div className="mt-3 text-xs md-text-muted">
+          Or type a custom answer in the main chat box below.
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [repositories, setRepositories] = useState<Repository[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -328,6 +451,8 @@ function App() {
   const [isRightPanelOpen, setIsRightPanelOpen] = useState(false);
   const [autoStartingWorkspaceId, setAutoStartingWorkspaceId] = useState<string | null>(null);
   const [expandedActivityIdsByWorkspace, setExpandedActivityIdsByWorkspace] = useState<Record<string, string[]>>({});
+  const [credentialErrorWorkspaces, setCredentialErrorWorkspaces] = useState<Set<string>>(new Set());
+  const [answeredQuestionTimestamps, setAnsweredQuestionTimestamps] = useState<Set<string>>(new Set());
   const [thinkingSinceByWorkspace, setThinkingSinceByWorkspace] = useState<Record<string, number | null>>({});
   const [thinkingElapsedSec, setThinkingElapsedSec] = useState(0);
   const [showRenameForm, setShowRenameForm] = useState(false);
@@ -366,12 +491,16 @@ function App() {
       if (messageWorkspaceId && selectedWorkspaceRef.current === messageWorkspaceId) {
         setMessages(prev => [...prev, event.payload]);
       }
+      if (event.payload.role === "credential_error" && messageWorkspaceId) {
+        setCredentialErrorWorkspaces((prev) => new Set(prev).add(messageWorkspaceId));
+      }
       const inferredRole =
         event.payload.role ??
         (event.payload.agentId === "user" || event.payload.content.trimStart().startsWith(">")
           ? "user"
           : "assistant");
-      const isTerminalResponse = event.payload.isError || inferredRole === "assistant";
+      const isTerminalResponse =
+        event.payload.isError || inferredRole === "assistant" || inferredRole === "question";
       if (isTerminalResponse) {
         if (messageWorkspaceId) {
           setThinkingSinceByWorkspace((prev) => ({ ...prev, [messageWorkspaceId]: null }));
@@ -1040,9 +1169,20 @@ function App() {
     return map;
   }
 
+  function dismissCredentialError(workspaceId: string) {
+    setCredentialErrorWorkspaces((prev) => {
+      const next = new Set(prev);
+      next.delete(workspaceId);
+      return next;
+    });
+  }
+
   async function sendMessage(rawMessage?: string, visibleOverride?: string): Promise<boolean> {
     const composedInput = (rawMessage ?? inputMessage).trim();
     if (!composedInput) return false;
+    if (selectedWorkspace) {
+      dismissCredentialError(selectedWorkspace);
+    }
     const workspaceThinkingSince = selectedWorkspace
       ? (thinkingSinceByWorkspace[selectedWorkspace] ?? null)
       : null;
@@ -1822,6 +1962,24 @@ function App() {
   const latestSystemMessage = [...workspaceMessages]
     .reverse()
     .find((message) => message.role === "system" && !message.isError);
+  const derivedAnsweredQuestionTimestamps = useMemo(() => {
+    const answered = new Set<string>();
+    for (let i = 0; i < workspaceMessages.length; i += 1) {
+      const current = workspaceMessages[i];
+      if (current.role !== "question") continue;
+      for (let j = i + 1; j < workspaceMessages.length; j += 1) {
+        const next = workspaceMessages[j];
+        if (next.role === "user" || next.agentId === "user") {
+          answered.add(current.timestamp);
+          break;
+        }
+        if (next.role === "question") {
+          break;
+        }
+      }
+    }
+    return answered;
+  }, [workspaceMessages]);
   const chatRows = useMemo<ChatRow[]>(() => {
     const rows: ChatRow[] = [];
     let systemBuffer: AgentMessage[] = [];
@@ -2008,11 +2166,14 @@ function App() {
           <div className="mb-4 flex items-center justify-between md-px-1">
             <h2 className="md-title-small">Workspaces</h2>
             <button
+              type="button"
               onClick={openCreateWorkspaceForm}
-              className="md-btn"
+              className="md-icon-plain rounded-full border md-outline disabled:cursor-not-allowed disabled:opacity-45"
               disabled={!selectedRepo}
+              title={selectedRepo ? "Add workspace" : "Select a repository first"}
+              aria-label={selectedRepo ? "Add workspace" : "Select a repository first"}
             >
-              + New
+              <span className="material-symbols-rounded !text-[18px]">add</span>
             </button>
           </div>
 
@@ -2225,11 +2386,48 @@ function App() {
                         msg.content.trimStart().startsWith(">");
 
                       if (msg.isError) {
+                        if (msg.role === "credential_error") {
+                          return (
+                            <div key={row.id} className="mt-3 border-l-2 border-amber-600 pl-3">
+                              <div className="mb-1 text-[11px] uppercase tracking-wide text-amber-300">Credential Error</div>
+                              <pre className="overflow-x-auto whitespace-pre-wrap text-sm text-amber-200">{msg.content}</pre>
+                              <button
+                                type="button"
+                                className="mt-1.5 text-xs text-amber-400 underline underline-offset-2 hover:text-amber-300"
+                                onClick={() => setTerminalTab("setup")}
+                              >
+                                Open Setup tab
+                              </button>
+                            </div>
+                          );
+                        }
                         return (
                           <div key={row.id} className="mt-3 border-l-2 border-rose-700 pl-3">
                             <div className="mb-1 text-[11px] uppercase tracking-wide text-rose-300">Error</div>
                             <pre className="overflow-x-auto whitespace-pre-wrap text-sm text-rose-200">{msg.content}</pre>
                           </div>
+                        );
+                      }
+
+                      if (msg.role === "question") {
+                        const isAnswered =
+                          answeredQuestionTimestamps.has(msg.timestamp) ||
+                          derivedAnsweredQuestionTimestamps.has(msg.timestamp);
+                        return (
+                          <QuestionCard
+                            key={row.id}
+                            message={msg}
+                            rowId={row.id}
+                            isAnswered={isAnswered}
+                            onAnswer={(answer) => {
+                              setAnsweredQuestionTimestamps((prev) => {
+                                const next = new Set(prev);
+                                next.add(msg.timestamp);
+                                return next;
+                              });
+                              void sendMessage(answer);
+                            }}
+                          />
                         );
                       }
 
@@ -2304,6 +2502,33 @@ function App() {
                     )}
                 </div>
               </div>
+
+              {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && selectedWorkspace && credentialErrorWorkspaces.has(selectedWorkspace) && (
+                <div className="border-t border-amber-700/50 bg-amber-950/40 px-4 py-3">
+                  <div className="flex items-start gap-3">
+                    <span className="material-symbols-rounded text-amber-400 !text-xl mt-0.5">key</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-amber-200">AWS credentials expired or invalid</div>
+                      <div className="text-xs text-amber-300/70 mt-0.5">Update your AWS credentials in the environment overrides, then retry your message.</div>
+                    </div>
+                    <button
+                      type="button"
+                      className="shrink-0 rounded-lg bg-amber-700/50 px-3 py-1.5 text-xs font-medium text-amber-100 hover:bg-amber-700/70 transition-colors"
+                      onClick={() => { setTerminalTab("setup"); dismissCredentialError(selectedWorkspace); }}
+                    >
+                      Go to Setup
+                    </button>
+                    <button
+                      type="button"
+                      className="shrink-0 text-amber-400/60 hover:text-amber-300 transition-colors"
+                      onClick={() => dismissCredentialError(selectedWorkspace)}
+                      title="Dismiss"
+                    >
+                      <span className="material-symbols-rounded !text-lg">close</span>
+                    </button>
+                  </div>
+                </div>
+              )}
 
               {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && (
                 <div className="border-t md-outline md-surface-container-high md-px-3 md-py-2">

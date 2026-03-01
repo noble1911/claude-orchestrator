@@ -1075,6 +1075,32 @@ fn extract_model_suggestion(error_text: &str) -> Option<String> {
     }
 }
 
+fn detect_credential_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const PATTERNS: &[&str] = &[
+        "expiredtoken",
+        "expiredtokenexception",
+        "the security token included in the request is expired",
+        "invalidclienttokenid",
+        "unrecognizedclientexception",
+        "accessdeniedexception",
+        "not authorized to perform",
+        "unable to locate credentials",
+        "no credentials found",
+        "invalid identity token",
+        "token has expired",
+        "request has expired",
+        "signing error",
+    ];
+    if PATTERNS.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    if lower.contains("credentials") && (lower.contains("expired") || lower.contains("invalid")) {
+        return true;
+    }
+    false
+}
+
 fn stream_event_payload<'a>(event: &'a Value) -> &'a Value {
     if event.get("type").and_then(|v| v.as_str()) == Some("stream_event") {
         event.get("event").unwrap_or(event)
@@ -1236,11 +1262,17 @@ fn summarize_tool_call(tool_name: &str, input_json: &str) -> Option<String> {
     Some(message)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum ActivityEvent {
+    Activity(String),
+    Question(String),
+}
+
 fn parse_stream_event_for_activity(
     event: &Value,
     tool_names: &mut HashMap<i64, String>,
     tool_inputs: &mut HashMap<i64, String>,
-) -> Vec<String> {
+) -> Vec<ActivityEvent> {
     let mut out = Vec::new();
     let payload = stream_event_payload(event);
     let event_type = match payload.get("type").and_then(|v| v.as_str()) {
@@ -1263,12 +1295,12 @@ fn parse_stream_event_for_activity(
                     .get("permissionMode")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                out.push(format!(
+                out.push(ActivityEvent::Activity(format!(
                     "Claude initialized ({}, permission={})",
                     model, permission_mode
-                ));
+                )));
             } else if !subtype.is_empty() {
-                out.push(format!("System {}", subtype));
+                out.push(ActivityEvent::Activity(format!("System {}", subtype)));
             }
         }
         "assistant" => {
@@ -1280,7 +1312,7 @@ fn parse_stream_event_for_activity(
                 for item in content {
                     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if item_type == "thinking" || item_type == "redacted_thinking" {
-                        out.push("Thinking".to_string());
+                        out.push(ActivityEvent::Activity("Thinking".to_string()));
                     } else if item_type == "tool_use" {
                         let tool_name = item
                             .get("name")
@@ -1294,12 +1326,14 @@ fn parse_stream_event_for_activity(
                                 serde_json::to_string(input_val).unwrap_or_default()
                             };
                             if !input_json.trim().is_empty() {
-                                if let Some(summary) = summarize_tool_call(&tool_name, &input_json) {
-                                    out.push(summary);
+                                if tool_name == "AskUserQuestion" {
+                                    out.push(ActivityEvent::Question(input_json));
+                                } else if let Some(summary) = summarize_tool_call(&tool_name, &input_json) {
+                                    out.push(ActivityEvent::Activity(summary));
                                 }
                             }
                         } else {
-                            out.push(format!("Tool {}", tool_name));
+                            out.push(ActivityEvent::Activity(format!("Tool {}", tool_name)));
                         }
                     }
                 }
@@ -1316,7 +1350,7 @@ fn parse_stream_event_for_activity(
                 .and_then(|v| v.as_i64())
                 .unwrap_or(-1);
             if block_type == "thinking" {
-                out.push("Thinking".to_string());
+                out.push(ActivityEvent::Activity("Thinking".to_string()));
             } else if block_type == "tool_use" {
                 let tool_name = payload
                     .get("content_block")
@@ -1364,13 +1398,15 @@ fn parse_stream_event_for_activity(
             if index >= 0 {
                 if let (Some(tool_name), Some(input_json)) = (tool_names.remove(&index), tool_inputs.remove(&index)) {
                     if !input_json.trim().is_empty() {
-                        if let Some(summary) = summarize_tool_call(&tool_name, &input_json) {
-                            out.push(summary);
+                        if tool_name == "AskUserQuestion" {
+                            out.push(ActivityEvent::Question(input_json));
+                        } else if let Some(summary) = summarize_tool_call(&tool_name, &input_json) {
+                            out.push(ActivityEvent::Activity(summary));
                         } else {
-                            out.push(format!("Tool {}", tool_name));
+                            out.push(ActivityEvent::Activity(format!("Tool {}", tool_name)));
                         }
                     } else {
-                        out.push(format!("Tool {}", tool_name));
+                        out.push(ActivityEvent::Activity(format!("Tool {}", tool_name)));
                     }
                 }
             }
@@ -1772,6 +1808,7 @@ async fn send_message_to_agent(
         let mut known_claude_session_id = claude_session_id.clone();
         let allow_init_activity = known_claude_session_id.is_none();
         let mut last_activity: Option<String> = None;
+        let mut last_question: Option<String> = None;
         let mut error_emitted = false;
 
         if let Some(stdout) = child.stdout.take() {
@@ -1795,25 +1832,46 @@ async fn send_message_to_agent(
                         }
                     }
 
-                    for activity in parse_stream_event_for_activity(&event, &mut tool_names, &mut tool_inputs) {
-                        if !allow_init_activity && activity.starts_with("Claude initialized (") {
-                            continue;
+                    for event_item in parse_stream_event_for_activity(&event, &mut tool_names, &mut tool_inputs) {
+                        match event_item {
+                            ActivityEvent::Activity(activity) => {
+                                if !allow_init_activity && activity.starts_with("Claude initialized (") {
+                                    continue;
+                                }
+                                if last_activity.as_deref() == Some(activity.as_str()) {
+                                    continue;
+                                }
+                                emit_agent_message(
+                                    &app,
+                                    &db,
+                                    &session_id,
+                                    &agent_id_clone,
+                                    &workspace_id,
+                                    &ws_server,
+                                    activity.clone(),
+                                    false,
+                                    "system",
+                                );
+                                last_activity = Some(activity);
+                            }
+                            ActivityEvent::Question(json_content) => {
+                                if last_question.as_deref() == Some(json_content.as_str()) {
+                                    continue;
+                                }
+                                emit_agent_message(
+                                    &app,
+                                    &db,
+                                    &session_id,
+                                    &agent_id_clone,
+                                    &workspace_id,
+                                    &ws_server,
+                                    json_content.clone(),
+                                    false,
+                                    "question",
+                                );
+                                last_question = Some(json_content);
+                            }
                         }
-                        if last_activity.as_deref() == Some(activity.as_str()) {
-                            continue;
-                        }
-                        emit_agent_message(
-                            &app,
-                            &db,
-                            &session_id,
-                            &agent_id_clone,
-                            &workspace_id,
-                            &ws_server,
-                            activity.clone(),
-                            false,
-                            "system",
-                        );
-                        last_activity = Some(activity);
                     }
 
                     if let Some(text) = extract_assistant_message_text(&event) {
@@ -1855,6 +1913,19 @@ async fn send_message_to_agent(
                                 .filter(|s| !s.trim().is_empty())
                                 .or_else(|| extract_result_text(&event))
                                 .unwrap_or_else(|| "Claude execution failed".to_string());
+                            if detect_credential_error(&errors) {
+                                emit_agent_message(
+                                    &app,
+                                    &db,
+                                    &session_id,
+                                    &agent_id_clone,
+                                    &workspace_id,
+                                    &ws_server,
+                                    "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                                    true,
+                                    "credential_error",
+                                );
+                            }
                             emit_agent_message(
                                 &app,
                                 &db,
@@ -1871,6 +1942,20 @@ async fn send_message_to_agent(
                     }
                 } else {
                     // Forward non-JSON runtime output so authentication/runtime issues are visible.
+                    let cli_line = format!("cli: {}", line);
+                    if detect_credential_error(&cli_line) {
+                        emit_agent_message(
+                            &app,
+                            &db,
+                            &session_id,
+                            &agent_id_clone,
+                            &workspace_id,
+                            &ws_server,
+                            "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                            true,
+                            "credential_error",
+                        );
+                    }
                     emit_agent_message(
                         &app,
                         &db,
@@ -1878,7 +1963,7 @@ async fn send_message_to_agent(
                         &agent_id_clone,
                         &workspace_id,
                         &ws_server,
-                        format!("cli: {}", line),
+                        cli_line,
                         false,
                         "system",
                     );
@@ -1971,6 +2056,19 @@ async fn send_message_to_agent(
                     "error",
                 );
             }
+            if detect_credential_error(&error_content) {
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                    true,
+                    "credential_error",
+                );
+            }
             emit_agent_message(
                 &app,
                 &db,
@@ -2008,7 +2106,7 @@ async fn send_message_to_agent(
             }
         }
     });
-    
+
     Ok(())
 }
 
@@ -2963,6 +3061,7 @@ async fn handle_ws_commands(
                                 let mut known_claude_session_id = claude_session_id.clone();
                                 let allow_init_activity = known_claude_session_id.is_none();
                                 let mut last_activity: Option<String> = None;
+                                let mut last_question: Option<String> = None;
                                 let mut error_emitted = false;
 
                                 if let Some(stdout) = child.stdout.take() {
@@ -2991,31 +3090,54 @@ async fn handle_ws_commands(
                                                 }
                                             }
 
-                                            for activity in parse_stream_event_for_activity(
+                                            for event_item in parse_stream_event_for_activity(
                                                 &event,
                                                 &mut tool_names,
                                                 &mut tool_inputs,
                                             ) {
-                                                if !allow_init_activity
-                                                    && activity.starts_with("Claude initialized (")
-                                                {
-                                                    continue;
+                                                match event_item {
+                                                    ActivityEvent::Activity(activity) => {
+                                                        if !allow_init_activity
+                                                            && activity.starts_with("Claude initialized (")
+                                                        {
+                                                            continue;
+                                                        }
+                                                        if last_activity.as_deref() == Some(activity.as_str()) {
+                                                            continue;
+                                                        }
+                                                        emit_agent_message(
+                                                            &app_clone,
+                                                            &db,
+                                                            &session_id,
+                                                            &agent_id_clone,
+                                                            &workspace_id_clone,
+                                                            &ws_server,
+                                                            activity.clone(),
+                                                            false,
+                                                            "system",
+                                                        );
+                                                        last_activity = Some(activity);
+                                                    }
+                                                    ActivityEvent::Question(json_content) => {
+                                                        if last_question.as_deref()
+                                                            == Some(json_content.as_str())
+                                                        {
+                                                            continue;
+                                                        }
+                                                        emit_agent_message(
+                                                            &app_clone,
+                                                            &db,
+                                                            &session_id,
+                                                            &agent_id_clone,
+                                                            &workspace_id_clone,
+                                                            &ws_server,
+                                                            json_content.clone(),
+                                                            false,
+                                                            "question",
+                                                        );
+                                                        last_question = Some(json_content);
+                                                    }
                                                 }
-                                                if last_activity.as_deref() == Some(activity.as_str()) {
-                                                    continue;
-                                                }
-                                                emit_agent_message(
-                                                    &app_clone,
-                                                    &db,
-                                                    &session_id,
-                                                    &agent_id_clone,
-                                                    &workspace_id_clone,
-                                                    &ws_server,
-                                                    activity.clone(),
-                                                    false,
-                                                    "system",
-                                                );
-                                                last_activity = Some(activity);
                                             }
 
                                             if let Some(text) = extract_assistant_message_text(&event) {
@@ -3052,6 +3174,19 @@ async fn handle_ws_commands(
                                                         .filter(|s| !s.trim().is_empty())
                                                         .or_else(|| extract_result_text(&event))
                                                         .unwrap_or_else(|| "Claude execution failed".to_string());
+                                                    if detect_credential_error(&errors) {
+                                                        emit_agent_message(
+                                                            &app_clone,
+                                                            &db,
+                                                            &session_id,
+                                                            &agent_id_clone,
+                                                            &workspace_id_clone,
+                                                            &ws_server,
+                                                            "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                                                            true,
+                                                            "credential_error",
+                                                        );
+                                                    }
                                                     emit_agent_message(
                                                         &app_clone,
                                                         &db,
@@ -3067,6 +3202,20 @@ async fn handle_ws_commands(
                                                 }
                                             }
                                         } else {
+                                            let cli_line = format!("cli: {}", line);
+                                            if detect_credential_error(&cli_line) {
+                                                emit_agent_message(
+                                                    &app_clone,
+                                                    &db,
+                                                    &session_id,
+                                                    &agent_id_clone,
+                                                    &workspace_id_clone,
+                                                    &ws_server,
+                                                    "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                                                    true,
+                                                    "credential_error",
+                                                );
+                                            }
                                             emit_agent_message(
                                                 &app_clone,
                                                 &db,
@@ -3074,7 +3223,7 @@ async fn handle_ws_commands(
                                                 &agent_id_clone,
                                                 &workspace_id_clone,
                                                 &ws_server,
-                                                format!("cli: {}", line),
+                                                cli_line,
                                                 false,
                                                 "system",
                                             );
@@ -3166,6 +3315,19 @@ async fn handle_ws_commands(
                                             format!("Suggested model from Claude: {}", suggested_model),
                                             true,
                                             "error",
+                                        );
+                                    }
+                                    if detect_credential_error(&error_content) {
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                                            true,
+                                            "credential_error",
                                         );
                                     }
                                     emit_agent_message(
@@ -3610,7 +3772,39 @@ mod tests {
         let activities = parse_stream_event_for_activity(&event, &mut tool_names, &mut tool_inputs);
         assert_eq!(
             activities,
-            vec!["Claude initialized (claude-sonnet-4-6, permission=plan)".to_string()]
+            vec![ActivityEvent::Activity(
+                "Claude initialized (claude-sonnet-4-6, permission=plan)".to_string()
+            )]
         );
+    }
+
+    #[test]
+    fn parse_ask_user_question_tool_use_emits_question_event() {
+        let event = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [
+                                {
+                                    "question": "Pick a mode",
+                                    "options": [
+                                        { "label": "Fast" },
+                                        { "label": "Safe" }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        });
+        let mut tool_names = HashMap::new();
+        let mut tool_inputs = HashMap::new();
+        let activities = parse_stream_event_for_activity(&event, &mut tool_names, &mut tool_inputs);
+        assert!(matches!(activities.first(), Some(ActivityEvent::Question(_))));
     }
 }
