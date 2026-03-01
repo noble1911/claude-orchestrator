@@ -18,10 +18,19 @@ import {
 
 type WorkspaceInfo = {
   id: string;
+  repo_id: string;
   name: string;
   branch: string;
   status: string;
   has_agent: boolean;
+};
+
+type RepositoryInfo = {
+  id: string;
+  path: string;
+  name: string;
+  default_branch: string;
+  added_at: string;
 };
 
 type MessageInfo = {
@@ -46,6 +55,12 @@ type QuestionItem = {
 
 type AskUserQuestionPayload = {
   questions: QuestionItem[];
+};
+
+type PromptShortcut = {
+  id: string;
+  name: string;
+  prompt: string;
 };
 
 type FileEntryInfo = {
@@ -73,7 +88,13 @@ type CheckInfo = {
 
 type WsResponse =
   | { type: "connected" }
+  | { type: "repository_list"; repositories: RepositoryInfo[] }
+  | { type: "repository_added"; repository: RepositoryInfo }
+  | { type: "repository_removed"; repo_id: string }
   | { type: "workspace_list"; workspaces: WorkspaceInfo[] }
+  | { type: "workspace_created"; workspace: WorkspaceInfo }
+  | { type: "workspace_renamed"; workspace: WorkspaceInfo }
+  | { type: "workspace_removed"; workspace_id: string }
   | { type: "message_history"; workspace_id: string; messages: MessageInfo[] }
   | { type: "files_list"; workspace_id: string; relative_path: string; entries: FileEntryInfo[] }
   | { type: "file_content"; workspace_id: string; path: string; content: string }
@@ -105,6 +126,8 @@ const MODEL_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "haiku", label: "Haiku" },
 ];
 const DRAWER_ANIMATION_MS = 220;
+const NAME_ADJECTIVES = ["swift", "brisk", "neat", "solid", "lively", "calm", "bold", "quiet"];
+const NAME_NOUNS = ["otter", "falcon", "maple", "harbor", "comet", "forest", "breeze", "ember"];
 
 function parseAskUserQuestionPayload(raw: string): AskUserQuestionPayload | null {
   try {
@@ -163,10 +186,20 @@ function compactActivityLines(messages: MessageInfo[]): ActivityLine[] {
   return lines;
 }
 
+function generateWorkspaceName(): string {
+  const adjective = NAME_ADJECTIVES[Math.floor(Math.random() * NAME_ADJECTIVES.length)];
+  const noun = NAME_NOUNS[Math.floor(Math.random() * NAME_NOUNS.length)];
+  const suffix = Math.floor(Math.random() * 900) + 100;
+  return `${adjective}-${noun}-${suffix}`;
+}
+
 function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const [wsUrl, setWsUrl] = useState("ws://192.168.1.42:3001");
   const [connected, setConnected] = useState(false);
+  const [repositories, setRepositories] = useState<RepositoryInfo[]>([]);
+  const [selectedRepoId, setSelectedRepoId] = useState<string | null>(null);
+  const [defaultRepoId, setDefaultRepoId] = useState<string | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
   const [messagesByWorkspace, setMessagesByWorkspace] = useState<Record<string, MessageInfo[]>>({});
@@ -178,14 +211,24 @@ function App() {
   const [rightOpen, setRightOpen] = useState(false);
   const [renderLeftOverlay, setRenderLeftOverlay] = useState(false);
   const [renderRightOverlay, setRenderRightOverlay] = useState(false);
-  const [rightTab, setRightTab] = useState<"all_files" | "changes" | "checks">("all_files");
+  const [rightTab, setRightTab] = useState<"prompts" | "all_files" | "changes" | "checks">("prompts");
   const [statusText, setStatusText] = useState("");
+  const [showAddRepoForm, setShowAddRepoForm] = useState(false);
+  const [newRepoPath, setNewRepoPath] = useState("");
+  const [showAddWorkspaceForm, setShowAddWorkspaceForm] = useState(false);
+  const [newWorkspaceName, setNewWorkspaceName] = useState("");
+  const [renameWorkspaceId, setRenameWorkspaceId] = useState<string | null>(null);
+  const [renameWorkspaceName, setRenameWorkspaceName] = useState("");
   const [filesPath, setFilesPath] = useState("");
   const [fileEntries, setFileEntries] = useState<FileEntryInfo[]>([]);
   const [selectedFilePath, setSelectedFilePath] = useState("");
   const [selectedFileContent, setSelectedFileContent] = useState("");
   const [changes, setChanges] = useState<ChangeInfo[]>([]);
   const [checks, setChecks] = useState<CheckInfo[]>([]);
+  const [promptShortcuts, setPromptShortcuts] = useState<PromptShortcut[]>([]);
+  const [showAddPromptForm, setShowAddPromptForm] = useState(false);
+  const [newPromptName, setNewPromptName] = useState("");
+  const [newPromptBody, setNewPromptBody] = useState("");
   const [checksRunning, setChecksRunning] = useState(false);
   const [filesLoading, setFilesLoading] = useState(false);
   const [changesLoading, setChangesLoading] = useState(false);
@@ -198,6 +241,19 @@ function App() {
   const selectedWorkspace = useMemo(
     () => workspaces.find((w) => w.id === selectedWorkspaceId) || null,
     [workspaces, selectedWorkspaceId],
+  );
+  const selectedRepository = useMemo(
+    () => repositories.find((repo) => repo.id === selectedRepoId) || null,
+    [repositories, selectedRepoId],
+  );
+  const workspaceGroups = useMemo(
+    () => [
+      { key: "running", label: "In progress", items: workspaces.filter((ws) => ws.status === "running") },
+      { key: "inReview", label: "In review", items: workspaces.filter((ws) => ws.status === "inReview") },
+      { key: "idle", label: "Ready", items: workspaces.filter((ws) => ws.status === "idle") },
+      { key: "merged", label: "Done", items: workspaces.filter((ws) => ws.status === "merged") },
+    ],
+    [workspaces],
   );
 
   const currentMessages = selectedWorkspaceId ? messagesByWorkspace[selectedWorkspaceId] || [] : [];
@@ -376,7 +432,7 @@ function App() {
       setConnected(true);
       setStatusText("Connected");
       sendJson({ type: "connect", client_name: "mobile" });
-      sendJson({ type: "list_workspaces" });
+      sendJson({ type: "list_repositories" });
     };
 
     ws.onclose = () => {
@@ -398,11 +454,51 @@ function App() {
       }
 
       if (parsed.type === "workspace_list") {
-        setWorkspaces(parsed.workspaces || []);
-        if (!selectedWorkspaceId && parsed.workspaces && parsed.workspaces.length > 0) {
-          const first = parsed.workspaces[0].id;
+        const next: WorkspaceInfo[] = parsed.workspaces ?? [];
+        setWorkspaces(next);
+        const stillSelected = next.some((item) => item.id === selectedWorkspaceId);
+        if (stillSelected) {
+          return;
+        }
+        if (next.length > 0) {
+          const first = next[0].id;
           setSelectedWorkspaceId(first);
           bootstrapWorkspace(first);
+        } else {
+          setSelectedWorkspaceId(null);
+        }
+        return;
+      }
+
+      if (parsed.type === "repository_list") {
+        const nextRepos: RepositoryInfo[] = parsed.repositories ?? [];
+        setRepositories(nextRepos);
+        let nextSelectedRepo = selectedRepoId;
+        if (!nextSelectedRepo || !nextRepos.some((repo) => repo.id === nextSelectedRepo)) {
+          nextSelectedRepo =
+            (defaultRepoId && nextRepos.some((repo) => repo.id === defaultRepoId) ? defaultRepoId : null) ||
+            (nextRepos[0]?.id ?? null);
+        }
+        setSelectedRepoId(nextSelectedRepo);
+        if (nextSelectedRepo) {
+          sendJson({ type: "list_workspaces", repo_id: nextSelectedRepo });
+        } else {
+          setWorkspaces([]);
+          setSelectedWorkspaceId(null);
+        }
+        return;
+      }
+
+      if (parsed.type === "repository_added" || parsed.type === "repository_removed") {
+        sendJson({ type: "list_repositories" });
+        return;
+      }
+
+      if (parsed.type === "workspace_created" || parsed.type === "workspace_renamed" || parsed.type === "workspace_removed") {
+        if (selectedRepoId) {
+          sendJson({ type: "list_workspaces", repo_id: selectedRepoId });
+        } else {
+          sendJson({ type: "list_workspaces" });
         }
         return;
       }
@@ -502,6 +598,59 @@ function App() {
     sendJson({ type: "list_changes", workspace_id: workspaceId });
   }
 
+  function selectRepository(repoId: string) {
+    setSelectedRepoId(repoId);
+    setSelectedWorkspaceId(null);
+    setWorkspaces([]);
+    sendJson({ type: "list_workspaces", repo_id: repoId });
+  }
+
+  function addRepository() {
+    const path = newRepoPath.trim();
+    if (!path) return;
+    sendJson({ type: "add_repository", path });
+    setNewRepoPath("");
+    setShowAddRepoForm(false);
+  }
+
+  function removeRepository(repoId: string) {
+    sendJson({ type: "remove_repository", repo_id: repoId });
+    if (selectedRepoId === repoId) {
+      setSelectedRepoId(null);
+      setSelectedWorkspaceId(null);
+      setWorkspaces([]);
+    }
+  }
+
+  function createWorkspace() {
+    if (!selectedRepoId) return;
+    const name = newWorkspaceName.trim() || generateWorkspaceName();
+    sendJson({ type: "create_workspace", repo_id: selectedRepoId, name });
+    setNewWorkspaceName("");
+    setShowAddWorkspaceForm(false);
+  }
+
+  function beginRenameWorkspace(workspace: WorkspaceInfo) {
+    setRenameWorkspaceId(workspace.id);
+    setRenameWorkspaceName(workspace.name);
+  }
+
+  function saveRenameWorkspace() {
+    if (!renameWorkspaceId) return;
+    const name = renameWorkspaceName.trim();
+    if (!name) return;
+    sendJson({ type: "rename_workspace", workspace_id: renameWorkspaceId, name });
+    setRenameWorkspaceId(null);
+    setRenameWorkspaceName("");
+  }
+
+  function removeWorkspace(workspaceId: string) {
+    sendJson({ type: "remove_workspace", workspace_id: workspaceId });
+    if (selectedWorkspaceId === workspaceId) {
+      setSelectedWorkspaceId(null);
+    }
+  }
+
   function selectWorkspace(workspaceId: string) {
     setSelectedWorkspaceId(workspaceId);
     setLeftOpen(false);
@@ -545,15 +694,39 @@ function App() {
     }
   }
 
-  function openRightDrawer(tab: "all_files" | "changes" | "checks") {
+  function openRightDrawer(tab: "prompts" | "all_files" | "changes" | "checks") {
     setRightTab(tab);
     setRightOpen(true);
     if (!selectedWorkspaceId) return;
+    if (tab === "prompts") {
+      return;
+    }
     if (tab === "all_files") {
       refreshFiles(selectedWorkspaceId, filesPath || "");
     } else if (tab === "changes") {
       refreshChanges(selectedWorkspaceId);
     }
+  }
+
+  function runPromptShortcut(shortcut: PromptShortcut) {
+    if (!selectedWorkspaceId) return;
+    sendMessage(shortcut.prompt);
+    setRightOpen(false);
+  }
+
+  function addPromptShortcut() {
+    const name = newPromptName.trim();
+    const prompt = newPromptBody.trim();
+    if (!name || !prompt) return;
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setPromptShortcuts((prev) => [...prev, { id, name, prompt }]);
+    setNewPromptName("");
+    setNewPromptBody("");
+    setShowAddPromptForm(false);
+  }
+
+  function deletePromptShortcut(id: string) {
+    setPromptShortcuts((prev) => prev.filter((item) => item.id !== id));
   }
 
   function navigateUp() {
@@ -616,7 +789,7 @@ function App() {
           <Text style={styles.smallButtonText}>Menu</Text>
         </TouchableOpacity>
         <Text style={styles.headerTitle}>{selectedWorkspace?.name || "Select Workspace"}</Text>
-        <TouchableOpacity style={styles.smallButton} onPress={() => openRightDrawer("all_files")}>
+        <TouchableOpacity style={styles.smallButton} onPress={() => openRightDrawer("prompts")}>
           <Text style={styles.smallButtonText}>Tools</Text>
         </TouchableOpacity>
       </View>
@@ -807,14 +980,168 @@ function App() {
               { paddingTop: topInset + 12, transform: [{ translateX: leftDrawerTranslateX }] },
             ]}
           >
-            <Text style={styles.drawerTitle}>Workspaces</Text>
+            <Text style={styles.drawerTitle}>History</Text>
             <ScrollView>
-              {workspaces.map((ws) => (
-                <TouchableOpacity key={ws.id} style={styles.wsItem} onPress={() => selectWorkspace(ws.id)}>
-                  <Text style={styles.wsName}>{ws.name}</Text>
-                  <Text style={styles.wsMeta}>{ws.branch} · {ws.status}</Text>
-                </TouchableOpacity>
-              ))}
+              <View style={styles.drawerSection}>
+                <View style={styles.drawerSectionHeader}>
+                  <Text style={styles.drawerSectionTitle}>Repositories</Text>
+                  <TouchableOpacity style={styles.iconButton} onPress={() => setShowAddRepoForm((prev) => !prev)}>
+                    <Text style={styles.iconButtonText}>+</Text>
+                  </TouchableOpacity>
+                </View>
+                {showAddRepoForm ? (
+                  <View style={styles.inlineForm}>
+                    <TextInput
+                      value={newRepoPath}
+                      onChangeText={setNewRepoPath}
+                      placeholder="/path/to/repository"
+                      placeholderTextColor="#7a726c"
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      style={styles.inlineFormInput}
+                    />
+                    <TouchableOpacity style={styles.inlineFormButton} onPress={addRepository}>
+                      <Text style={styles.inlineFormButtonText}>Add</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : null}
+                {repositories.length === 0 ? (
+                  <Text style={styles.emptyText}>No repositories yet.</Text>
+                ) : (
+                  repositories.map((repo) => (
+                    <View
+                      key={repo.id}
+                      style={[
+                        styles.repoItem,
+                        selectedRepoId === repo.id ? styles.repoItemActive : null,
+                      ]}
+                    >
+                      <TouchableOpacity
+                        style={styles.repoMainButton}
+                        onPress={() => selectRepository(repo.id)}
+                      >
+                        <Text style={styles.repoName} numberOfLines={1}>
+                          {repo.name}
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity style={styles.iconButton} onPress={() => setDefaultRepoId(repo.id)}>
+                        <Text style={[styles.iconButtonText, defaultRepoId === repo.id ? styles.iconButtonActive : null]}>
+                          {defaultRepoId === repo.id ? "★" : "☆"}
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity style={styles.iconButton} onPress={() => removeRepository(repo.id)}>
+                        <Text style={[styles.iconButtonText, styles.iconButtonDanger]}>🗑</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ))
+                )}
+              </View>
+
+              <View style={styles.drawerSection}>
+                <View style={styles.drawerSectionHeader}>
+                  <Text style={styles.drawerSectionTitle}>Workspaces</Text>
+                  <TouchableOpacity
+                    style={styles.iconButton}
+                    disabled={!selectedRepoId}
+                    onPress={() => {
+                      setShowAddWorkspaceForm((prev) => !prev);
+                      if (!newWorkspaceName.trim()) {
+                        setNewWorkspaceName(generateWorkspaceName());
+                      }
+                    }}
+                  >
+                    <Text
+                      style={[
+                        styles.iconButtonText,
+                        !selectedRepoId ? styles.iconButtonDisabled : null,
+                      ]}
+                    >
+                      +
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.drawerCaption}>
+                  {selectedRepository ? selectedRepository.name : "Select a repository"}
+                </Text>
+                {showAddWorkspaceForm && selectedRepoId ? (
+                  <View style={styles.inlineForm}>
+                    <TextInput
+                      value={newWorkspaceName}
+                      onChangeText={setNewWorkspaceName}
+                      placeholder="workspace-name"
+                      placeholderTextColor="#7a726c"
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      style={styles.inlineFormInput}
+                    />
+                    <TouchableOpacity style={styles.inlineFormButton} onPress={createWorkspace}>
+                      <Text style={styles.inlineFormButtonText}>Create</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : null}
+                {!selectedRepoId ? (
+                  <Text style={styles.emptyText}>Choose a repository to see workspaces.</Text>
+                ) : workspaces.length === 0 ? (
+                  <Text style={styles.emptyText}>No workspaces yet.</Text>
+                ) : (
+                  workspaceGroups.map((group) => (
+                    <View key={group.key} style={styles.workspaceGroup}>
+                      <Text style={styles.workspaceGroupTitle}>
+                        {group.label} {group.items.length}
+                      </Text>
+                      {group.items.map((ws) => (
+                        <View
+                          key={ws.id}
+                          style={[
+                            styles.wsItem,
+                            selectedWorkspaceId === ws.id ? styles.wsItemActive : null,
+                          ]}
+                        >
+                          {renameWorkspaceId === ws.id ? (
+                            <View style={styles.wsRenameRow}>
+                              <TextInput
+                                value={renameWorkspaceName}
+                                onChangeText={setRenameWorkspaceName}
+                                style={styles.wsRenameInput}
+                                autoFocus
+                              />
+                              <TouchableOpacity style={styles.iconButton} onPress={saveRenameWorkspace}>
+                                <Text style={styles.iconButtonText}>✓</Text>
+                              </TouchableOpacity>
+                              <TouchableOpacity
+                                style={styles.iconButton}
+                                onPress={() => {
+                                  setRenameWorkspaceId(null);
+                                  setRenameWorkspaceName("");
+                                }}
+                              >
+                                <Text style={styles.iconButtonText}>✕</Text>
+                              </TouchableOpacity>
+                            </View>
+                          ) : (
+                            <>
+                              <TouchableOpacity style={styles.wsMainButton} onPress={() => selectWorkspace(ws.id)}>
+                                <Text style={styles.wsName} numberOfLines={1}>
+                                  {ws.name}
+                                </Text>
+                                <Text style={styles.wsMeta} numberOfLines={1}>
+                                  {ws.branch}
+                                </Text>
+                              </TouchableOpacity>
+                              <TouchableOpacity style={styles.iconButton} onPress={() => beginRenameWorkspace(ws)}>
+                                <Text style={styles.iconButtonText}>✎</Text>
+                              </TouchableOpacity>
+                              <TouchableOpacity style={styles.iconButton} onPress={() => removeWorkspace(ws.id)}>
+                                <Text style={[styles.iconButtonText, styles.iconButtonDanger]}>🗑</Text>
+                              </TouchableOpacity>
+                            </>
+                          )}
+                        </View>
+                      ))}
+                    </View>
+                  ))
+                )}
+              </View>
             </ScrollView>
           </Animated.View>
         </View>
@@ -836,13 +1163,57 @@ function App() {
             ]}
           >
             <View style={styles.tabRow}>
-              {(["all_files", "changes", "checks"] as const).map((tab) => (
+              {(["prompts", "all_files", "changes", "checks"] as const).map((tab) => (
                 <TouchableOpacity key={tab} style={[styles.tabButton, rightTab === tab && styles.tabButtonActive]} onPress={() => openRightDrawer(tab)}>
                   <Text style={[styles.tabText, rightTab === tab && styles.tabTextActive]}>{tab.replace("_", " ")}</Text>
                 </TouchableOpacity>
               ))}
             </View>
             <View style={styles.drawerContent}>
+              {rightTab === "prompts" && (
+                <>
+                  <View style={styles.drawerActions}>
+                    <TouchableOpacity style={styles.secondaryButton} onPress={() => setShowAddPromptForm((prev) => !prev)}>
+                      <Text style={styles.secondaryButtonText}>{showAddPromptForm ? "Close" : "Add Prompt"}</Text>
+                    </TouchableOpacity>
+                  </View>
+                  {showAddPromptForm ? (
+                    <View style={styles.promptForm}>
+                      <TextInput
+                        value={newPromptName}
+                        onChangeText={setNewPromptName}
+                        style={styles.promptNameInput}
+                        placeholder="Prompt name"
+                        placeholderTextColor="#7a726c"
+                      />
+                      <TextInput
+                        value={newPromptBody}
+                        onChangeText={setNewPromptBody}
+                        style={styles.promptBodyInput}
+                        placeholder="Prompt text"
+                        placeholderTextColor="#7a726c"
+                        multiline
+                      />
+                      <TouchableOpacity style={styles.secondaryButton} onPress={addPromptShortcut}>
+                        <Text style={styles.secondaryButtonText}>Save Prompt</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ) : null}
+                  <ScrollView>
+                    {promptShortcuts.length === 0 ? <Text style={styles.drawerText}>No prompt shortcuts yet.</Text> : null}
+                    {promptShortcuts.map((shortcut) => (
+                      <View key={shortcut.id} style={styles.promptItem}>
+                        <TouchableOpacity style={styles.promptMainButton} onPress={() => runPromptShortcut(shortcut)}>
+                          <Text style={styles.promptName}>{shortcut.name}</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.iconButton} onPress={() => deletePromptShortcut(shortcut.id)}>
+                          <Text style={[styles.iconButtonText, styles.iconButtonDanger]}>🗑</Text>
+                        </TouchableOpacity>
+                      </View>
+                    ))}
+                  </ScrollView>
+                </>
+              )}
               {rightTab === "all_files" && (
                 <>
                   <View style={styles.drawerActions}>
@@ -1070,9 +1441,91 @@ const styles = StyleSheet.create({
     borderLeftColor: "#2b2623",
   },
   drawerTitle: { color: "#e6e0da", fontSize: 16, fontWeight: "700", marginBottom: 10 },
-  wsItem: { paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: "#2b2623" },
-  wsName: { color: "#ece8e4", fontSize: 14, fontWeight: "600" },
-  wsMeta: { color: "#a79e96", fontSize: 12, marginTop: 2 },
+  drawerSection: { marginBottom: 14 },
+  drawerSectionHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 8 },
+  drawerSectionTitle: { color: "#cfc7c1", fontSize: 13, fontWeight: "700" },
+  drawerCaption: { color: "#918880", fontSize: 11, marginBottom: 8 },
+  emptyText: { color: "#8f857d", fontSize: 12, marginTop: 2, marginBottom: 6 },
+  iconButton: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#4a4038",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#1d1916",
+  },
+  iconButtonText: { color: "#d5ccc5", fontSize: 13, lineHeight: 14 },
+  iconButtonActive: { color: "#f7ca6a" },
+  iconButtonDanger: { color: "#d98b8b" },
+  iconButtonDisabled: { color: "#6a625c" },
+  inlineForm: { flexDirection: "row", gap: 8, marginBottom: 8 },
+  inlineFormInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: "#433a34",
+    borderRadius: 8,
+    backgroundColor: "#14110f",
+    color: "#e8e1db",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 12,
+  },
+  inlineFormButton: {
+    borderWidth: 1,
+    borderColor: "#5b4f46",
+    borderRadius: 8,
+    backgroundColor: "#26211d",
+    paddingHorizontal: 10,
+    justifyContent: "center",
+  },
+  inlineFormButtonText: { color: "#d9d1ca", fontSize: 12, fontWeight: "600" },
+  repoItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1,
+    borderColor: "#36302a",
+    borderRadius: 10,
+    backgroundColor: "#171411",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    marginBottom: 6,
+  },
+  repoItemActive: { borderColor: "#6a5b52", backgroundColor: "#221d19" },
+  repoMainButton: { flex: 1, minWidth: 0 },
+  repoName: { color: "#ece8e4", fontSize: 13, fontWeight: "600" },
+  workspaceGroup: { marginBottom: 10 },
+  workspaceGroupTitle: { color: "#8f857d", fontSize: 11, marginBottom: 6 },
+  wsItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1,
+    borderColor: "#36302a",
+    borderRadius: 10,
+    backgroundColor: "#171411",
+    paddingHorizontal: 8,
+    paddingVertical: 7,
+    marginBottom: 6,
+  },
+  wsItemActive: { borderColor: "#6a5b52", backgroundColor: "#221d19" },
+  wsMainButton: { flex: 1, minWidth: 0 },
+  wsName: { color: "#ece8e4", fontSize: 13, fontWeight: "600" },
+  wsMeta: { color: "#a79e96", fontSize: 11, marginTop: 2 },
+  wsRenameRow: { flexDirection: "row", alignItems: "center", gap: 6, flex: 1 },
+  wsRenameInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: "#4a4038",
+    borderRadius: 8,
+    backgroundColor: "#14110f",
+    color: "#ece8e4",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    fontSize: 12,
+  },
   tabRow: { flexDirection: "row", gap: 6, marginBottom: 12 },
   tabButton: { borderWidth: 1, borderColor: "#39312b", borderRadius: 8, paddingHorizontal: 8, paddingVertical: 6 },
   tabButtonActive: { backgroundColor: "#2a2320", borderColor: "#6a5b52" },
@@ -1098,6 +1551,43 @@ const styles = StyleSheet.create({
   checkMeta: { color: "#8d847d", fontSize: 11, marginTop: 3 },
   checkOutput: { color: "#c7beb7", fontSize: 11, marginTop: 6 },
   checkOutputError: { color: "#da8e8e", fontSize: 11, marginTop: 6 },
+  promptForm: { marginBottom: 10, gap: 8 },
+  promptNameInput: {
+    borderWidth: 1,
+    borderColor: "#433a34",
+    borderRadius: 8,
+    backgroundColor: "#14110f",
+    color: "#e8e1db",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 12,
+  },
+  promptBodyInput: {
+    minHeight: 72,
+    borderWidth: 1,
+    borderColor: "#433a34",
+    borderRadius: 8,
+    backgroundColor: "#14110f",
+    color: "#e8e1db",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 12,
+    textAlignVertical: "top",
+  },
+  promptItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    borderWidth: 1,
+    borderColor: "#35302b",
+    borderRadius: 10,
+    backgroundColor: "#171411",
+    marginBottom: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 7,
+  },
+  promptMainButton: { flex: 1 },
+  promptName: { color: "#ece8e4", fontSize: 13, fontWeight: "600" },
 });
 
 export default App;

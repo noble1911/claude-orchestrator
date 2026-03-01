@@ -18,7 +18,10 @@ mod process_manager;
 mod websocket_server;
 
 use database::Database;
-use websocket_server::{ChangeInfo, CheckInfo, FileEntryInfo, MessageInfo, WebSocketServer, WsResponse, WorkspaceInfo, ServerCommand};
+use websocket_server::{
+    ChangeInfo, CheckInfo, FileEntryInfo, MessageInfo, RepositoryInfo, ServerCommand, WebSocketServer,
+    WorkspaceInfo, WsResponse,
+};
 
 static CLAUDE_HELP_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 const REMOTE_SERVER_PORT: u16 = 3001;
@@ -203,6 +206,36 @@ impl AppState {
     
     fn set_ws_server(&mut self, server: Arc<WebSocketServer>) {
         self.ws_server = Some(server);
+    }
+}
+
+fn workspace_status_to_ws(status: &WorkspaceStatus) -> String {
+    match status {
+        WorkspaceStatus::Idle => "idle".to_string(),
+        WorkspaceStatus::Running => "running".to_string(),
+        WorkspaceStatus::InReview => "inReview".to_string(),
+        WorkspaceStatus::Merged => "merged".to_string(),
+    }
+}
+
+fn to_workspace_info(workspace: &Workspace, has_agent: bool) -> WorkspaceInfo {
+    WorkspaceInfo {
+        id: workspace.id.clone(),
+        repo_id: workspace.repo_id.clone(),
+        name: workspace.name.clone(),
+        branch: workspace.branch.clone(),
+        status: workspace_status_to_ws(&workspace.status),
+        has_agent,
+    }
+}
+
+fn to_repository_info(repository: &Repository) -> RepositoryInfo {
+    RepositoryInfo {
+        id: repository.id.clone(),
+        path: repository.path.clone(),
+        name: repository.name.clone(),
+        default_branch: repository.default_branch.clone(),
+        added_at: repository.added_at.clone(),
     }
 }
 
@@ -2628,27 +2661,345 @@ async fn handle_ws_commands(
                 *state.ws_connected_clients.write() = connected_clients;
                 let _ = app.emit("remote-clients-updated", connected_clients);
             }
-            ServerCommand::ListWorkspaces { response_tx } => {
+            ServerCommand::ListRepositories { response_tx } => {
+                let repos = state.repositories.read();
+                let mut repository_list: Vec<RepositoryInfo> =
+                    repos.values().map(to_repository_info).collect();
+                repository_list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                let response = WsResponse::RepositoryList {
+                    repositories: repository_list,
+                };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            ServerCommand::AddRepository { path, response_tx } => {
+                let path_buf = PathBuf::from(&path);
+                if !path_buf.exists() {
+                    let response = WsResponse::Error {
+                        message: format!("Path does not exist: {}", path),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                if !path_buf.is_dir() {
+                    let response = WsResponse::Error {
+                        message: format!("Path is not a directory: {}", path),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                if !is_git_repo(&path) {
+                    let response = WsResponse::Error {
+                        message:
+                            "Not a git repository. Please select a folder containing a .git directory."
+                                .to_string(),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+
+                let name = path_buf
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Repository")
+                    .to_string();
+                let default_branch = match get_default_branch(&path) {
+                    Ok(branch) => branch,
+                    Err(err) => {
+                        let response = WsResponse::Error {
+                            message: format!("Failed to detect default branch: {}", err),
+                        };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+
+                let repository = Repository {
+                    id: Uuid::new_v4().to_string(),
+                    path,
+                    name,
+                    default_branch,
+                    added_at: chrono::Utc::now().to_rfc3339(),
+                };
+
+                if let Err(err) = state.db.insert_repository(&repository) {
+                    let response = WsResponse::Error {
+                        message: format!("Failed to save repository: {}", err),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                {
+                    let mut repos = state.repositories.write();
+                    repos.insert(repository.id.clone(), repository.clone());
+                }
+
+                let response = WsResponse::RepositoryAdded {
+                    repository: to_repository_info(&repository),
+                };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            ServerCommand::RemoveRepository { repo_id, response_tx } => {
+                let repo_path = {
+                    let repos = state.repositories.read();
+                    repos.get(&repo_id).map(|r| r.path.clone())
+                };
+
+                if let Some(repo_path) = repo_path {
+                    let workspaces_to_remove: Vec<Workspace> = {
+                        let workspaces = state.workspaces.read();
+                        workspaces
+                            .values()
+                            .filter(|w| w.repo_id == repo_id)
+                            .cloned()
+                            .collect()
+                    };
+
+                    for workspace in workspaces_to_remove {
+                        if let Err(e) = remove_worktree(&repo_path, &workspace.worktree_path) {
+                            tracing::warn!(
+                                "git worktree remove failed for {}: {}",
+                                workspace.worktree_path,
+                                e
+                            );
+                        }
+                        if let Err(e) = remove_workspace_directory(&repo_path, &workspace.worktree_path)
+                        {
+                            tracing::warn!(
+                                "workspace directory cleanup failed for {}: {}",
+                                workspace.worktree_path,
+                                e
+                            );
+                        }
+                        let mut workspaces = state.workspaces.write();
+                        workspaces.remove(&workspace.id);
+                    }
+                }
+
+                if let Err(err) = state.db.delete_repository(&repo_id) {
+                    let response = WsResponse::Error {
+                        message: format!("Failed to delete repository: {}", err),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                {
+                    let mut repos = state.repositories.write();
+                    repos.remove(&repo_id);
+                }
+
+                let response = WsResponse::RepositoryRemoved { repo_id };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            ServerCommand::ListWorkspaces { repo_id, response_tx } => {
                 let workspaces = state.workspaces.read();
                 let agents = state.agents.read();
                 
-                let workspace_list: Vec<WorkspaceInfo> = workspaces.values().map(|ws| {
-                    let has_agent = agents.values().any(|a| a.workspace_id == ws.id);
-                    WorkspaceInfo {
-                        id: ws.id.clone(),
-                        name: ws.name.clone(),
-                        branch: ws.branch.clone(),
-                        status: match ws.status {
-                            WorkspaceStatus::Idle => "idle".to_string(),
-                            WorkspaceStatus::Running => "running".to_string(),
-                            WorkspaceStatus::InReview => "inReview".to_string(),
-                            WorkspaceStatus::Merged => "merged".to_string(),
-                        },
-                        has_agent,
-                    }
-                }).collect();
+                let mut workspace_list: Vec<WorkspaceInfo> = workspaces
+                    .values()
+                    .filter(|ws| repo_id.as_ref().map_or(true, |id| &ws.repo_id == id))
+                    .map(|ws| {
+                        let has_agent = agents.values().any(|a| a.workspace_id == ws.id);
+                        to_workspace_info(ws, has_agent)
+                    })
+                    .collect();
+                workspace_list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                 
                 let response = WsResponse::WorkspaceList { workspaces: workspace_list };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            ServerCommand::CreateWorkspace {
+                repo_id,
+                name,
+                response_tx,
+            } => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    let response = WsResponse::Error {
+                        message: "Workspace name cannot be empty".to_string(),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+
+                let repo = {
+                    let repos = state.repositories.read();
+                    match repos.get(&repo_id).cloned() {
+                        Some(repo) => repo,
+                        None => {
+                            let response = WsResponse::Error {
+                                message: "Repository not found".to_string(),
+                            };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                    }
+                };
+
+                let branch = format!("workspace/{}", trimmed.to_lowercase().replace(' ', "-"));
+                let worktrees_dir = PathBuf::from(&repo.path).join(".worktrees");
+                if let Err(err) = std::fs::create_dir_all(&worktrees_dir) {
+                    let response = WsResponse::Error {
+                        message: format!("Failed to create worktrees directory: {}", err),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                let worktree_path = worktrees_dir.join(trimmed);
+                let worktree_path_str = worktree_path.to_string_lossy().to_string();
+                if let Err(err) = create_worktree(&repo.path, &worktree_path_str, &branch) {
+                    let response = WsResponse::Error {
+                        message: format!("Failed to create workspace: {}", err),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+
+                let workspace = Workspace {
+                    id: Uuid::new_v4().to_string(),
+                    repo_id: repo_id.clone(),
+                    name: trimmed.to_string(),
+                    branch,
+                    worktree_path: worktree_path_str,
+                    status: WorkspaceStatus::Idle,
+                    last_activity: None,
+                    pr_url: None,
+                };
+                if let Err(err) = state.db.insert_workspace(&workspace) {
+                    let response = WsResponse::Error {
+                        message: format!("Failed to save workspace: {}", err),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                {
+                    let mut workspaces = state.workspaces.write();
+                    workspaces.insert(workspace.id.clone(), workspace.clone());
+                }
+
+                let response = WsResponse::WorkspaceCreated {
+                    workspace: to_workspace_info(&workspace, false),
+                };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            ServerCommand::RenameWorkspace {
+                workspace_id,
+                name,
+                response_tx,
+            } => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    let response = WsResponse::Error {
+                        message: "Workspace name cannot be empty".to_string(),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+
+                let updated = {
+                    let mut workspaces = state.workspaces.write();
+                    match workspaces.get_mut(&workspace_id) {
+                        Some(workspace) => {
+                            workspace.name = trimmed.to_string();
+                            workspace.clone()
+                        }
+                        None => {
+                            let response = WsResponse::Error {
+                                message: "Workspace not found".to_string(),
+                            };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                    }
+                };
+
+                if let Err(err) = state.db.update_workspace_name(&workspace_id, trimmed) {
+                    let response = WsResponse::Error {
+                        message: format!("Failed to rename workspace: {}", err),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+
+                let has_agent = {
+                    let agents = state.agents.read();
+                    agents.values().any(|a| a.workspace_id == workspace_id)
+                };
+                let response = WsResponse::WorkspaceRenamed {
+                    workspace: to_workspace_info(&updated, has_agent),
+                };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+            }
+            ServerCommand::RemoveWorkspace {
+                workspace_id,
+                response_tx,
+            } => {
+                let (repo_path, worktree_path) = {
+                    let workspaces = state.workspaces.read();
+                    let workspace = match workspaces.get(&workspace_id) {
+                        Some(workspace) => workspace,
+                        None => {
+                            let response = WsResponse::Error {
+                                message: "Workspace not found".to_string(),
+                            };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                    };
+
+                    let repos = state.repositories.read();
+                    let repo = match repos.get(&workspace.repo_id) {
+                        Some(repo) => repo,
+                        None => {
+                            let response = WsResponse::Error {
+                                message: "Repository not found".to_string(),
+                            };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                            continue;
+                        }
+                    };
+
+                    (repo.path.clone(), workspace.worktree_path.clone())
+                };
+
+                if let Err(e) = remove_worktree(&repo_path, &worktree_path) {
+                    tracing::warn!("git worktree remove failed for {}: {}", worktree_path, e);
+                }
+                if let Err(err) = remove_workspace_directory(&repo_path, &worktree_path) {
+                    let response = WsResponse::Error {
+                        message: format!("Failed to remove workspace directory: {}", err),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                if let Err(err) = state.db.delete_workspace(&workspace_id) {
+                    let response = WsResponse::Error {
+                        message: format!("Failed to delete workspace: {}", err),
+                    };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    continue;
+                }
+                {
+                    let mut workspaces = state.workspaces.write();
+                    workspaces.remove(&workspace_id);
+                }
+                {
+                    let mut agents = state.agents.write();
+                    let dead: Vec<String> = agents
+                        .iter()
+                        .filter_map(|(id, agent)| {
+                            if agent.workspace_id == workspace_id {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    for agent_id in dead {
+                        agents.remove(&agent_id);
+                    }
+                }
+
+                let response = WsResponse::WorkspaceRemoved { workspace_id };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
 

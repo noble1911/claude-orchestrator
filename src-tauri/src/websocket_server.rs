@@ -31,7 +31,13 @@ struct ClientHandle {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsMessage {
     Connect { client_name: String },
-    ListWorkspaces,
+    ListRepositories,
+    AddRepository { path: String },
+    RemoveRepository { repo_id: String },
+    ListWorkspaces { repo_id: Option<String> },
+    CreateWorkspace { repo_id: String, name: String },
+    RenameWorkspace { workspace_id: String, name: String },
+    RemoveWorkspace { workspace_id: String },
     GetMessages { workspace_id: String },
     ListFiles { workspace_id: String, relative_path: Option<String> },
     ReadFile { workspace_id: String, relative_path: String, max_bytes: Option<usize> },
@@ -57,8 +63,26 @@ pub enum WsResponse {
         server_name: String,
         features: Vec<String>,
     },
+    RepositoryList {
+        repositories: Vec<RepositoryInfo>,
+    },
+    RepositoryAdded {
+        repository: RepositoryInfo,
+    },
+    RepositoryRemoved {
+        repo_id: String,
+    },
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
+    },
+    WorkspaceCreated {
+        workspace: WorkspaceInfo,
+    },
+    WorkspaceRenamed {
+        workspace: WorkspaceInfo,
+    },
+    WorkspaceRemoved {
+        workspace_id: String,
     },
     MessageHistory {
         workspace_id: String,
@@ -110,10 +134,20 @@ pub enum WsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
     pub id: String,
+    pub repo_id: String,
     pub name: String,
     pub branch: String,
     pub status: String,
     pub has_agent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryInfo {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub default_branch: String,
+    pub added_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +187,9 @@ pub struct CheckInfo {
 
 // Commands from WebSocket to main app
 pub enum ServerCommand {
+    ListRepositories { response_tx: mpsc::UnboundedSender<String> },
+    AddRepository { path: String, response_tx: mpsc::UnboundedSender<String> },
+    RemoveRepository { repo_id: String, response_tx: mpsc::UnboundedSender<String> },
     SendMessage {
         workspace_id: String,
         message: String,
@@ -161,9 +198,12 @@ pub enum ServerCommand {
         effort: Option<String>,
         response_tx: mpsc::UnboundedSender<String>,
     },
+    CreateWorkspace { repo_id: String, name: String, response_tx: mpsc::UnboundedSender<String> },
+    RenameWorkspace { workspace_id: String, name: String, response_tx: mpsc::UnboundedSender<String> },
+    RemoveWorkspace { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     StartAgent { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     StopAgent { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
-    ListWorkspaces { response_tx: mpsc::UnboundedSender<String> },
+    ListWorkspaces { repo_id: Option<String>, response_tx: mpsc::UnboundedSender<String> },
     GetMessages { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     ListFiles { workspace_id: String, relative_path: Option<String>, response_tx: mpsc::UnboundedSender<String> },
     ReadFile { workspace_id: String, relative_path: String, max_bytes: Option<usize>, response_tx: mpsc::UnboundedSender<String> },
@@ -339,10 +379,93 @@ async fn handle_connection(
                             tracing::info!("Client {} identified as: {}", client_id_clone, client_name);
                         }
                         
-                        WsMessage::ListWorkspaces => {
+                        WsMessage::ListRepositories => {
                             let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-                            if message_tx.send(ServerCommand::ListWorkspaces { response_tx }).is_ok() {
+                            if message_tx.send(ServerCommand::ListRepositories { response_tx }).is_ok() {
                                 if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::AddRepository { path } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx
+                                .send(ServerCommand::AddRepository { path, response_tx })
+                                .is_ok()
+                            {
+                                while let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::RemoveRepository { repo_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx
+                                .send(ServerCommand::RemoveRepository { repo_id, response_tx })
+                                .is_ok()
+                            {
+                                while let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::ListWorkspaces { repo_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx
+                                .send(ServerCommand::ListWorkspaces { repo_id, response_tx })
+                                .is_ok()
+                            {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::CreateWorkspace { repo_id, name } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx
+                                .send(ServerCommand::CreateWorkspace {
+                                    repo_id,
+                                    name,
+                                    response_tx,
+                                })
+                                .is_ok()
+                            {
+                                while let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::RenameWorkspace { workspace_id, name } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx
+                                .send(ServerCommand::RenameWorkspace {
+                                    workspace_id,
+                                    name,
+                                    response_tx,
+                                })
+                                .is_ok()
+                            {
+                                while let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::RemoveWorkspace { workspace_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx
+                                .send(ServerCommand::RemoveWorkspace {
+                                    workspace_id,
+                                    response_tx,
+                                })
+                                .is_ok()
+                            {
+                                while let Some(response) = response_rx.recv().await {
                                     let _ = tx.send(response);
                                 }
                             }
