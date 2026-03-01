@@ -37,6 +37,10 @@ claude-orchestrator/
 │   ├── App.tsx              # Main UI
 │   ├── main.tsx
 │   └── index.css            # Tailwind
+├── mobile/                   # React Native (Expo) companion app
+│   ├── App.tsx              # Mobile UI
+│   ├── app.json             # Expo config
+│   └── package.json
 ├── package.json
 └── tauri.conf.json
 ```
@@ -68,6 +72,52 @@ The built app will be at:
 ```
 src-tauri/target/debug/bundle/macos/Claude Orchestrator.app
 ```
+
+## Mobile App
+
+A companion React Native (Expo) app lives in the `mobile/` directory. It connects to the desktop app over WebSocket for remote monitoring and control of workspaces.
+
+### Prerequisites
+
+- Node.js 18+
+- [Expo CLI](https://docs.expo.dev/get-started/installation/) (`npx expo` works out of the box)
+- For iOS: Xcode 15+ and an iOS Simulator (or [Expo Go](https://apps.apple.com/app/expo-go/id982107779) on a physical device)
+- For Android: Android Studio with an emulator (or [Expo Go](https://play.google.com/store/apps/details?id=host.exp.exponent) on a physical device)
+
+### Quick Start (Expo Go)
+
+The fastest way to run the mobile app during development:
+
+```bash
+cd mobile
+npm install
+npm run start
+```
+
+Scan the QR code with Expo Go (iOS Camera app or Android Expo Go app). Your phone must be on the same Wi-Fi network as your desktop.
+
+### Native Builds
+
+For a full native build (required for features not supported by Expo Go):
+
+```bash
+cd mobile
+
+# iOS (requires Xcode)
+npm run ios
+
+# Android (requires Android Studio)
+npm run android
+```
+
+### Connecting to the Desktop App
+
+1. Make sure the Claude Orchestrator desktop app is running (it starts the WebSocket server on port 3001).
+2. In the mobile app, set the WebSocket URL to your desktop's local IP:
+   ```
+   ws://192.168.x.x:3001
+   ```
+3. Find your desktop IP with `ipconfig getifaddr en0` (macOS).
 
 ## WebSocket Protocol
 
