@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tauri::menu::Menu;
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -94,6 +94,15 @@ pub struct ServerStatus {
 pub struct AppStatus {
     pub repositories: Vec<Repository>,
     pub server_status: ServerStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub current_version: String,
+    pub version: String,
+    pub body: Option<String>,
+    pub date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +410,50 @@ async fn stop_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerSta
     *state.ws_connected_clients.write() = 0;
 
     Ok(build_server_status(state.inner().as_ref()))
+}
+
+#[tauri::command]
+async fn check_for_app_update(app: AppHandle) -> Result<Option<UpdateInfo>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Failed to initialize updater: {}", e))?;
+
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Failed to check for updates: {}", e))?;
+
+    Ok(update.map(|item| UpdateInfo {
+        current_version: item.current_version,
+        version: item.version,
+        body: item.body,
+        date: item.date.map(|d| d.to_string()),
+    }))
+}
+
+#[tauri::command]
+async fn install_app_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Failed to initialize updater: {}", e))?;
+
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Failed to check for updates: {}", e))?
+        .ok_or_else(|| "No update available.".to_string())?;
+
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| format!("Failed to download/install update: {}", e))?;
+
+    app.request_restart();
+    Ok(())
 }
 
 #[tauri::command]
@@ -3904,6 +3957,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state)
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -3938,6 +3992,8 @@ pub fn run() {
             get_app_status,
             start_remote_server,
             stop_remote_server,
+            check_for_app_update,
+            install_app_update,
             add_repository,
             remove_repository,
             list_repositories,

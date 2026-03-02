@@ -52,6 +52,13 @@ interface AppStatus {
   serverStatus: ServerStatus;
 }
 
+interface UpdateInfo {
+  currentVersion: string;
+  version: string;
+  body?: string | null;
+  date?: string | null;
+}
+
 interface WorkspaceFileEntry {
   name: string;
   path: string;
@@ -608,6 +615,11 @@ function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [availableUpdate, setAvailableUpdate] = useState<UpdateInfo | null>(null);
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
+  const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [inputMessage, setInputMessage] = useState("");
   const [activeRightTab, setActiveRightTab] = useState<"prompts" | "files" | "changes" | "checks">("prompts");
@@ -675,6 +687,7 @@ function App() {
 
   useEffect(() => {
     loadInitialState();
+    void checkForAppUpdate();
     
     // Listen for agent messages from backend
     const unlisten = listen<AgentMessage>("agent-message", (event) => {
@@ -1089,6 +1102,45 @@ function App() {
       setError(String(err));
     } finally {
       setIsLoading(false);
+    }
+  }
+
+  async function checkForAppUpdate(showNoUpdateStatus = false) {
+    setIsCheckingUpdate(true);
+    setUpdateError(null);
+
+    try {
+      const update = await invoke<UpdateInfo | null>("check_for_app_update");
+      if (update) {
+        setAvailableUpdate(update);
+        setUpdateDismissed(false);
+      } else {
+        setAvailableUpdate(null);
+        if (showNoUpdateStatus) {
+          setUpdateError("You are already on the latest version.");
+        }
+      }
+    } catch (err) {
+      console.error("Failed to check for app updates:", err);
+      setUpdateError(String(err));
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  }
+
+  async function installAppUpdate() {
+    if (isInstallingUpdate) return;
+
+    setIsInstallingUpdate(true);
+    setUpdateError(null);
+    try {
+      await invoke("install_app_update");
+      setUpdateError("Installing update and restarting...");
+    } catch (err) {
+      console.error("Failed to install app update:", err);
+      setUpdateError(String(err));
+    } finally {
+      setIsInstallingUpdate(false);
     }
   }
 
@@ -2385,6 +2437,34 @@ function App() {
             </div>
           )}
 
+          {availableUpdate && !updateDismissed && (
+            <div className="mx-4 mt-3 rounded-md border border-emerald-700/50 bg-emerald-950/25 md-px-3 md-py-2 text-xs text-emerald-200">
+              <div className="flex flex-wrap items-center gap-2">
+                <span>
+                  Update available: {availableUpdate.currentVersion} → {availableUpdate.version}
+                </span>
+                <button
+                  type="button"
+                  className="md-btn md-btn-tonal !min-h-0 !px-2 !py-1 text-[11px]"
+                  onClick={() => void installAppUpdate()}
+                  disabled={isInstallingUpdate}
+                >
+                  {isInstallingUpdate ? "Installing..." : "Install now"}
+                </button>
+                <button
+                  type="button"
+                  className="md-btn !min-h-0 !px-2 !py-1 text-[11px]"
+                  onClick={() => setUpdateDismissed(true)}
+                >
+                  Later
+                </button>
+              </div>
+              {availableUpdate.body && (
+                <p className="mt-1 truncate md-text-muted">{availableUpdate.body}</p>
+              )}
+            </div>
+          )}
+
           {currentWorkspace ? (
             <>
               <div className="md-tab-strip md-px-4 pt-2">
@@ -3114,6 +3194,36 @@ function App() {
                 <p className="mb-3 md-text-strong">{currentWorkspace?.name || "-"}</p>
                 <p className="md-text-dim">Path</p>
                 <p className="break-all md-text-strong">{currentWorkspace?.worktreePath || "-"}</p>
+              </div>
+
+              <div className="border-t md-outline pt-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <p className="md-text-dim">App updates</p>
+                  <button
+                    type="button"
+                    className="md-btn md-btn-tonal !min-h-0 !px-2 !py-1 text-[11px] disabled:opacity-50"
+                    onClick={() => void checkForAppUpdate(true)}
+                    disabled={isCheckingUpdate}
+                  >
+                    {isCheckingUpdate ? "Checking..." : "Check now"}
+                  </button>
+                </div>
+                {availableUpdate ? (
+                  <div className="rounded-md border border-emerald-700/50 bg-emerald-950/25 p-2 text-[11px] text-emerald-200">
+                    <p>New version available: {availableUpdate.currentVersion} → {availableUpdate.version}</p>
+                    <button
+                      type="button"
+                      className="md-btn mt-2 !min-h-0 !px-2 !py-1 text-[11px]"
+                      onClick={() => void installAppUpdate()}
+                      disabled={isInstallingUpdate}
+                    >
+                      {isInstallingUpdate ? "Installing..." : "Install update"}
+                    </button>
+                  </div>
+                ) : (
+                  <p className="text-[11px] md-text-muted">No pending update detected.</p>
+                )}
+                {updateError && <p className="mt-1 text-[11px] text-amber-300">{updateError}</p>}
               </div>
 
               <div className="border-t md-outline pt-3">

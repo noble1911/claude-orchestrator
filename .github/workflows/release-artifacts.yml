@@ -33,15 +33,73 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build desktop app + dmg
-        run: npm run build-dmg
+      - name: Build desktop app + updater bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          npm run build
+          npx tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":true}}'
 
       - name: Prepare desktop release files
         run: |
           TAG="${{ github.event.release.tag_name }}"
+          mkdir -p builds
+          rm -rf "builds/Claude Orchestrator.app"
+          cp -R "src-tauri/target/release/bundle/macos/Claude Orchestrator.app" "builds/Claude Orchestrator.app"
+          rm -f "builds/Claude Orchestrator.dmg"
+          hdiutil create -volname "Claude Orchestrator" -srcfolder "builds/Claude Orchestrator.app" -ov -format UDZO "builds/Claude Orchestrator.dmg"
           mkdir -p release-assets
           ditto -c -k --sequesterRsrc --keepParent "builds/Claude Orchestrator.app" "release-assets/Claude-Orchestrator-${TAG}-macos-app.zip"
           cp "builds/Claude Orchestrator.dmg" "release-assets/Claude-Orchestrator-${TAG}-macos.dmg"
+          UPDATER_SOURCE="$(find src-tauri/target/release/bundle -type f -name '*.app.tar.gz' | head -n 1)"
+          UPDATER_SIG_SOURCE="$(find src-tauri/target/release/bundle -type f -name '*.app.tar.gz.sig' | head -n 1)"
+          if [ -z "$UPDATER_SOURCE" ] || [ -z "$UPDATER_SIG_SOURCE" ]; then
+            echo "No updater bundle/signature generated. Ensure signing secrets are configured."
+            exit 1
+          fi
+          UPDATER_FILE="Claude-Orchestrator-${TAG}-macos-updater.tar.gz"
+          UPDATER_SIG_FILE="${UPDATER_FILE}.sig"
+          cp "$UPDATER_SOURCE" "release-assets/$UPDATER_FILE"
+          cp "$UPDATER_SIG_SOURCE" "release-assets/$UPDATER_SIG_FILE"
+
+          ARCH="$(uname -m)"
+          if [ "$ARCH" = "arm64" ]; then
+            TARGET_ARCH="aarch64"
+          else
+            TARGET_ARCH="x86_64"
+          fi
+          TARGET_BASE="darwin-${TARGET_ARCH}"
+          RELEASE_URL_BASE="https://github.com/noble1911/claude-orchestrator/releases/download/${TAG}"
+          export UPDATER_SIG_CONTENT="$(cat "release-assets/$UPDATER_SIG_FILE")"
+          export UPDATER_DOWNLOAD_URL="${RELEASE_URL_BASE}/${UPDATER_FILE}"
+          export UPDATE_TARGET="${TARGET_BASE}"
+          export UPDATE_VERSION="${TAG#v}"
+          export UPDATE_PUB_DATE="${{ github.event.release.published_at }}"
+          python3 - <<'PY'
+          import json
+          import os
+
+          signature = os.environ.get("UPDATER_SIG_CONTENT", "").strip()
+          target = os.environ.get("UPDATE_TARGET", "darwin-aarch64").strip()
+          update = {
+              "version": os.environ.get("UPDATE_VERSION", "0.0.0").strip(),
+              "notes": f"Release {os.environ.get('UPDATE_VERSION', '').strip()}",
+              "pub_date": os.environ.get("UPDATE_PUB_DATE", "").strip(),
+              "platforms": {
+                  target: {
+                      "url": os.environ["UPDATER_DOWNLOAD_URL"],
+                      "signature": signature,
+                  },
+                  f"{target}-app": {
+                      "url": os.environ["UPDATER_DOWNLOAD_URL"],
+                      "signature": signature,
+                  },
+              },
+          }
+          with open("release-assets/latest.json", "w", encoding="utf-8") as f:
+              json.dump(update, f, indent=2)
+          PY
 
       - name: Upload desktop assets to release
         uses: softprops/action-gh-release@v2
@@ -49,6 +107,9 @@ jobs:
           files: |
             release-assets/Claude-Orchestrator-${{ github.event.release.tag_name }}-macos-app.zip
             release-assets/Claude-Orchestrator-${{ github.event.release.tag_name }}-macos.dmg
+            release-assets/Claude-Orchestrator-${{ github.event.release.tag_name }}-macos-updater.tar.gz
+            release-assets/Claude-Orchestrator-${{ github.event.release.tag_name }}-macos-updater.tar.gz.sig
+            release-assets/latest.json
 
   mobile_release:
     name: Build Mobile Release Artifact

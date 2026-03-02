@@ -33,3 +33,6 @@ src-tauri/gen/
 
 # Builds
 builds/
+
+# Local signing keys / updater secrets
+.tauri/

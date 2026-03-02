@@ -73,6 +73,20 @@ The built app will be at:
 src-tauri/target/debug/bundle/macos/Claude Orchestrator.app
 ```
 
+## Desktop Auto Updates
+
+The desktop app is configured to check for updates from GitHub Releases and install updates in-app.
+
+- Update endpoint: `https://github.com/noble1911/claude-orchestrator/releases/latest/download/latest.json`
+- Public key: configured in `src-tauri/tauri.conf.json` under `plugins.updater.pubkey`
+
+To produce signed updater artifacts on release, add these GitHub repository secrets:
+
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+
+The release workflow uploads `latest.json` plus updater bundles/signatures to the Release assets.
+
 ## Mobile App
 
 A companion React Native (Expo) app lives in the `mobile/` directory. It connects to the desktop app over WebSocket for remote monitoring and control of workspaces.
