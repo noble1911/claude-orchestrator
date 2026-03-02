@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+use tauri::menu::Menu;
 use tauri::{Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
@@ -3906,6 +3907,9 @@ pub fn run() {
         .manage(app_state)
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            // Ensure the native menu bar is present and About displays package version metadata.
+            let default_menu = Menu::default(&app_handle)?;
+            app.set_menu(default_menu)?;
             let ws_server_clone = ws_server.clone();
             let startup_state = app_state_for_ws.clone();
             let command_state = app_state_for_ws.clone();
