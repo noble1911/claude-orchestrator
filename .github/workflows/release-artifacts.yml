@@ -170,35 +170,27 @@ jobs:
             fi
             TARGET_BASE="darwin-${TARGET_ARCH}"
             RELEASE_URL_BASE="https://github.com/noble1911/claude-orchestrator/releases/download/${TAG}"
-            export UPDATER_SIG_CONTENT="$(cat "release-assets/$UPDATER_SIG_FILE")"
-            export UPDATER_DOWNLOAD_URL="${RELEASE_URL_BASE}/${UPDATER_FILE}"
-            export UPDATE_TARGET="${TARGET_BASE}"
-            export UPDATE_VERSION="${TAG#v}"
-            export UPDATE_PUB_DATE="${{ env.RELEASE_PUBLISHED_AT }}"
-            python3 - <<'PY'
-            import json
-            import os
-
-            signature = os.environ.get("UPDATER_SIG_CONTENT", "").strip()
-            target = os.environ.get("UPDATE_TARGET", "darwin-aarch64").strip()
-            update = {
-                "version": os.environ.get("UPDATE_VERSION", "0.0.0").strip(),
-                "notes": f"Release {os.environ.get('UPDATE_VERSION', '').strip()}",
-                "pub_date": os.environ.get("UPDATE_PUB_DATE", "").strip(),
-                "platforms": {
-                    target: {
-                        "url": os.environ["UPDATER_DOWNLOAD_URL"],
-                        "signature": signature,
-                    },
-                    f"{target}-app": {
-                        "url": os.environ["UPDATER_DOWNLOAD_URL"],
-                        "signature": signature,
-                    },
-                },
-            }
-            with open("release-assets/latest.json", "w", encoding="utf-8") as f:
-                json.dump(update, f, indent=2)
-            PY
+            UPDATER_SIG_CONTENT="$(cat "release-assets/$UPDATER_SIG_FILE")"
+            UPDATER_DOWNLOAD_URL="${RELEASE_URL_BASE}/${UPDATER_FILE}"
+            UPDATE_TARGET="${TARGET_BASE}"
+            UPDATE_VERSION="${TAG#v}"
+            UPDATE_PUB_DATE="${{ env.RELEASE_PUBLISHED_AT }}"
+            jq -n \
+              --arg version "$UPDATE_VERSION" \
+              --arg notes "Release $UPDATE_VERSION" \
+              --arg pub_date "$UPDATE_PUB_DATE" \
+              --arg target "$UPDATE_TARGET" \
+              --arg url "$UPDATER_DOWNLOAD_URL" \
+              --arg signature "$UPDATER_SIG_CONTENT" \
+              '{
+                version: $version,
+                notes: $notes,
+                pub_date: $pub_date,
+                platforms: {
+                  ($target): { url: $url, signature: $signature },
+                  (($target + "-app")): { url: $url, signature: $signature }
+                }
+              }' > release-assets/latest.json
           else
             echo "Updater signing disabled; skipping updater tar/signature/latest.json generation."
           fi
