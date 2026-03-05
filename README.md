@@ -85,11 +85,16 @@ To produce signed updater artifacts on release, add these GitHub repository secr
 - `TAURI_SIGNING_PRIVATE_KEY`
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
 
+`TAURI_SIGNING_PRIVATE_KEY` should be the minisign private key content (starts with `untrusted comment:`). The release workflow also accepts escaped-newline and base64-encoded variants and normalizes them before build.
+
 The release workflow uploads `latest.json` plus updater bundles/signatures to the Release assets.
+If a release run fails, you can re-run artifact generation from Actions using the `Release Artifacts` workflow `Run workflow` button with `release_tag` (for example `v0.0.3`).
 
 ## Mobile App
 
 A companion React Native (Expo) app lives in the `mobile/` directory. It connects to the desktop app over WebSocket for remote monitoring and control of workspaces.
+
+Current GitHub Release behavior: the mobile release job uploads an Expo export bundle archive (`*-mobile-export.tar.gz`). It does not currently produce an Android `.apk`.
 
 ### Prerequisites
 
