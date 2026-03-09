@@ -253,7 +253,7 @@ function MarkdownMessage({ content }: { content: string }) {
 
   const flushParagraph = () => {
     if (paragraphLines.length === 0) return;
-    const text = paragraphLines.join(" ").trim();
+    const text = paragraphLines.join("\n").trim();
     if (text) {
       blocks.push(
         <p key={`p-${blockIndex}`} className="whitespace-pre-wrap text-sm leading-relaxed md-text-primary">
