@@ -106,18 +106,16 @@ jobs:
             fi
           fi
 
-          # Canonicalize to minisign format expected by Tauri:
-          # first line comment + second line RW... payload.
+          # Extract the minisign/rsign payload line.
           PAYLOAD="$(printf '%s\n' "$KEY" | grep -E '^RW[0-9A-Za-z+/=]+$' | head -n 1 || true)"
-          if [ -n "$PAYLOAD" ]; then
-            KEY=$'untrusted comment: minisign encrypted secret key\n'"$PAYLOAD"
-          fi
-
-          if ! printf '%s' "$KEY" | grep -q '^untrusted comment: minisign encrypted secret key$'; then
+          if [ -z "$PAYLOAD" ]; then
             echo "has_signing=false" >> "$GITHUB_OUTPUT"
             echo "::warning::TAURI_SIGNING_PRIVATE_KEY format is invalid. Building desktop artifacts without updater bundles."
             exit 0
           fi
+
+          # Tauri CLI expects the base64 payload, not the untrusted-comment header.
+          KEY="$PAYLOAD"
 
           # Avoid exposing transformed secrets in logs.
           while IFS= read -r line; do
