@@ -95,7 +95,7 @@ If a release run fails, you can re-run artifact generation from Actions using th
 
 A companion React Native (Expo) app lives in the `mobile/` directory. It connects to the desktop app over WebSocket for remote monitoring and control of workspaces.
 
-Current GitHub Release behavior: the mobile release job uploads an Expo export bundle archive (`*-mobile-export.tar.gz`). It does not currently produce an Android `.apk`.
+Current GitHub Release behavior: the mobile release job builds and uploads an Android APK (`*-android.apk`).
 
 ### Prerequisites
 
