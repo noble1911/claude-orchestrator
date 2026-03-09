@@ -685,9 +685,22 @@ function App() {
     selectedWorkspaceRef.current = selectedWorkspace;
   }, [selectedWorkspace]);
 
+  function normalizeUpdateErrorMessage(rawError: string): string {
+    const message = rawError.trim();
+    const lowered = message.toLowerCase();
+    if (
+      lowered.includes("could not fetch a valid release json from the remote") ||
+      lowered.includes("404")
+    ) {
+      return "Update feed is unavailable for this release.";
+    }
+    return message;
+  }
+
   useEffect(() => {
     loadInitialState();
-    void checkForAppUpdate();
+    // Silent background check on launch; surfaced only on explicit user action.
+    void checkForAppUpdate(false, false);
     
     // Listen for agent messages from backend
     const unlisten = listen<AgentMessage>("agent-message", (event) => {
@@ -1105,7 +1118,7 @@ function App() {
     }
   }
 
-  async function checkForAppUpdate(showNoUpdateStatus = false) {
+  async function checkForAppUpdate(showNoUpdateStatus = false, surfaceErrors = true) {
     setIsCheckingUpdate(true);
     setUpdateError(null);
 
@@ -1121,8 +1134,11 @@ function App() {
         }
       }
     } catch (err) {
+      const normalizedError = normalizeUpdateErrorMessage(String(err));
       console.error("Failed to check for app updates:", err);
-      setUpdateError(String(err));
+      if (surfaceErrors) {
+        setUpdateError(normalizedError);
+      }
     } finally {
       setIsCheckingUpdate(false);
     }
@@ -3220,9 +3236,9 @@ function App() {
                       {isInstallingUpdate ? "Installing..." : "Install update"}
                     </button>
                   </div>
-                ) : (
+                ) : !updateError ? (
                   <p className="text-[11px] md-text-muted">No pending update detected.</p>
-                )}
+                ) : null}
                 {updateError && <p className="mt-1 text-[11px] text-amber-300">{updateError}</p>}
               </div>
 
