@@ -1229,6 +1229,45 @@ fn normalize_text_for_dedupe(text: &str) -> String {
     text.replace("\r\n", "\n").trim().to_string()
 }
 
+fn emit_agent_message_with_options(
+    app: &tauri::AppHandle,
+    db: &Database,
+    session_id: &str,
+    agent_id: &str,
+    workspace_id: &str,
+    ws_server: &Option<Arc<WebSocketServer>>,
+    content: String,
+    is_error: bool,
+    role: &str,
+    timestamp: Option<&str>,
+    persist: bool,
+) {
+    let timestamp = timestamp
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let msg = AgentMessage {
+        agent_id: agent_id.to_string(),
+        workspace_id: Some(workspace_id.to_string()),
+        role: role.to_string(),
+        content: content.clone(),
+        is_error,
+        timestamp: timestamp.clone(),
+    };
+    if persist {
+        let _ = db.insert_message(session_id, agent_id, role, &msg.content, is_error, &msg.timestamp);
+    }
+    let _ = app.emit("agent-message", msg.clone());
+    if let Some(ws) = ws_server {
+        ws.broadcast_to_workspace(workspace_id, &WsResponse::AgentMessage {
+            workspace_id: workspace_id.to_string(),
+            role: role.to_string(),
+            content: msg.content,
+            is_error,
+            timestamp: msg.timestamp,
+        });
+    }
+}
+
 fn emit_agent_message(
     app: &tauri::AppHandle,
     db: &Database,
@@ -1240,25 +1279,19 @@ fn emit_agent_message(
     is_error: bool,
     role: &str,
 ) {
-    let msg = AgentMessage {
-        agent_id: agent_id.to_string(),
-        workspace_id: Some(workspace_id.to_string()),
-        role: role.to_string(),
-        content: content.clone(),
+    emit_agent_message_with_options(
+        app,
+        db,
+        session_id,
+        agent_id,
+        workspace_id,
+        ws_server,
+        content,
         is_error,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    };
-    let _ = db.insert_message(session_id, agent_id, role, &msg.content, is_error, &msg.timestamp);
-    let _ = app.emit("agent-message", msg.clone());
-    if let Some(ws) = ws_server {
-        ws.broadcast_to_workspace(workspace_id, &WsResponse::AgentMessage {
-            workspace_id: workspace_id.to_string(),
-            role: role.to_string(),
-            content: msg.content,
-            is_error,
-            timestamp: msg.timestamp,
-        });
-    }
+        role,
+        None,
+        true,
+    );
 }
 
 fn summarize_tool_call(tool_name: &str, input_json: &str) -> Option<String> {
@@ -1602,6 +1635,107 @@ fn extract_assistant_message_text(event: &Value) -> Option<String> {
     if buf.is_empty() { None } else { Some(buf) }
 }
 
+fn extract_stream_error_text(payload: &Value) -> Option<String> {
+    if payload.get("type").and_then(|v| v.as_str()) != Some("error") {
+        return None;
+    }
+
+    let err_obj = payload.get("error");
+    let err_type = err_obj
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("error");
+    let err_message = err_obj
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("message").and_then(|v| v.as_str()))
+        .unwrap_or("Claude streaming error");
+
+    Some(format!("Stream error ({}): {}", err_type, err_message.trim()))
+}
+
+fn update_text_blocks_from_stream_event(payload: &Value, text_blocks: &mut HashMap<i64, String>) -> bool {
+    let event_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match event_type {
+        "message_start" => {
+            text_blocks.clear();
+            true
+        }
+        "content_block_start" => {
+            let block_type = payload
+                .get("content_block")
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let index = payload.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if block_type == "text" && index >= 0 {
+                text_blocks.entry(index).or_default();
+                true
+            } else {
+                false
+            }
+        }
+        "content_block_delta" => {
+            let index = payload.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let delta_type = payload
+                .get("delta")
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if delta_type == "text_delta" && index >= 0 {
+                if let Some(chunk) = payload
+                    .get("delta")
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !chunk.is_empty() {
+                        text_blocks
+                            .entry(index)
+                            .and_modify(|value| value.push_str(chunk))
+                            .or_insert_with(|| chunk.to_string());
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        "message_delta" | "message_stop" | "content_block_stop" => false,
+        _ => false,
+    }
+}
+
+fn build_text_from_blocks(text_blocks: &HashMap<i64, String>) -> Option<String> {
+    if text_blocks.is_empty() {
+        return None;
+    }
+    let mut indices: Vec<i64> = text_blocks.keys().copied().collect();
+    indices.sort_unstable();
+
+    let mut output = String::new();
+    for index in indices {
+        if let Some(chunk) = text_blocks.get(&index) {
+            if chunk.is_empty() {
+                continue;
+            }
+            output.push_str(chunk);
+        }
+    }
+
+    if output.trim().is_empty() {
+        None
+    } else {
+        Some(output)
+    }
+}
+
+fn choose_streaming_assistant_text(
+    text_blocks: &HashMap<i64, String>,
+    delta_text: &str,
+    snapshot_text: Option<&String>,
+) -> Option<String> {
+    build_text_from_blocks(text_blocks).or_else(|| choose_assistant_text(delta_text, snapshot_text))
+}
+
 fn run_claude_cli(
     app: tauri::AppHandle,
     agent_id: String,
@@ -1917,6 +2051,9 @@ async fn send_message_to_agent(
         let mut assistant_delta_text = String::new();
         let mut latest_assistant_snapshot: Option<String> = None;
         let mut result_text_fallback: Option<String> = None;
+        let mut assistant_text_blocks: HashMap<i64, String> = HashMap::new();
+        let mut assistant_stream_timestamp: Option<String> = None;
+        let mut assistant_stream_last_emitted: Option<String> = None;
         let mut tool_names: HashMap<i64, String> = HashMap::new();
         let mut tool_inputs: HashMap<i64, String> = HashMap::new();
         let mut known_claude_session_id = claude_session_id.clone();
@@ -1945,6 +2082,33 @@ async fn send_message_to_agent(
                             }
                             let _ = db.update_session_claude_id(&session_id, &stream_session_id);
                         }
+                    }
+
+                    let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                    // Keep-alive event; no UI action required.
+                    if payload_type == "ping" {
+                        continue;
+                    }
+
+                    if let Some(stream_error) = extract_stream_error_text(payload) {
+                        emit_agent_message(
+                            &app,
+                            &db,
+                            &session_id,
+                            &agent_id_clone,
+                            &workspace_id,
+                            &ws_server,
+                            stream_error,
+                            true,
+                            "error",
+                        );
+                        error_emitted = true;
+                        continue;
+                    }
+
+                    if update_text_blocks_from_stream_event(payload, &mut assistant_text_blocks) {
+                        // Updated in-memory streaming text blocks.
                     }
 
                     for event_item in parse_stream_event_for_activity(&event, &mut tool_names, &mut tool_inputs) {
@@ -2013,7 +2177,7 @@ async fn send_message_to_agent(
                         latest_assistant_snapshot = Some(text);
                     }
 
-                    if payload.get("type").and_then(|v| v.as_str()) == Some("content_block_delta") {
+                    if payload_type == "content_block_delta" {
                         if payload
                             .get("delta")
                             .and_then(|d| d.get("type"))
@@ -2030,7 +2194,38 @@ async fn send_message_to_agent(
                         }
                     }
 
-                    if payload.get("type").and_then(|v| v.as_str()) == Some("result") {
+                    if let Some(stream_text) = choose_streaming_assistant_text(
+                        &assistant_text_blocks,
+                        &assistant_delta_text,
+                        latest_assistant_snapshot.as_ref(),
+                    ) {
+                        let normalized_stream = normalize_text_for_dedupe(&stream_text);
+                        if !normalized_stream.is_empty()
+                            && assistant_stream_last_emitted.as_deref()
+                                != Some(normalized_stream.as_str())
+                            && last_plan.as_deref() != Some(normalized_stream.as_str())
+                        {
+                            if assistant_stream_timestamp.is_none() {
+                                assistant_stream_timestamp = Some(chrono::Utc::now().to_rfc3339());
+                            }
+                            emit_agent_message_with_options(
+                                &app,
+                                &db,
+                                &session_id,
+                                &agent_id_clone,
+                                &workspace_id,
+                                &ws_server,
+                                stream_text,
+                                false,
+                                "assistant",
+                                assistant_stream_timestamp.as_deref(),
+                                false,
+                            );
+                            assistant_stream_last_emitted = Some(normalized_stream);
+                        }
+                    }
+
+                    if payload_type == "result" {
                         if result_text_fallback.is_none() {
                             result_text_fallback = extract_result_text(&event);
                         }
@@ -2134,39 +2329,75 @@ async fn send_message_to_agent(
         // Clean up stored PID now that process has exited
         app_state_for_pids.child_pids.write().remove(&agent_id_clone);
 
-        if let Some(assistant_text) = choose_assistant_text(&assistant_delta_text, latest_assistant_snapshot.as_ref()) {
+        if let Some(assistant_text) = choose_streaming_assistant_text(
+            &assistant_text_blocks,
+            &assistant_delta_text,
+            latest_assistant_snapshot.as_ref(),
+        ) {
             let normalized_assistant = normalize_text_for_dedupe(&assistant_text);
             if !normalized_assistant.is_empty()
                 && last_plan.as_deref() != Some(normalized_assistant.as_str())
             {
-                emit_agent_message(
-                    &app,
-                    &db,
-                    &session_id,
-                    &agent_id_clone,
-                    &workspace_id,
-                    &ws_server,
-                    assistant_text,
-                    false,
-                    "assistant",
-                );
+                if assistant_stream_timestamp.is_some() {
+                    emit_agent_message_with_options(
+                        &app,
+                        &db,
+                        &session_id,
+                        &agent_id_clone,
+                        &workspace_id,
+                        &ws_server,
+                        assistant_text,
+                        false,
+                        "assistant",
+                        assistant_stream_timestamp.as_deref(),
+                        true,
+                    );
+                } else {
+                    emit_agent_message(
+                        &app,
+                        &db,
+                        &session_id,
+                        &agent_id_clone,
+                        &workspace_id,
+                        &ws_server,
+                        assistant_text,
+                        false,
+                        "assistant",
+                    );
+                }
             }
         } else if let Some(fallback) = result_text_fallback {
             let normalized_fallback = normalize_text_for_dedupe(&fallback);
             if !normalized_fallback.is_empty()
                 && last_plan.as_deref() != Some(normalized_fallback.as_str())
             {
-                emit_agent_message(
-                    &app,
-                    &db,
-                    &session_id,
-                    &agent_id_clone,
-                    &workspace_id,
-                    &ws_server,
-                    fallback,
-                    false,
-                    "assistant",
-                );
+                if assistant_stream_timestamp.is_some() {
+                    emit_agent_message_with_options(
+                        &app,
+                        &db,
+                        &session_id,
+                        &agent_id_clone,
+                        &workspace_id,
+                        &ws_server,
+                        fallback,
+                        false,
+                        "assistant",
+                        assistant_stream_timestamp.as_deref(),
+                        true,
+                    );
+                } else {
+                    emit_agent_message(
+                        &app,
+                        &db,
+                        &session_id,
+                        &agent_id_clone,
+                        &workspace_id,
+                        &ws_server,
+                        fallback,
+                        false,
+                        "assistant",
+                    );
+                }
             }
         } else if status.success() && !error_emitted {
             emit_agent_message(
@@ -3519,6 +3750,9 @@ async fn handle_ws_commands(
                                 let mut assistant_delta_text = String::new();
                                 let mut latest_assistant_snapshot: Option<String> = None;
                                 let mut result_text_fallback: Option<String> = None;
+                                let mut assistant_text_blocks: HashMap<i64, String> = HashMap::new();
+                                let mut assistant_stream_timestamp: Option<String> = None;
+                                let mut assistant_stream_last_emitted: Option<String> = None;
                                 let mut tool_names: HashMap<i64, String> = HashMap::new();
                                 let mut tool_inputs: HashMap<i64, String> = HashMap::new();
                                 let mut known_claude_session_id = claude_session_id.clone();
@@ -3552,6 +3786,38 @@ async fn handle_ws_commands(
                                                         &stream_session_id,
                                                     );
                                                 }
+                                            }
+
+                                            let payload_type = payload
+                                                .get("type")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+
+                                            if payload_type == "ping" {
+                                                continue;
+                                            }
+
+                                            if let Some(stream_error) = extract_stream_error_text(payload) {
+                                                emit_agent_message(
+                                                    &app_clone,
+                                                    &db,
+                                                    &session_id,
+                                                    &agent_id_clone,
+                                                    &workspace_id_clone,
+                                                    &ws_server,
+                                                    stream_error,
+                                                    true,
+                                                    "error",
+                                                );
+                                                error_emitted = true;
+                                                continue;
+                                            }
+
+                                            if update_text_blocks_from_stream_event(
+                                                payload,
+                                                &mut assistant_text_blocks,
+                                            ) {
+                                                // Updated in-memory streaming text blocks.
                                             }
 
                                             for event_item in parse_stream_event_for_activity(
@@ -3630,18 +3896,59 @@ async fn handle_ws_commands(
                                                 latest_assistant_snapshot = Some(text);
                                             }
 
-                                            if payload.get("type").and_then(|v| v.as_str()) == Some("content_block_delta")
-                                                && payload.get("delta").and_then(|d| d.get("type")).and_then(|v| v.as_str())
+                                            if payload_type == "content_block_delta" {
+                                                if payload
+                                                    .get("delta")
+                                                    .and_then(|d| d.get("type"))
+                                                    .and_then(|v| v.as_str())
                                                     == Some("text_delta")
-                                            {
-                                                if let Some(chunk) =
-                                                    payload.get("delta").and_then(|d| d.get("text")).and_then(|v| v.as_str())
                                                 {
-                                                    assistant_delta_text.push_str(chunk);
+                                                    if let Some(chunk) = payload
+                                                        .get("delta")
+                                                        .and_then(|d| d.get("text"))
+                                                        .and_then(|v| v.as_str())
+                                                    {
+                                                        assistant_delta_text.push_str(chunk);
+                                                    }
                                                 }
                                             }
 
-                                            if payload.get("type").and_then(|v| v.as_str()) == Some("result") {
+                                            if let Some(stream_text) = choose_streaming_assistant_text(
+                                                &assistant_text_blocks,
+                                                &assistant_delta_text,
+                                                latest_assistant_snapshot.as_ref(),
+                                            ) {
+                                                let normalized_stream =
+                                                    normalize_text_for_dedupe(&stream_text);
+                                                if !normalized_stream.is_empty()
+                                                    && assistant_stream_last_emitted.as_deref()
+                                                        != Some(normalized_stream.as_str())
+                                                    && last_plan.as_deref()
+                                                        != Some(normalized_stream.as_str())
+                                                {
+                                                    if assistant_stream_timestamp.is_none() {
+                                                        assistant_stream_timestamp =
+                                                            Some(chrono::Utc::now().to_rfc3339());
+                                                    }
+                                                    emit_agent_message_with_options(
+                                                        &app_clone,
+                                                        &db,
+                                                        &session_id,
+                                                        &agent_id_clone,
+                                                        &workspace_id_clone,
+                                                        &ws_server,
+                                                        stream_text,
+                                                        false,
+                                                        "assistant",
+                                                        assistant_stream_timestamp.as_deref(),
+                                                        false,
+                                                    );
+                                                    assistant_stream_last_emitted =
+                                                        Some(normalized_stream);
+                                                }
+                                            }
+
+                                            if payload_type == "result" {
                                                 if result_text_fallback.is_none() {
                                                     result_text_fallback = extract_result_text(&event);
                                                 }
@@ -3745,24 +4052,44 @@ async fn handle_ws_commands(
                                 app_state_clone.child_pids.write().remove(&agent_id_clone);
 
                                 if let Some(assistant_text) =
-                                    choose_assistant_text(&assistant_delta_text, latest_assistant_snapshot.as_ref())
+                                    choose_streaming_assistant_text(
+                                        &assistant_text_blocks,
+                                        &assistant_delta_text,
+                                        latest_assistant_snapshot.as_ref(),
+                                    )
                                 {
                                     let normalized_assistant = normalize_text_for_dedupe(&assistant_text);
                                     if !normalized_assistant.is_empty()
                                         && last_plan.as_deref()
                                             != Some(normalized_assistant.as_str())
                                     {
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            assistant_text,
-                                            false,
-                                            "assistant",
-                                        );
+                                        if assistant_stream_timestamp.is_some() {
+                                            emit_agent_message_with_options(
+                                                &app_clone,
+                                                &db,
+                                                &session_id,
+                                                &agent_id_clone,
+                                                &workspace_id_clone,
+                                                &ws_server,
+                                                assistant_text,
+                                                false,
+                                                "assistant",
+                                                assistant_stream_timestamp.as_deref(),
+                                                true,
+                                            );
+                                        } else {
+                                            emit_agent_message(
+                                                &app_clone,
+                                                &db,
+                                                &session_id,
+                                                &agent_id_clone,
+                                                &workspace_id_clone,
+                                                &ws_server,
+                                                assistant_text,
+                                                false,
+                                                "assistant",
+                                            );
+                                        }
                                     }
                                 } else if let Some(fallback) = result_text_fallback {
                                     let normalized_fallback = normalize_text_for_dedupe(&fallback);
@@ -3770,17 +4097,33 @@ async fn handle_ws_commands(
                                         && last_plan.as_deref()
                                             != Some(normalized_fallback.as_str())
                                     {
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            fallback,
-                                            false,
-                                            "assistant",
-                                        );
+                                        if assistant_stream_timestamp.is_some() {
+                                            emit_agent_message_with_options(
+                                                &app_clone,
+                                                &db,
+                                                &session_id,
+                                                &agent_id_clone,
+                                                &workspace_id_clone,
+                                                &ws_server,
+                                                fallback,
+                                                false,
+                                                "assistant",
+                                                assistant_stream_timestamp.as_deref(),
+                                                true,
+                                            );
+                                        } else {
+                                            emit_agent_message(
+                                                &app_clone,
+                                                &db,
+                                                &session_id,
+                                                &agent_id_clone,
+                                                &workspace_id_clone,
+                                                &ws_server,
+                                                fallback,
+                                                false,
+                                                "assistant",
+                                            );
+                                        }
                                     }
                                 } else if status.success() && !error_emitted {
                                     emit_agent_message(

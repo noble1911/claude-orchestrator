@@ -312,6 +312,21 @@ function compactActivityLines(messages: MessageInfo[]): ActivityLine[] {
   return lines;
 }
 
+function messageIdentity(message: MessageInfo): string {
+  return `${message.timestamp}::${message.agent_id}::${message.role ?? ""}`;
+}
+
+function upsertMessageByIdentity(messages: MessageInfo[], incoming: MessageInfo): MessageInfo[] {
+  const key = messageIdentity(incoming);
+  const existingIndex = messages.findIndex((item) => messageIdentity(item) === key);
+  if (existingIndex < 0) {
+    return [...messages, incoming];
+  }
+  const next = [...messages];
+  next[existingIndex] = incoming;
+  return next;
+}
+
 function generateWorkspaceName(): string {
   const adjective = NAME_ADJECTIVES[Math.floor(Math.random() * NAME_ADJECTIVES.length)];
   const noun = NAME_NOUNS[Math.floor(Math.random() * NAME_NOUNS.length)];
@@ -661,7 +676,7 @@ function App() {
         };
         setMessagesByWorkspace((prev) => ({
           ...prev,
-          [parsed.workspace_id]: [...(prev[parsed.workspace_id] || []), item],
+          [parsed.workspace_id]: upsertMessageByIdentity(prev[parsed.workspace_id] || [], item),
         }));
         return;
       }

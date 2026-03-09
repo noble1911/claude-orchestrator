@@ -171,6 +171,21 @@ function compactActivityLines(messages: AgentMessage[]): ActivityLine[] {
   return lines;
 }
 
+function messageIdentity(message: AgentMessage): string {
+  return `${message.timestamp}::${message.agentId}::${message.role ?? ""}`;
+}
+
+function upsertMessageByIdentity(messages: AgentMessage[], incoming: AgentMessage): AgentMessage[] {
+  const key = messageIdentity(incoming);
+  const existingIndex = messages.findIndex((item) => messageIdentity(item) === key);
+  if (existingIndex < 0) {
+    return [...messages, incoming];
+  }
+  const next = [...messages];
+  next[existingIndex] = incoming;
+  return next;
+}
+
 function shortText(value: string, maxLength = 120): string {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, maxLength)}...`;
@@ -778,7 +793,7 @@ function App() {
     const unlisten = listen<AgentMessage>("agent-message", (event) => {
       const messageWorkspaceId = event.payload.workspaceId ?? selectedWorkspaceRef.current;
       if (messageWorkspaceId && selectedWorkspaceRef.current === messageWorkspaceId) {
-        setMessages(prev => [...prev, event.payload]);
+        setMessages((prev) => upsertMessageByIdentity(prev, event.payload));
       }
       if (event.payload.role === "credential_error" && messageWorkspaceId) {
         setCredentialErrorWorkspaces((prev) => new Set(prev).add(messageWorkspaceId));
