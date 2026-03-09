@@ -134,6 +134,7 @@ jobs:
           echo "has_signing=true" >> "$GITHUB_OUTPUT"
 
       - name: Build desktop app (+ updater when signing is enabled)
+        id: desktop_build
         env:
           HAS_SIGNING: ${{ steps.signing.outputs.has_signing }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
@@ -141,14 +142,21 @@ jobs:
         run: |
           npm run build
           if [ "$HAS_SIGNING" = "true" ]; then
-            npx tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":true}}'
+            if npx tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":true}}'; then
+              echo "effective_has_signing=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Signed updater build failed (likely invalid TAURI_SIGNING_PRIVATE_KEY format). Retrying without updater artifacts."
+              npx tauri build --bundles app
+              echo "effective_has_signing=false" >> "$GITHUB_OUTPUT"
+            fi
           else
             npx tauri build --bundles app
+            echo "effective_has_signing=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Prepare desktop release files
         env:
-          HAS_SIGNING: ${{ steps.signing.outputs.has_signing }}
+          HAS_SIGNING: ${{ steps.desktop_build.outputs.effective_has_signing }}
         run: |
           TAG="${{ env.RELEASE_TAG }}"
           APP_SOURCE="src-tauri/target/release/bundle/macos/Claude Orchestrator.app"
