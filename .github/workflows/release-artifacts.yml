@@ -141,11 +141,23 @@ jobs:
           HAS_SIGNING: ${{ steps.signing.outputs.has_signing }}
         run: |
           TAG="${{ env.RELEASE_TAG }}"
+          APP_SOURCE="src-tauri/target/release/bundle/macos/Claude Orchestrator.app"
           mkdir -p builds
           rm -rf "builds/Claude Orchestrator.app"
-          cp -R "src-tauri/target/release/bundle/macos/Claude Orchestrator.app" "builds/Claude Orchestrator.app"
+          ditto "$APP_SOURCE" "builds/Claude Orchestrator.app"
+
+          # If signature verification fails after staging, re-sign ad-hoc so macOS does not flag it as broken.
+          if ! codesign --verify --deep --strict --verbose=2 "builds/Claude Orchestrator.app"; then
+            codesign --force --deep --sign - "builds/Claude Orchestrator.app"
+          fi
+
+          # Create installer-friendly DMG contents: app + Applications shortcut.
+          rm -rf "builds/dmg-root"
+          mkdir -p "builds/dmg-root"
+          ditto "builds/Claude Orchestrator.app" "builds/dmg-root/Claude Orchestrator.app"
+          ln -sfn /Applications "builds/dmg-root/Applications"
           rm -f "builds/Claude Orchestrator.dmg"
-          hdiutil create -volname "Claude Orchestrator" -srcfolder "builds/Claude Orchestrator.app" -ov -format UDZO "builds/Claude Orchestrator.dmg"
+          hdiutil create -volname "Claude Orchestrator" -srcfolder "builds/dmg-root" -ov -format UDZO "builds/Claude Orchestrator.dmg"
           mkdir -p release-assets
           ditto -c -k --sequesterRsrc --keepParent "builds/Claude Orchestrator.app" "release-assets/Claude-Orchestrator-${TAG}-macos-app.zip"
           cp "builds/Claude Orchestrator.dmg" "release-assets/Claude-Orchestrator-${TAG}-macos.dmg"
