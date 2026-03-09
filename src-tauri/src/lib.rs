@@ -1349,10 +1349,23 @@ fn summarize_tool_call(tool_name: &str, input_json: &str) -> Option<String> {
     Some(message)
 }
 
+fn extract_exit_plan_text(tool_name: &str, input_json: &str) -> Option<String> {
+    if !tool_name.eq_ignore_ascii_case("ExitPlanMode") {
+        return None;
+    }
+    let parsed = serde_json::from_str::<Value>(input_json).ok()?;
+    let plan = parsed.get("plan").and_then(|v| v.as_str())?.trim();
+    if plan.is_empty() {
+        return None;
+    }
+    Some(plan.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum ActivityEvent {
     Activity(String),
     Question(String),
+    Plan(String),
 }
 
 fn parse_stream_event_for_activity(
@@ -1415,6 +1428,11 @@ fn parse_stream_event_for_activity(
                             if !input_json.trim().is_empty() {
                                 if tool_name == "AskUserQuestion" {
                                     out.push(ActivityEvent::Question(input_json));
+                                } else if let Some(plan_text) =
+                                    extract_exit_plan_text(&tool_name, &input_json)
+                                {
+                                    out.push(ActivityEvent::Activity("Plan ready for review".to_string()));
+                                    out.push(ActivityEvent::Plan(plan_text));
                                 } else if let Some(summary) = summarize_tool_call(&tool_name, &input_json) {
                                     out.push(ActivityEvent::Activity(summary));
                                 }
@@ -1487,6 +1505,11 @@ fn parse_stream_event_for_activity(
                     if !input_json.trim().is_empty() {
                         if tool_name == "AskUserQuestion" {
                             out.push(ActivityEvent::Question(input_json));
+                        } else if let Some(plan_text) =
+                            extract_exit_plan_text(&tool_name, &input_json)
+                        {
+                            out.push(ActivityEvent::Activity("Plan ready for review".to_string()));
+                            out.push(ActivityEvent::Plan(plan_text));
                         } else if let Some(summary) = summarize_tool_call(&tool_name, &input_json) {
                             out.push(ActivityEvent::Activity(summary));
                         } else {
@@ -1896,6 +1919,7 @@ async fn send_message_to_agent(
         let allow_init_activity = known_claude_session_id.is_none();
         let mut last_activity: Option<String> = None;
         let mut last_question: Option<String> = None;
+        let mut last_plan: Option<String> = None;
         let mut error_emitted = false;
 
         if let Some(stdout) = child.stdout.take() {
@@ -1957,6 +1981,23 @@ async fn send_message_to_agent(
                                     "question",
                                 );
                                 last_question = Some(json_content);
+                            }
+                            ActivityEvent::Plan(plan_content) => {
+                                if last_plan.as_deref() == Some(plan_content.as_str()) {
+                                    continue;
+                                }
+                                emit_agent_message(
+                                    &app,
+                                    &db,
+                                    &session_id,
+                                    &agent_id_clone,
+                                    &workspace_id,
+                                    &ws_server,
+                                    plan_content.clone(),
+                                    false,
+                                    "assistant",
+                                );
+                                last_plan = Some(plan_content);
                             }
                         }
                     }
@@ -3467,6 +3508,7 @@ async fn handle_ws_commands(
                                 let allow_init_activity = known_claude_session_id.is_none();
                                 let mut last_activity: Option<String> = None;
                                 let mut last_question: Option<String> = None;
+                                let mut last_plan: Option<String> = None;
                                 let mut error_emitted = false;
 
                                 if let Some(stdout) = child.stdout.take() {
@@ -3541,6 +3583,25 @@ async fn handle_ws_commands(
                                                             "question",
                                                         );
                                                         last_question = Some(json_content);
+                                                    }
+                                                    ActivityEvent::Plan(plan_content) => {
+                                                        if last_plan.as_deref()
+                                                            == Some(plan_content.as_str())
+                                                        {
+                                                            continue;
+                                                        }
+                                                        emit_agent_message(
+                                                            &app_clone,
+                                                            &db,
+                                                            &session_id,
+                                                            &agent_id_clone,
+                                                            &workspace_id_clone,
+                                                            &ws_server,
+                                                            plan_content.clone(),
+                                                            false,
+                                                            "assistant",
+                                                        );
+                                                        last_plan = Some(plan_content);
                                                     }
                                                 }
                                             }
@@ -4217,5 +4278,28 @@ mod tests {
         let mut tool_inputs = HashMap::new();
         let activities = parse_stream_event_for_activity(&event, &mut tool_names, &mut tool_inputs);
         assert!(matches!(activities.first(), Some(ActivityEvent::Question(_))));
+    }
+
+    #[test]
+    fn parse_exit_plan_mode_tool_use_emits_plan_event() {
+        let event = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "ExitPlanMode",
+                        "input": {
+                            "allowedPrompts": [],
+                            "plan": "# Plan Title\n\n1. Step one\n2. Step two"
+                        }
+                    }
+                ]
+            }
+        });
+        let mut tool_names = HashMap::new();
+        let mut tool_inputs = HashMap::new();
+        let activities = parse_stream_event_for_activity(&event, &mut tool_names, &mut tool_inputs);
+        assert!(activities.iter().any(|evt| matches!(evt, ActivityEvent::Plan(plan) if plan.contains("Plan Title"))));
     }
 }
