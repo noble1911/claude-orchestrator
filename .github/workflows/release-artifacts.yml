@@ -86,14 +86,8 @@ jobs:
             KEY="$(printf '%b' "$KEY")"
           fi
 
-          # Support secret values stored as only the minisign payload line.
-          if ! printf '%s' "$KEY" | grep -q '^untrusted comment:'; then
-            if printf '%s' "$KEY" | grep -Eq '^RW[0-9A-Za-z+/=]+$'; then
-              KEY=$'untrusted comment: minisign encrypted secret key\n'"$KEY"
-            fi
-          fi
-
-          # Support secret values stored as base64-encoded key file content.
+          # Tauri expects TAURI_SIGNING_PRIVATE_KEY as base64-encoded minisign key text.
+          # Accept either raw key text, payload-only, or already-base64-encoded key text.
           if ! printf '%s' "$KEY" | grep -q '^untrusted comment:'; then
             DECODED=""
             if DECODED="$(printf '%s' "$KEY" | base64 --decode 2>/dev/null)"; then
@@ -106,25 +100,36 @@ jobs:
             fi
           fi
 
-          # Extract the minisign/rsign payload line.
-          PAYLOAD="$(printf '%s\n' "$KEY" | grep -E '^RW[0-9A-Za-z+/=]+$' | head -n 1 || true)"
-          if [ -z "$PAYLOAD" ]; then
+          # Support secret values stored as only the minisign payload line.
+          if ! printf '%s' "$KEY" | grep -q '^untrusted comment:'; then
+            if printf '%s' "$KEY" | grep -Eq '^RW[0-9A-Za-z+/=]+$'; then
+              KEY=$'untrusted comment: minisign encrypted secret key\n'"$KEY"
+            fi
+          fi
+
+          if ! printf '%s' "$KEY" | grep -q '^untrusted comment:'; then
             echo "has_signing=false" >> "$GITHUB_OUTPUT"
             echo "::warning::TAURI_SIGNING_PRIVATE_KEY format is invalid. Building desktop artifacts without updater bundles."
             exit 0
           fi
 
-          # Tauri CLI expects the base64 payload, not the untrusted-comment header.
-          KEY="$PAYLOAD"
+          if ! printf '%s\n' "$KEY" | grep -q -E '^RW[0-9A-Za-z+/=]+$'; then
+            echo "has_signing=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY payload is missing. Building desktop artifacts without updater bundles."
+            exit 0
+          fi
+
+          KEY_B64="$(printf '%s' "$KEY" | base64 | tr -d '\n')"
 
           # Avoid exposing transformed secrets in logs.
           while IFS= read -r line; do
             [ -n "$line" ] && echo "::add-mask::$line"
           done <<< "$KEY"
+          echo "::add-mask::$KEY_B64"
 
           {
             echo "TAURI_SIGNING_PRIVATE_KEY<<EOF"
-            printf '%s\n' "$KEY"
+            printf '%s\n' "$KEY_B64"
             echo "EOF"
             echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD<<EOF"
             printf '%s\n' "$RAW_TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
@@ -142,13 +147,8 @@ jobs:
         run: |
           npm run build
           if [ "$HAS_SIGNING" = "true" ]; then
-            if npx tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":true}}'; then
-              echo "effective_has_signing=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "::warning::Signed updater build failed (likely invalid TAURI_SIGNING_PRIVATE_KEY format). Retrying without updater artifacts."
-              npx tauri build --bundles app
-              echo "effective_has_signing=false" >> "$GITHUB_OUTPUT"
-            fi
+            npx tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":true}}'
+            echo "effective_has_signing=true" >> "$GITHUB_OUTPUT"
           else
             npx tauri build --bundles app
             echo "effective_has_signing=false" >> "$GITHUB_OUTPUT"
