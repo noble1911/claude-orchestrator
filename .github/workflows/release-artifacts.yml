@@ -106,11 +106,23 @@ jobs:
             fi
           fi
 
-          if ! printf '%s' "$KEY" | grep -q '^untrusted comment:'; then
+          # Canonicalize to minisign format expected by Tauri:
+          # first line comment + second line RW... payload.
+          PAYLOAD="$(printf '%s\n' "$KEY" | grep -E '^RW[0-9A-Za-z+/=]+$' | head -n 1 || true)"
+          if [ -n "$PAYLOAD" ]; then
+            KEY=$'untrusted comment: minisign encrypted secret key\n'"$PAYLOAD"
+          fi
+
+          if ! printf '%s' "$KEY" | grep -q '^untrusted comment: minisign encrypted secret key$'; then
             echo "has_signing=false" >> "$GITHUB_OUTPUT"
             echo "::warning::TAURI_SIGNING_PRIVATE_KEY format is invalid. Building desktop artifacts without updater bundles."
             exit 0
           fi
+
+          # Avoid exposing transformed secrets in logs.
+          while IFS= read -r line; do
+            [ -n "$line" ] && echo "::add-mask::$line"
+          done <<< "$KEY"
 
           {
             echo "TAURI_SIGNING_PRIVATE_KEY<<EOF"
