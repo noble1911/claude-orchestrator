@@ -172,6 +172,131 @@ function parseAskUserQuestionPayload(raw: string): AskUserQuestionPayload | null
   }
 }
 
+function buildBundledQuestionAnswerText(
+  payload: AskUserQuestionPayload,
+  selectedAnswersByQuestion: Record<number, string[]>,
+): string {
+  return payload.questions
+    .map((question, questionIdx) => {
+      const promptText = question.question || question.header || `Question ${questionIdx + 1}`;
+      const selectedValues = selectedAnswersByQuestion[questionIdx] || [];
+      return `${questionIdx + 1}. ${promptText}: ${selectedValues.join(", ")}`;
+    })
+    .join("\n");
+}
+
+type QuestionCardProps = {
+  message: MessageInfo;
+  rowId: string;
+  isAnswered: boolean;
+  onAnswer: (answer: string) => void;
+};
+
+function QuestionCard({ message, rowId, isAnswered, onAnswer }: QuestionCardProps) {
+  const payload = useMemo(() => parseAskUserQuestionPayload(message.content), [message.content]);
+  const [selectedAnswersByQuestion, setSelectedAnswersByQuestion] = useState<Record<number, string[]>>({});
+
+  useEffect(() => {
+    setSelectedAnswersByQuestion({});
+  }, [message.timestamp, message.content]);
+
+  if (!payload) {
+    return (
+      <View style={styles.questionCard}>
+        <Text style={styles.messageText}>{message.content}</Text>
+      </View>
+    );
+  }
+
+  const canBundleAnswers =
+    payload.questions.length > 1 &&
+    payload.questions.every((question) => (question.options?.length ?? 0) > 0);
+
+  const canSubmitBundledAnswers =
+    canBundleAnswers &&
+    payload.questions.every((_, questionIdx) => (selectedAnswersByQuestion[questionIdx]?.length ?? 0) > 0);
+
+  const selectOption = (questionIdx: number, question: QuestionItem, optionLabel: string) => {
+    if (isAnswered) return;
+    if (!canBundleAnswers) {
+      onAnswer(optionLabel);
+      return;
+    }
+
+    setSelectedAnswersByQuestion((prev) => {
+      const existing = prev[questionIdx] || [];
+      if (question.multiSelect) {
+        const hasValue = existing.includes(optionLabel);
+        const nextValues = hasValue
+          ? existing.filter((value) => value !== optionLabel)
+          : [...existing, optionLabel];
+        return { ...prev, [questionIdx]: nextValues };
+      }
+      return { ...prev, [questionIdx]: [optionLabel] };
+    });
+  };
+
+  const submitBundledAnswers = () => {
+    if (isAnswered || !canSubmitBundledAnswers) return;
+    onAnswer(buildBundledQuestionAnswerText(payload, selectedAnswersByQuestion));
+  };
+
+  return (
+    <View style={styles.questionCard}>
+      <Text style={styles.questionLabel}>QUESTION</Text>
+      {payload.questions.map((question, qIdx) => (
+        <View key={`${rowId}-q-${qIdx}`} style={styles.questionBlock}>
+          {question.header ? <Text style={styles.questionHeader}>{question.header}</Text> : null}
+          {question.question ? <Text style={styles.questionText}>{question.question}</Text> : null}
+          {question.options && question.options.length > 0 ? (
+            <View style={styles.questionOptions}>
+              {question.options.map((option, optionIdx) => {
+                const isSelected = canBundleAnswers
+                  ? (selectedAnswersByQuestion[qIdx] || []).includes(option.label)
+                  : false;
+                return (
+                  <TouchableOpacity
+                    key={`${rowId}-o-${qIdx}-${optionIdx}`}
+                    style={[
+                      styles.questionOption,
+                      isSelected ? styles.questionOptionSelected : null,
+                      isAnswered ? styles.questionOptionDisabled : null,
+                    ]}
+                    disabled={isAnswered}
+                    onPress={() => selectOption(qIdx, question, option.label)}
+                  >
+                    <Text style={styles.questionOptionText}>{option.label}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          ) : null}
+        </View>
+      ))}
+      {!isAnswered && canBundleAnswers ? (
+        <View style={styles.questionSubmitRow}>
+          <TouchableOpacity
+            style={[
+              styles.questionSubmitButton,
+              !canSubmitBundledAnswers ? styles.questionOptionDisabled : null,
+            ]}
+            disabled={!canSubmitBundledAnswers}
+            onPress={submitBundledAnswers}
+          >
+            <Text style={styles.questionSubmitButtonText}>Submit answers</Text>
+          </TouchableOpacity>
+          <Text style={styles.questionHint}>
+            {canSubmitBundledAnswers
+              ? "Ready to send all answers."
+              : "Select one option for each question before submitting."}
+          </Text>
+        </View>
+      ) : null}
+      {!isAnswered ? <Text style={styles.questionHint}>Or type a custom answer in the main chat box below.</Text> : null}
+    </View>
+  );
+}
+
 function compactActivityLines(messages: MessageInfo[]): ActivityLine[] {
   const lines: ActivityLine[] = [];
   for (const message of messages) {
@@ -900,50 +1025,18 @@ function App() {
             const role = item.role || (item.agent_id === "user" ? "user" : "assistant");
             const isUser = role === "user" || item.agent_id === "user";
             if (role === "question") {
-              const payload = parseAskUserQuestionPayload(item.content);
               const isAnswered =
                 answeredQuestionSet.has(item.timestamp) || derivedAnsweredQuestionSet.has(item.timestamp);
               return (
-                <View style={styles.questionCard}>
-                  <Text style={styles.questionLabel}>QUESTION</Text>
-                  {payload ? (
-                    <>
-                      {payload.questions.map((question, qIdx) => (
-                        <View key={`${row.id}-q-${qIdx}`} style={styles.questionBlock}>
-                          {question.header ? <Text style={styles.questionHeader}>{question.header}</Text> : null}
-                          {question.question ? <Text style={styles.questionText}>{question.question}</Text> : null}
-                          {question.options && question.options.length > 0 ? (
-                            <View style={styles.questionOptions}>
-                              {question.options.map((option, optionIdx) => (
-                                <TouchableOpacity
-                                  key={`${row.id}-o-${qIdx}-${optionIdx}`}
-                                  style={[
-                                    styles.questionOption,
-                                    isAnswered ? styles.questionOptionDisabled : null,
-                                  ]}
-                                  disabled={isAnswered}
-                                  onPress={() => {
-                                    markQuestionAnswered(item.timestamp);
-                                    sendMessage(option.label);
-                                  }}
-                                >
-                                  <Text style={styles.questionOptionText}>{option.label}</Text>
-                                </TouchableOpacity>
-                              ))}
-                            </View>
-                          ) : null}
-                        </View>
-                      ))}
-                      {!isAnswered ? (
-                        <Text style={styles.questionHint}>
-                          Or type a custom answer in the main chat box below.
-                        </Text>
-                      ) : null}
-                    </>
-                  ) : (
-                    <Text style={styles.messageText}>{item.content}</Text>
-                  )}
-                </View>
+                <QuestionCard
+                  message={item}
+                  rowId={row.id}
+                  isAnswered={isAnswered}
+                  onAnswer={(answer) => {
+                    markQuestionAnswered(item.timestamp);
+                    sendMessage(answer);
+                  }}
+                />
               );
             }
 
@@ -1461,8 +1554,23 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     backgroundColor: "#201b17",
   },
+  questionOptionSelected: {
+    borderColor: "#8d7a68",
+    backgroundColor: "#2b231d",
+  },
   questionOptionDisabled: { opacity: 0.5 },
   questionOptionText: { color: "#d8d0c8", fontSize: 12 },
+  questionSubmitRow: { marginTop: 4, gap: 8 },
+  questionSubmitButton: {
+    alignSelf: "flex-start",
+    borderWidth: 1,
+    borderColor: "#5f5449",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: "#1f1a16",
+  },
+  questionSubmitButtonText: { color: "#d8d0c8", fontSize: 12, fontWeight: "600" },
   questionHint: { color: "#9a9088", fontSize: 12, marginTop: 2 },
   composerCard: {
     borderTopWidth: 1,

@@ -1225,6 +1225,10 @@ fn choose_assistant_text(delta_text: &str, snapshot_text: Option<&String>) -> Op
     }
 }
 
+fn normalize_text_for_dedupe(text: &str) -> String {
+    text.replace("\r\n", "\n").trim().to_string()
+}
+
 fn emit_agent_message(
     app: &tauri::AppHandle,
     db: &Database,
@@ -1983,7 +1987,10 @@ async fn send_message_to_agent(
                                 last_question = Some(json_content);
                             }
                             ActivityEvent::Plan(plan_content) => {
-                                if last_plan.as_deref() == Some(plan_content.as_str()) {
+                                let normalized_plan = normalize_text_for_dedupe(&plan_content);
+                                if normalized_plan.is_empty()
+                                    || last_plan.as_deref() == Some(normalized_plan.as_str())
+                                {
                                     continue;
                                 }
                                 emit_agent_message(
@@ -1997,7 +2004,7 @@ async fn send_message_to_agent(
                                     false,
                                     "assistant",
                                 );
-                                last_plan = Some(plan_content);
+                                last_plan = Some(normalized_plan);
                             }
                         }
                     }
@@ -2128,29 +2135,39 @@ async fn send_message_to_agent(
         app_state_for_pids.child_pids.write().remove(&agent_id_clone);
 
         if let Some(assistant_text) = choose_assistant_text(&assistant_delta_text, latest_assistant_snapshot.as_ref()) {
-            emit_agent_message(
-                &app,
-                &db,
-                &session_id,
-                &agent_id_clone,
-                &workspace_id,
-                &ws_server,
-                assistant_text,
-                false,
-                "assistant",
-            );
+            let normalized_assistant = normalize_text_for_dedupe(&assistant_text);
+            if !normalized_assistant.is_empty()
+                && last_plan.as_deref() != Some(normalized_assistant.as_str())
+            {
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    assistant_text,
+                    false,
+                    "assistant",
+                );
+            }
         } else if let Some(fallback) = result_text_fallback {
-            emit_agent_message(
-                &app,
-                &db,
-                &session_id,
-                &agent_id_clone,
-                &workspace_id,
-                &ws_server,
-                fallback,
-                false,
-                "assistant",
-            );
+            let normalized_fallback = normalize_text_for_dedupe(&fallback);
+            if !normalized_fallback.is_empty()
+                && last_plan.as_deref() != Some(normalized_fallback.as_str())
+            {
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    fallback,
+                    false,
+                    "assistant",
+                );
+            }
         } else if status.success() && !error_emitted {
             emit_agent_message(
                 &app,
@@ -3585,8 +3602,11 @@ async fn handle_ws_commands(
                                                         last_question = Some(json_content);
                                                     }
                                                     ActivityEvent::Plan(plan_content) => {
-                                                        if last_plan.as_deref()
-                                                            == Some(plan_content.as_str())
+                                                        let normalized_plan =
+                                                            normalize_text_for_dedupe(&plan_content);
+                                                        if normalized_plan.is_empty()
+                                                            || last_plan.as_deref()
+                                                                == Some(normalized_plan.as_str())
                                                         {
                                                             continue;
                                                         }
@@ -3601,7 +3621,7 @@ async fn handle_ws_commands(
                                                             false,
                                                             "assistant",
                                                         );
-                                                        last_plan = Some(plan_content);
+                                                        last_plan = Some(normalized_plan);
                                                     }
                                                 }
                                             }
@@ -3727,29 +3747,41 @@ async fn handle_ws_commands(
                                 if let Some(assistant_text) =
                                     choose_assistant_text(&assistant_delta_text, latest_assistant_snapshot.as_ref())
                                 {
-                                    emit_agent_message(
-                                        &app_clone,
-                                        &db,
-                                        &session_id,
-                                        &agent_id_clone,
-                                        &workspace_id_clone,
-                                        &ws_server,
-                                        assistant_text,
-                                        false,
-                                        "assistant",
-                                    );
+                                    let normalized_assistant = normalize_text_for_dedupe(&assistant_text);
+                                    if !normalized_assistant.is_empty()
+                                        && last_plan.as_deref()
+                                            != Some(normalized_assistant.as_str())
+                                    {
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            assistant_text,
+                                            false,
+                                            "assistant",
+                                        );
+                                    }
                                 } else if let Some(fallback) = result_text_fallback {
-                                    emit_agent_message(
-                                        &app_clone,
-                                        &db,
-                                        &session_id,
-                                        &agent_id_clone,
-                                        &workspace_id_clone,
-                                        &ws_server,
-                                        fallback,
-                                        false,
-                                        "assistant",
-                                    );
+                                    let normalized_fallback = normalize_text_for_dedupe(&fallback);
+                                    if !normalized_fallback.is_empty()
+                                        && last_plan.as_deref()
+                                            != Some(normalized_fallback.as_str())
+                                    {
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            fallback,
+                                            false,
+                                            "assistant",
+                                        );
+                                    }
                                 } else if status.success() && !error_emitted {
                                     emit_agent_message(
                                         &app_clone,
