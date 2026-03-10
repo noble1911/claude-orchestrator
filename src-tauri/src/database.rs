@@ -271,6 +271,15 @@ impl Database {
         Ok(())
     }
 
+    pub fn clear_session_claude_id(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE sessions SET claude_session_id = NULL WHERE id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn end_session(&self, id: &str, ended_at: &str) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(

@@ -1178,6 +1178,21 @@ fn detect_credential_error(text: &str) -> bool {
         "token has expired",
         "request has expired",
         "signing error",
+        "unauthorizedexception",
+        "forbidden",
+        "access denied",
+        "invalidsignatureexception",
+        "signaturedoesnotmatch",
+        "request signature we calculated does not match",
+        "could not load credentials",
+        "nocredentialproviders",
+        "the security token included in the request is invalid",
+        "invalid security token",
+        "missing authentication token",
+        "status code: 401",
+        "status code: 403",
+        "http 401",
+        "http 403",
     ];
     if PATTERNS.iter().any(|p| lower.contains(p)) {
         return true;
@@ -1186,6 +1201,63 @@ fn detect_credential_error(text: &str) -> bool {
         return true;
     }
     false
+}
+
+fn extract_http_status_code(text: &str) -> Option<u16> {
+    for token in text.split(|c: char| !c.is_ascii_digit()) {
+        if token.len() != 3 {
+            continue;
+        }
+        if let Ok(code) = token.parse::<u16>() {
+            if (400..=599).contains(&code) {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn credential_error_message(details: &str) -> String {
+    if let Some(status) = extract_http_status_code(details) {
+        format!(
+            "AWS authentication failed (HTTP {}). Your credentials appear invalid or expired. Update your environment in the Setup tab.",
+            status
+        )
+    } else {
+        "AWS authentication failed. Your credentials appear invalid or expired. Update your environment in the Setup tab.".to_string()
+    }
+}
+
+fn extract_missing_conversation_session_id(text: &str) -> Option<String> {
+    let marker = "No conversation found with session ID:";
+    let start = text.find(marker)?;
+    let tail = &text[start + marker.len()..];
+    let session_id = tail
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+    if session_id.is_empty() {
+        None
+    } else {
+        Some(session_id.to_string())
+    }
+}
+
+fn reset_agent_claude_session(
+    app_state: &Arc<AppState>,
+    db: &Database,
+    session_id: &str,
+    agent_id: &str,
+) {
+    {
+        let mut agents = app_state.agents.write();
+        if let Some(agent) = agents.get_mut(agent_id) {
+            agent.claude_session_id = None;
+        }
+    }
+    let _ = db.clear_session_claude_id(session_id);
 }
 
 fn stream_event_payload<'a>(event: &'a Value) -> &'a Value {
@@ -2062,6 +2134,15 @@ async fn send_message_to_agent(
         let mut last_question: Option<String> = None;
         let mut last_plan: Option<String> = None;
         let mut error_emitted = false;
+        let mut missing_conversation_session_id: Option<String> = None;
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut stderr_buf = String::new();
+                let _ = std::io::Read::read_to_string(&mut reader, &mut stderr_buf);
+                stderr_buf
+            })
+        });
 
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
@@ -2092,6 +2173,10 @@ async fn send_message_to_agent(
                     }
 
                     if let Some(stream_error) = extract_stream_error_text(payload) {
+                        if missing_conversation_session_id.is_none() {
+                            missing_conversation_session_id =
+                                extract_missing_conversation_session_id(&stream_error);
+                        }
                         emit_agent_message(
                             &app,
                             &db,
@@ -2243,6 +2328,10 @@ async fn send_message_to_agent(
                                 .filter(|s| !s.trim().is_empty())
                                 .or_else(|| extract_result_text(&event))
                                 .unwrap_or_else(|| "Claude execution failed".to_string());
+                            if missing_conversation_session_id.is_none() {
+                                missing_conversation_session_id =
+                                    extract_missing_conversation_session_id(&errors);
+                            }
                             if detect_credential_error(&errors) {
                                 emit_agent_message(
                                     &app,
@@ -2251,7 +2340,7 @@ async fn send_message_to_agent(
                                     &agent_id_clone,
                                     &workspace_id,
                                     &ws_server,
-                                    "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                                    credential_error_message(&errors),
                                     true,
                                     "credential_error",
                                 );
@@ -2273,7 +2362,12 @@ async fn send_message_to_agent(
                 } else {
                     // Forward non-JSON runtime output so authentication/runtime issues are visible.
                     let cli_line = format!("cli: {}", line);
-                    if detect_credential_error(&cli_line) {
+                    if missing_conversation_session_id.is_none() {
+                        missing_conversation_session_id =
+                            extract_missing_conversation_session_id(&line);
+                    }
+                    let line_has_credential_error = detect_credential_error(&cli_line);
+                    if line_has_credential_error {
                         emit_agent_message(
                             &app,
                             &db,
@@ -2281,11 +2375,12 @@ async fn send_message_to_agent(
                             &agent_id_clone,
                             &workspace_id,
                             &ws_server,
-                            "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                            credential_error_message(&cli_line),
                             true,
                             "credential_error",
                         );
                     }
+                    let line_is_error = line_has_credential_error || missing_conversation_session_id.is_some();
                     emit_agent_message(
                         &app,
                         &db,
@@ -2294,17 +2389,14 @@ async fn send_message_to_agent(
                         &workspace_id,
                         &ws_server,
                         cli_line,
-                        false,
-                        "system",
+                        line_is_error,
+                        if line_is_error { "error" } else { "system" },
                     );
+                    if line_is_error {
+                        error_emitted = true;
+                    }
                 }
             }
-        }
-
-        let mut stderr_buf = String::new();
-        if let Some(stderr) = child.stderr.take() {
-            let mut reader = BufReader::new(stderr);
-            let _ = std::io::Read::read_to_string(&mut reader, &mut stderr_buf);
         }
 
         let status = match child.wait() {
@@ -2325,9 +2417,42 @@ async fn send_message_to_agent(
                 return;
             }
         };
+        let mut stderr_buf = String::new();
+        if let Some(handle) = stderr_handle {
+            if let Ok(collected) = handle.join() {
+                stderr_buf = collected;
+            }
+        }
+        if missing_conversation_session_id.is_none() {
+            missing_conversation_session_id = extract_missing_conversation_session_id(&stderr_buf);
+        }
 
         // Clean up stored PID now that process has exited
         app_state_for_pids.child_pids.write().remove(&agent_id_clone);
+
+        if let Some(stale_session_id) = missing_conversation_session_id.clone() {
+            reset_agent_claude_session(
+                &app_state_for_pids,
+                &db,
+                &session_id,
+                &agent_id_clone,
+            );
+            emit_agent_message(
+                &app,
+                &db,
+                &session_id,
+                &agent_id_clone,
+                &workspace_id,
+                &ws_server,
+                format!(
+                    "Claude session {} is no longer valid for the current auth context. The session was reset automatically; resend your last message.",
+                    stale_session_id
+                ),
+                true,
+                "error",
+            );
+            error_emitted = true;
+        }
 
         if let Some(assistant_text) = choose_streaming_assistant_text(
             &assistant_text_blocks,
@@ -2440,7 +2565,7 @@ async fn send_message_to_agent(
                     &agent_id_clone,
                     &workspace_id,
                     &ws_server,
-                    "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                    credential_error_message(&error_content),
                     true,
                     "credential_error",
                 );
@@ -3761,6 +3886,15 @@ async fn handle_ws_commands(
                                 let mut last_question: Option<String> = None;
                                 let mut last_plan: Option<String> = None;
                                 let mut error_emitted = false;
+                                let mut missing_conversation_session_id: Option<String> = None;
+                                let stderr_handle = child.stderr.take().map(|stderr| {
+                                    std::thread::spawn(move || {
+                                        let mut reader = BufReader::new(stderr);
+                                        let mut stderr_buf = String::new();
+                                        let _ = std::io::Read::read_to_string(&mut reader, &mut stderr_buf);
+                                        stderr_buf
+                                    })
+                                });
 
                                 if let Some(stdout) = child.stdout.take() {
                                     let reader = BufReader::new(stdout);
@@ -3798,6 +3932,10 @@ async fn handle_ws_commands(
                                             }
 
                                             if let Some(stream_error) = extract_stream_error_text(payload) {
+                                                if missing_conversation_session_id.is_none() {
+                                                    missing_conversation_session_id =
+                                                        extract_missing_conversation_session_id(&stream_error);
+                                                }
                                                 emit_agent_message(
                                                     &app_clone,
                                                     &db,
@@ -3967,6 +4105,10 @@ async fn handle_ws_commands(
                                                         .filter(|s| !s.trim().is_empty())
                                                         .or_else(|| extract_result_text(&event))
                                                         .unwrap_or_else(|| "Claude execution failed".to_string());
+                                                    if missing_conversation_session_id.is_none() {
+                                                        missing_conversation_session_id =
+                                                            extract_missing_conversation_session_id(&errors);
+                                                    }
                                                     if detect_credential_error(&errors) {
                                                         emit_agent_message(
                                                             &app_clone,
@@ -3975,7 +4117,7 @@ async fn handle_ws_commands(
                                                             &agent_id_clone,
                                                             &workspace_id_clone,
                                                             &ws_server,
-                                                            "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                                                            credential_error_message(&errors),
                                                             true,
                                                             "credential_error",
                                                         );
@@ -3996,7 +4138,12 @@ async fn handle_ws_commands(
                                             }
                                         } else {
                                             let cli_line = format!("cli: {}", line);
-                                            if detect_credential_error(&cli_line) {
+                                            if missing_conversation_session_id.is_none() {
+                                                missing_conversation_session_id =
+                                                    extract_missing_conversation_session_id(&line);
+                                            }
+                                            let line_has_credential_error = detect_credential_error(&cli_line);
+                                            if line_has_credential_error {
                                                 emit_agent_message(
                                                     &app_clone,
                                                     &db,
@@ -4004,11 +4151,13 @@ async fn handle_ws_commands(
                                                     &agent_id_clone,
                                                     &workspace_id_clone,
                                                     &ws_server,
-                                                    "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                                                    credential_error_message(&cli_line),
                                                     true,
                                                     "credential_error",
                                                 );
                                             }
+                                            let line_is_error =
+                                                line_has_credential_error || missing_conversation_session_id.is_some();
                                             emit_agent_message(
                                                 &app_clone,
                                                 &db,
@@ -4017,17 +4166,14 @@ async fn handle_ws_commands(
                                                 &workspace_id_clone,
                                                 &ws_server,
                                                 cli_line,
-                                                false,
-                                                "system",
+                                                line_is_error,
+                                                if line_is_error { "error" } else { "system" },
                                             );
+                                            if line_is_error {
+                                                error_emitted = true;
+                                            }
                                         }
                                     }
-                                }
-
-                                let mut stderr_buf = String::new();
-                                if let Some(stderr) = child.stderr.take() {
-                                    let mut reader = BufReader::new(stderr);
-                                    let _ = std::io::Read::read_to_string(&mut reader, &mut stderr_buf);
                                 }
 
                                 let status = match child.wait() {
@@ -4048,8 +4194,42 @@ async fn handle_ws_commands(
                                         return;
                                     }
                                 };
+                                let mut stderr_buf = String::new();
+                                if let Some(handle) = stderr_handle {
+                                    if let Ok(collected) = handle.join() {
+                                        stderr_buf = collected;
+                                    }
+                                }
+                                if missing_conversation_session_id.is_none() {
+                                    missing_conversation_session_id =
+                                        extract_missing_conversation_session_id(&stderr_buf);
+                                }
 
                                 app_state_clone.child_pids.write().remove(&agent_id_clone);
+
+                                if let Some(stale_session_id) = missing_conversation_session_id.clone() {
+                                    reset_agent_claude_session(
+                                        &app_state_clone,
+                                        &db,
+                                        &session_id,
+                                        &agent_id_clone,
+                                    );
+                                    emit_agent_message(
+                                        &app_clone,
+                                        &db,
+                                        &session_id,
+                                        &agent_id_clone,
+                                        &workspace_id_clone,
+                                        &ws_server,
+                                        format!(
+                                            "Claude session {} is no longer valid for the current auth context. The session was reset automatically; resend your last message.",
+                                            stale_session_id
+                                        ),
+                                        true,
+                                        "error",
+                                    );
+                                    error_emitted = true;
+                                }
 
                                 if let Some(assistant_text) =
                                     choose_streaming_assistant_text(
@@ -4166,7 +4346,7 @@ async fn handle_ws_commands(
                                             &agent_id_clone,
                                             &workspace_id_clone,
                                             &ws_server,
-                                            "AWS credentials appear to be expired or invalid. Update your environment in the Setup tab.".to_string(),
+                                            credential_error_message(&error_content),
                                             true,
                                             "credential_error",
                                         );
