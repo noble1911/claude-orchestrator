@@ -2,6 +2,7 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
@@ -653,6 +654,7 @@ function App() {
   const [terminalHistoryByWorkspace, setTerminalHistoryByWorkspace] = useState<Record<string, string[]>>({});
   const [terminalHistoryIndex, setTerminalHistoryIndex] = useState<number | null>(null);
   const [terminalLinesByWorkspace, setTerminalLinesByWorkspace] = useState<Record<string, TerminalLine[]>>({});
+  const [unreadByWorkspace, setUnreadByWorkspace] = useState<Record<string, number>>({});
   const [isRunningTerminalCommand, setIsRunningTerminalCommand] = useState(false);
   const [isTogglingRemoteServer, setIsTogglingRemoteServer] = useState(false);
   const [terminalTab, setTerminalTab] = useState<"setup" | "remote" | "terminal">("terminal");
@@ -683,6 +685,15 @@ function App() {
     return message;
   }
 
+  function isUnreadCandidateMessage(message: AgentMessage): boolean {
+    const role = message.role ?? "";
+    if (role === "user" || message.agentId === "user") return false;
+    if (role === "assistant" || role === "question" || role === "error" || role === "credential_error") {
+      return true;
+    }
+    return message.isError;
+  }
+
   useEffect(() => {
     loadInitialState();
     // Silent background check on launch; surfaced only on explicit user action.
@@ -693,6 +704,16 @@ function App() {
       const messageWorkspaceId = event.payload.workspaceId ?? selectedWorkspaceRef.current;
       if (messageWorkspaceId && selectedWorkspaceRef.current === messageWorkspaceId) {
         setMessages((prev) => upsertMessageByIdentity(prev, event.payload));
+      }
+      if (
+        messageWorkspaceId &&
+        selectedWorkspaceRef.current !== messageWorkspaceId &&
+        isUnreadCandidateMessage(event.payload)
+      ) {
+        setUnreadByWorkspace((prev) => ({
+          ...prev,
+          [messageWorkspaceId]: (prev[messageWorkspaceId] || 0) + 1,
+        }));
       }
       if (event.payload.role === "credential_error" && messageWorkspaceId) {
         setCredentialErrorWorkspaces((prev) => new Set(prev).add(messageWorkspaceId));
@@ -757,10 +778,41 @@ function App() {
   useEffect(() => {
     if (selectedWorkspace) {
       loadMessages(selectedWorkspace);
+      setUnreadByWorkspace((prev) => {
+        if (!prev[selectedWorkspace]) return prev;
+        const next = { ...prev };
+        delete next[selectedWorkspace];
+        return next;
+      });
     } else {
       setMessages([]);
     }
   }, [selectedWorkspace]);
+
+  useEffect(() => {
+    const validWorkspaceIds = new Set(workspaces.map((workspace) => workspace.id));
+    setUnreadByWorkspace((prev) => {
+      let changed = false;
+      const next: Record<string, number> = {};
+      for (const [workspaceId, count] of Object.entries(prev)) {
+        if (validWorkspaceIds.has(workspaceId) && count > 0) {
+          next[workspaceId] = count;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [workspaces]);
+
+  useEffect(() => {
+    const unreadTotal = Object.values(unreadByWorkspace).reduce((sum, count) => sum + count, 0);
+    getCurrentWindow()
+      .setBadgeCount(unreadTotal > 0 ? unreadTotal : undefined)
+      .catch(() => {
+        // Ignore unsupported platform badge operations.
+      });
+  }, [unreadByWorkspace]);
 
   useEffect(() => {
     if (!selectedWorkspace) {
@@ -2365,6 +2417,14 @@ function App() {
                       <div className="flex items-center gap-2">
                         <span className={`h-2 w-2 rounded-full ${getStatusColor(workspace.status)}`} />
                         <span className="truncate md-body-small md-text-primary">{workspace.name}</span>
+                        {(unreadByWorkspace[workspace.id] || 0) > 0 && (
+                          <span
+                            className="inline-flex min-h-[18px] min-w-[18px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-none text-white"
+                            title={`${unreadByWorkspace[workspace.id]} unread AI ${unreadByWorkspace[workspace.id] === 1 ? "response" : "responses"}`}
+                          >
+                            {unreadByWorkspace[workspace.id]}
+                          </span>
+                        )}
                       </div>
                       <p className="mt-1 truncate md-body-small md-text-muted">{workspace.branch}</p>
                     </button>
