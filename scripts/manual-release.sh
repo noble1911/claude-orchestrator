@@ -488,13 +488,19 @@ main() {
     build_mobile
   fi
 
-  ALL_FILES=("${DESKTOP_FILES[@]}" "${MOBILE_FILES[@]}")
+  ALL_FILES=()
+  local file
+  for file in "${DESKTOP_FILES[@]-}"; do
+    [ -n "$file" ] && ALL_FILES+=("$file")
+  done
+  for file in "${MOBILE_FILES[@]-}"; do
+    [ -n "$file" ] && ALL_FILES+=("$file")
+  done
   if [ "${#ALL_FILES[@]}" -eq 0 ]; then
     fail "No artifacts were generated."
   fi
 
   log "Artifacts ready:"
-  local file
   for file in "${ALL_FILES[@]}"; do
     [ -f "$file" ] && printf '  - %s\n' "$file"
   done
