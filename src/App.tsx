@@ -2023,6 +2023,8 @@ function App() {
           break;
         }
         if (next.role === "question") {
+          // A newer question supersedes an older pending one.
+          answered.add(current.timestamp);
           break;
         }
       }

@@ -478,6 +478,8 @@ function App() {
           break;
         }
         if (nextRole === "question") {
+          // A newer question supersedes an older pending one.
+          answered.add(current.timestamp);
           break;
         }
       }
