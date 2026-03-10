@@ -20,6 +20,7 @@ jobs:
     runs-on: macos-latest
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.event.release.tag_name }}
+      PUBLIC_RELEASE_REPOSITORY: noble1911/claude-orchestrator-releases
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,6 +47,12 @@ jobs:
           fi
 
           echo "RELEASE_PUBLISHED_AT=$PUBLISHED_AT" >> "$GITHUB_ENV"
+
+      - name: Require public release mirror token
+        if: ${{ secrets.PUBLIC_RELEASES_TOKEN == '' }}
+        run: |
+          echo "::error::PUBLIC_RELEASES_TOKEN secret is required to publish public release artifacts."
+          exit 1
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -199,7 +206,7 @@ jobs:
               TARGET_ARCH="x86_64"
             fi
             TARGET_BASE="darwin-${TARGET_ARCH}"
-            RELEASE_URL_BASE="https://github.com/noble1911/claude-orchestrator/releases/download/${TAG}"
+            RELEASE_URL_BASE="https://github.com/${{ env.PUBLIC_RELEASE_REPOSITORY }}/releases/download/${TAG}"
             UPDATER_SIG_CONTENT="$(cat "release-assets/$UPDATER_SIG_FILE")"
             UPDATER_DOWNLOAD_URL="${RELEASE_URL_BASE}/${UPDATER_FILE}"
             UPDATE_TARGET="${TARGET_BASE}"
@@ -237,16 +244,38 @@ jobs:
             release-assets/Claude-Orchestrator-${{ env.RELEASE_TAG }}-macos-updater.tar.gz.sig
             release-assets/latest.json
 
+      - name: Upload desktop assets to public release mirror
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.PUBLIC_RELEASE_REPOSITORY }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          fail_on_unmatched_files: false
+          files: |
+            release-assets/Claude-Orchestrator-${{ env.RELEASE_TAG }}-macos-app.zip
+            release-assets/Claude-Orchestrator-${{ env.RELEASE_TAG }}-macos.dmg
+            release-assets/Claude-Orchestrator-${{ env.RELEASE_TAG }}-macos-updater.tar.gz
+            release-assets/Claude-Orchestrator-${{ env.RELEASE_TAG }}-macos-updater.tar.gz.sig
+            release-assets/latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
+
   mobile_release:
     name: Build Mobile Release Artifact (Android APK)
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.event.release.tag_name }}
+      PUBLIC_RELEASE_REPOSITORY: noble1911/claude-orchestrator-releases
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref }}
+
+      - name: Require public release mirror token
+        if: ${{ secrets.PUBLIC_RELEASES_TOKEN == '' }}
+        run: |
+          echo "::error::PUBLIC_RELEASES_TOKEN secret is required to publish public release artifacts."
+          exit 1
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -288,3 +317,13 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           files: |
             Claude-Orchestrator-${{ env.RELEASE_TAG }}-android.apk
+
+      - name: Upload mobile asset to public release mirror
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.PUBLIC_RELEASE_REPOSITORY }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            Claude-Orchestrator-${{ env.RELEASE_TAG }}-android.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
