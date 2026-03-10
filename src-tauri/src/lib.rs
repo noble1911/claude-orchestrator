@@ -2611,26 +2611,43 @@ async fn send_message_to_agent(
         app_state_for_pids.child_pids.write().remove(&agent_id_clone);
 
         if let Some(stale_session_id) = missing_conversation_session_id.clone() {
-            reset_agent_claude_session(
-                &app_state_for_pids,
-                &db,
-                &session_id,
-                &agent_id_clone,
-            );
-            emit_agent_message(
-                &app,
-                &db,
-                &session_id,
-                &agent_id_clone,
-                &workspace_id,
-                &ws_server,
-                format!(
-                    "Claude session {} is no longer valid for the current auth context. The session was reset automatically; resend your last message.",
-                    stale_session_id
-                ),
-                true,
-                "error",
-            );
+            if saw_credential_error {
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    format!(
+                        "Claude reported missing session {} while AWS auth failed. Session reset was deferred; complete authentication and resend your last message.",
+                        stale_session_id
+                    ),
+                    true,
+                    "error",
+                );
+            } else {
+                reset_agent_claude_session(
+                    &app_state_for_pids,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                );
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    format!(
+                        "Claude session {} is no longer valid for the current auth context. The session was reset automatically; resend your last message.",
+                        stale_session_id
+                    ),
+                    true,
+                    "error",
+                );
+            }
             error_emitted = true;
         }
 
@@ -4424,26 +4441,43 @@ async fn handle_ws_commands(
                                 app_state_clone.child_pids.write().remove(&agent_id_clone);
 
                                 if let Some(stale_session_id) = missing_conversation_session_id.clone() {
-                                    reset_agent_claude_session(
-                                        &app_state_clone,
-                                        &db,
-                                        &session_id,
-                                        &agent_id_clone,
-                                    );
-                                    emit_agent_message(
-                                        &app_clone,
-                                        &db,
-                                        &session_id,
-                                        &agent_id_clone,
-                                        &workspace_id_clone,
-                                        &ws_server,
-                                        format!(
-                                            "Claude session {} is no longer valid for the current auth context. The session was reset automatically; resend your last message.",
-                                            stale_session_id
-                                        ),
-                                        true,
-                                        "error",
-                                    );
+                                    if saw_credential_error {
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            format!(
+                                                "Claude reported missing session {} while AWS auth failed. Session reset was deferred; complete authentication and resend your last message.",
+                                                stale_session_id
+                                            ),
+                                            true,
+                                            "error",
+                                        );
+                                    } else {
+                                        reset_agent_claude_session(
+                                            &app_state_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                        );
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            format!(
+                                                "Claude session {} is no longer valid for the current auth context. The session was reset automatically; resend your last message.",
+                                                stale_session_id
+                                            ),
+                                            true,
+                                            "error",
+                                        );
+                                    }
                                     error_emitted = true;
                                 }
 
