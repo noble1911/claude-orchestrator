@@ -123,6 +123,7 @@ interface CenterTab {
 
 type ClaudeMode = "normal" | "plan";
 type EditorKind = "vscode" | "intellij";
+type WorkspaceOpenTarget = "" | EditorKind | "terminal";
 
 interface ActivityLine {
   text: string;
@@ -641,6 +642,7 @@ function App() {
   const [showRenameForm, setShowRenameForm] = useState(false);
   const [renameWorkspaceId, setRenameWorkspaceId] = useState<string | null>(null);
   const [renameWorkspaceName, setRenameWorkspaceName] = useState("");
+  const [workspaceOpenTarget, setWorkspaceOpenTarget] = useState<WorkspaceOpenTarget>("");
   const [leftPanelWidth, setLeftPanelWidth] = useState(280);
   const [rightPanelWidth, setRightPanelWidth] = useState(360);
   const [terminalHeight, setTerminalHeight] = useState(180);
@@ -1992,6 +1994,15 @@ function App() {
     }
   }
 
+  async function openCurrentWorkspaceTarget(target: WorkspaceOpenTarget) {
+    if (!target) return;
+    if (target === "terminal") {
+      setTerminalTab("terminal");
+      return;
+    }
+    await openCurrentWorkspaceInEditor(target);
+  }
+
   function getDiffLineClass(line: string): string {
     if (line.startsWith("+++ ") || line.startsWith("--- ")) return "text-indigo-300";
     if (line.startsWith("+")) return "text-emerald-300";
@@ -2425,24 +2436,22 @@ function App() {
           </div>
           <div className="flex items-center gap-1">
             {currentWorkspace && (
-              <>
-                <button
-                  onClick={() => void openCurrentWorkspaceInEditor("vscode")}
-                  className="md-btn md-btn-tonal !min-h-0 !px-2 !py-1 text-[11px]"
-                  title="Open current workspace in VS Code"
-                  aria-label="Open current workspace in VS Code"
-                >
-                  VS Code
-                </button>
-                <button
-                  onClick={() => void openCurrentWorkspaceInEditor("intellij")}
-                  className="md-btn md-btn-tonal !min-h-0 !px-2 !py-1 text-[11px]"
-                  title="Open current workspace in IntelliJ IDEA"
-                  aria-label="Open current workspace in IntelliJ IDEA"
-                >
-                  IntelliJ
-                </button>
-              </>
+              <select
+                value={workspaceOpenTarget}
+                onChange={(e) => {
+                  const target = e.target.value as WorkspaceOpenTarget;
+                  setWorkspaceOpenTarget("");
+                  void openCurrentWorkspaceTarget(target);
+                }}
+                className="md-select !w-auto !min-h-0 h-7 py-0 pl-2 pr-7 text-[11px]"
+                title="Open current workspace"
+                aria-label="Open current workspace"
+              >
+                <option value="">Open</option>
+                <option value="vscode">VS Code</option>
+                <option value="intellij">IntelliJ</option>
+                <option value="terminal">Terminal</option>
+              </select>
             )}
             {currentWorkspace && workspaceAgents.length > 0 && (
               <button
@@ -2745,7 +2754,8 @@ function App() {
                       }}
                       rows={3}
                       placeholder="Ask to make changes... or /prompt name"
-                      className="w-full resize-y border-0 bg-transparent text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted min-h-[72px]"
+                      style={{ resize: "vertical" }}
+                      className="w-full overflow-y-auto rounded-lg border md-outline bg-black/10 px-2 py-1 text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted min-h-[96px] max-h-[45vh]"
                     />
 
                     {attachedFiles.length > 0 && (
