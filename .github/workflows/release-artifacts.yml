@@ -10,13 +10,27 @@ on:
         description: Release tag to build/upload (for example v0.0.3)
         required: true
         type: string
+      target:
+        description: Which artifacts to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - desktop
+          - mobile
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-artifacts-${{ github.event_name == 'release' && github.event.release.tag_name || github.event.inputs.release_tag || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   desktop_release:
     name: Build Desktop Release Artifacts
+    if: ${{ github.event_name == 'release' || github.event.inputs.target == 'all' || github.event.inputs.target == 'desktop' }}
     runs-on: macos-latest
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.event.release.tag_name }}
@@ -296,6 +310,7 @@ jobs:
 
   mobile_release:
     name: Build Mobile Release Artifact (Android APK)
+    if: ${{ github.event_name == 'release' || github.event.inputs.target == 'all' || github.event.inputs.target == 'mobile' }}
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.event.release.tag_name }}
