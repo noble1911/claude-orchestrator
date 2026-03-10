@@ -18,6 +18,7 @@
     "react-native-markdown-display": "^7.0.2"
   },
   "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
     "@types/react": "~19.1.10",
     "babel-preset-expo": "~54.0.10",
     "typescript": "~5.9.2"

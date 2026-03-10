@@ -341,15 +341,38 @@ function messageIdentity(message: MessageInfo): string {
   return `${message.timestamp}::${message.agent_id}::${message.role ?? ""}`;
 }
 
+function isAssistantStreamingMessage(message: MessageInfo): boolean {
+  return (message.role ?? "") === "assistant" && !message.is_error;
+}
+
 function upsertMessageByIdentity(messages: MessageInfo[], incoming: MessageInfo): MessageInfo[] {
   const key = messageIdentity(incoming);
-  const existingIndex = messages.findIndex((item) => messageIdentity(item) === key);
+  let existingIndex = -1;
+  for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+    if (messageIdentity(messages[idx]) === key) {
+      existingIndex = idx;
+      break;
+    }
+  }
   if (existingIndex < 0) {
     return [...messages, incoming];
   }
-  const next = [...messages];
-  next[existingIndex] = incoming;
-  return next;
+  const existing = messages[existingIndex];
+  if (
+    existing.content === incoming.content &&
+    existing.is_error === incoming.is_error &&
+    (existing.role ?? "") === (incoming.role ?? "")
+  ) {
+    return messages;
+  }
+
+  if (isAssistantStreamingMessage(existing) && isAssistantStreamingMessage(incoming)) {
+    const next = [...messages];
+    next[existingIndex] = incoming;
+    return next;
+  }
+
+  return [...messages, incoming];
 }
 
 function generateWorkspaceName(): string {

@@ -177,15 +177,38 @@ function messageIdentity(message: AgentMessage): string {
   return `${message.timestamp}::${message.agentId}::${message.role ?? ""}`;
 }
 
+function isAssistantStreamingMessage(message: AgentMessage): boolean {
+  return (message.role ?? "") === "assistant" && !message.isError;
+}
+
 function upsertMessageByIdentity(messages: AgentMessage[], incoming: AgentMessage): AgentMessage[] {
   const key = messageIdentity(incoming);
-  const existingIndex = messages.findIndex((item) => messageIdentity(item) === key);
+  let existingIndex = -1;
+  for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+    if (messageIdentity(messages[idx]) === key) {
+      existingIndex = idx;
+      break;
+    }
+  }
   if (existingIndex < 0) {
     return [...messages, incoming];
   }
-  const next = [...messages];
-  next[existingIndex] = incoming;
-  return next;
+  const existing = messages[existingIndex];
+  if (
+    existing.content === incoming.content &&
+    existing.isError === incoming.isError &&
+    (existing.role ?? "") === (incoming.role ?? "")
+  ) {
+    return messages;
+  }
+
+  if (isAssistantStreamingMessage(existing) && isAssistantStreamingMessage(incoming)) {
+    const next = [...messages];
+    next[existingIndex] = incoming;
+    return next;
+  }
+
+  return [...messages, incoming];
 }
 
 function shortText(value: string, maxLength = 120): string {
@@ -321,6 +344,64 @@ const CLAUDE_MODE_STORAGE_KEY = "claude_orchestrator_mode";
 const MODEL_STORAGE_KEY = "claude_orchestrator_model";
 const THINKING_MODE_STORAGE_KEY = "claude_orchestrator_thinking_mode";
 const DEFAULT_REPOSITORY_STORAGE_KEY = "claude_orchestrator_default_repository";
+const BEDROCK_ENV_KEY = "CLAUDE_CODE_USE_BEDROCK";
+
+function isTruthyEnvValue(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function upsertEnvOverrideLine(raw: string, targetKey: string, nextValue: string | null): string {
+  const lines = raw.split("\n");
+  const result: string[] = [];
+  let didWriteTarget = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      result.push(line);
+      continue;
+    }
+
+    let candidate = trimmed;
+    if (candidate.startsWith("export ")) {
+      candidate = candidate.slice("export ".length).trim();
+    } else if (candidate.startsWith("set ")) {
+      candidate = candidate.slice("set ".length).trim();
+    }
+
+    const eqIndex = candidate.indexOf("=");
+    if (eqIndex <= 0) {
+      result.push(line);
+      continue;
+    }
+
+    const key = candidate.slice(0, eqIndex).trim();
+    if (key !== targetKey) {
+      result.push(line);
+      continue;
+    }
+
+    if (!didWriteTarget && nextValue !== null) {
+      result.push(`export ${targetKey}=${nextValue}`);
+      didWriteTarget = true;
+    }
+  }
+
+  if (!didWriteTarget && nextValue !== null) {
+    if (result.length > 0 && result[result.length - 1].trim().length > 0) {
+      result.push("");
+    }
+    result.push(`export ${targetKey}=${nextValue}`);
+  }
+
+  while (result.length > 0 && result[result.length - 1].trim().length === 0) {
+    result.pop();
+  }
+
+  return result.join("\n");
+}
 
 function parseAskUserQuestionPayload(raw: string): AskUserQuestionPayload | null {
   try {
@@ -578,6 +659,10 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const terminalInputRef = useRef<HTMLInputElement>(null);
+  const bedrockEnabled = useMemo(
+    () => isTruthyEnvValue(parseEnvOverrides(envOverridesText)[BEDROCK_ENV_KEY]),
+    [envOverridesText],
+  );
 
   useEffect(() => {
     selectedWorkspaceRef.current = selectedWorkspace;
@@ -1328,6 +1413,10 @@ function App() {
       map[key] = value;
     }
     return map;
+  }
+
+  function setBedrockEnabled(enabled: boolean) {
+    setEnvOverridesText((current) => upsertEnvOverrideLine(current, BEDROCK_ENV_KEY, enabled ? "1" : null));
   }
 
   function dismissCredentialError(workspaceId: string) {
@@ -3147,6 +3236,15 @@ function App() {
                 <p className="mb-2 text-[11px] md-text-muted">
                   Supports lines like `export KEY=VALUE` or `KEY=VALUE`. Applied to agents, chat and terminal commands.
                 </p>
+                <label className="mb-2 flex items-center gap-2 rounded-md border px-2 py-1.5 md-outline">
+                  <input
+                    type="checkbox"
+                    checked={bedrockEnabled}
+                    onChange={(e) => setBedrockEnabled(e.target.checked)}
+                    className="h-4 w-4 accent-sky-500"
+                  />
+                  <span className="text-[11px] md-text-strong">Use AWS Bedrock (`CLAUDE_CODE_USE_BEDROCK=1`)</span>
+                </label>
                 <textarea
                   value={envOverridesText}
                   onChange={(e) => setEnvOverridesText(e.target.value)}
