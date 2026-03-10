@@ -21,11 +21,16 @@ Options:
   --create-releases        Create missing GitHub releases before upload
   --skip-install           Skip npm install steps (assume dependencies are already installed)
   --keep-version-files     Do not restore version files after build
+  --tauri-key-file <path>  Path to Tauri updater private key file (minisign format)
+  --tauri-key-password-file <path>
+                           Read Tauri updater private key password from file (first line)
+  --no-key-password-prompt Never prompt for key password when missing
   -h, --help               Show this help
 
 Examples:
   scripts/manual-release.sh --tag v0.1.3 --target mobile
   scripts/manual-release.sh --tag v0.1.3 --target all --create-releases
+  scripts/manual-release.sh --tag v0.1.3 --target desktop --tauri-key-file ~/.tauri/claude-orchestrator.key
 EOF
 }
 
@@ -64,6 +69,9 @@ UPLOAD="true"
 CREATE_RELEASES="false"
 INSTALL_DEPS="true"
 KEEP_VERSION_FILES="false"
+TAURI_KEY_FILE=""
+TAURI_KEY_PASSWORD_FILE=""
+PROMPT_KEY_PASSWORD="true"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -101,6 +109,20 @@ while [ $# -gt 0 ]; do
       ;;
     --keep-version-files)
       KEEP_VERSION_FILES="true"
+      shift
+      ;;
+    --tauri-key-file)
+      [ $# -ge 2 ] || fail "--tauri-key-file requires a value"
+      TAURI_KEY_FILE="$2"
+      shift 2
+      ;;
+    --tauri-key-password-file)
+      [ $# -ge 2 ] || fail "--tauri-key-password-file requires a value"
+      TAURI_KEY_PASSWORD_FILE="$2"
+      shift 2
+      ;;
+    --no-key-password-prompt)
+      PROMPT_KEY_PASSWORD="false"
       shift
       ;;
     -h|--help)
@@ -187,11 +209,68 @@ sync_version_files() {
   mv mobile/app.json.tmp mobile/app.json
 }
 
+find_default_tauri_key_file() {
+  local default_file="$HOME/.tauri/claude-orchestrator.key"
+  if [ -f "$default_file" ]; then
+    printf '%s' "$default_file"
+    return 0
+  fi
+
+  local tauri_dir="$HOME/.tauri"
+  [ -d "$tauri_dir" ] || return 1
+
+  local matches=()
+  local file=""
+  while IFS= read -r -d '' file; do
+    matches+=("$file")
+  done < <(find "$tauri_dir" -maxdepth 1 -type f -name '*.key' -print0 2>/dev/null)
+
+  if [ "${#matches[@]}" -eq 1 ]; then
+    printf '%s' "${matches[0]}"
+    return 0
+  fi
+
+  return 1
+}
+
+load_signing_material_from_files() {
+  if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+    local key_file=""
+    key_file="${TAURI_KEY_FILE:-${TAURI_SIGNING_PRIVATE_KEY_FILE:-}}"
+    if [ -z "$key_file" ]; then
+      key_file="$(find_default_tauri_key_file || true)"
+    fi
+
+    if [ -n "$key_file" ]; then
+      [ -f "$key_file" ] || fail "Tauri key file not found: $key_file"
+      TAURI_SIGNING_PRIVATE_KEY="$(cat "$key_file")"
+      export TAURI_SIGNING_PRIVATE_KEY
+      log "Loaded updater signing key from $key_file"
+    fi
+  fi
+
+  if [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+    local password_file=""
+    password_file="${TAURI_KEY_PASSWORD_FILE:-${TAURI_SIGNING_PRIVATE_KEY_PASSWORD_FILE:-}}"
+    if [ -n "$password_file" ]; then
+      [ -f "$password_file" ] || fail "Tauri key password file not found: $password_file"
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(head -n 1 "$password_file" | tr -d '\r\n')"
+      export TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+      log "Loaded updater signing password from file"
+    elif [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ "$PROMPT_KEY_PASSWORD" = "true" ] && [ -t 0 ]; then
+      read -r -s -p "Tauri signing key password: " TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+      printf '\n'
+      export TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+    fi
+  fi
+}
+
 prepare_signing_env() {
   HAS_SIGNING="false"
+  load_signing_material_from_files
 
   if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
-    log "Updater signing secrets not set; building desktop artifacts without updater bundles"
+    log "Updater signing key/password not set; building desktop artifacts without updater bundles"
     return
   fi
 
