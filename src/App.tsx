@@ -113,6 +113,23 @@ interface PromptShortcut {
   autoRunOnCreate?: boolean;
 }
 
+interface SkillShortcut {
+  id: string;
+  scope: "project" | "user";
+  name: string;
+  commandName: string;
+  relativePath: string;
+  filePath: string;
+  content: string;
+}
+
+interface SkillCatalogResponse {
+  projectRoot?: string | null;
+  userRoot?: string | null;
+  projectSkills: SkillShortcut[];
+  userSkills: SkillShortcut[];
+}
+
 interface CenterTab {
   id: string;
   type: "chat" | "file" | "diff";
@@ -125,6 +142,7 @@ interface CenterTab {
 type ClaudeMode = "normal" | "plan";
 type EditorKind = "vscode" | "intellij";
 type WorkspaceOpenTarget = "" | EditorKind | "terminal";
+type SkillScope = "project" | "user";
 
 interface ActivityLine {
   text: string;
@@ -627,6 +645,19 @@ function App() {
   const [newPromptName, setNewPromptName] = useState("");
   const [newPromptBody, setNewPromptBody] = useState("");
   const [newPromptAutoRunOnCreate, setNewPromptAutoRunOnCreate] = useState(false);
+  const [projectSkills, setProjectSkills] = useState<SkillShortcut[]>([]);
+  const [userSkills, setUserSkills] = useState<SkillShortcut[]>([]);
+  const [projectSkillsRoot, setProjectSkillsRoot] = useState<string | null>(null);
+  const [userSkillsRoot, setUserSkillsRoot] = useState<string | null>(null);
+  const [isSkillsLoading, setIsSkillsLoading] = useState(false);
+  const [projectSkillsExpanded, setProjectSkillsExpanded] = useState(true);
+  const [userSkillsExpanded, setUserSkillsExpanded] = useState(true);
+  const [showSkillForm, setShowSkillForm] = useState(false);
+  const [editingSkillId, setEditingSkillId] = useState<string | null>(null);
+  const [skillScopeDraft, setSkillScopeDraft] = useState<SkillScope>("project");
+  const [skillRelativePathDraft, setSkillRelativePathDraft] = useState<string | null>(null);
+  const [skillNameDraft, setSkillNameDraft] = useState("");
+  const [skillBodyDraft, setSkillBodyDraft] = useState("");
   const [envOverridesText, setEnvOverridesText] = useState("");
   const [claudeMode, setClaudeMode] = useState<ClaudeMode>("normal");
   const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
@@ -668,6 +699,7 @@ function App() {
     () => isTruthyEnvValue(parseEnvOverrides(envOverridesText)[BEDROCK_ENV_KEY]),
     [envOverridesText],
   );
+  const allSkills = useMemo(() => [...projectSkills, ...userSkills], [projectSkills, userSkills]);
 
   useEffect(() => {
     selectedWorkspaceRef.current = selectedWorkspace;
@@ -748,6 +780,10 @@ function App() {
     if (selectedRepo) {
       loadWorkspaces(selectedRepo);
     }
+  }, [selectedRepo]);
+
+  useEffect(() => {
+    void loadSkills(selectedRepo);
   }, [selectedRepo]);
 
   useEffect(() => {
@@ -1434,6 +1470,143 @@ function App() {
     return value.trim().toLowerCase().replace(/\s+/g, " ");
   }
 
+  function normalizeSkillCommand(value: string) {
+    return value.trim().toLowerCase().replace(/\\/g, "/");
+  }
+
+  function sanitizeSkillDirName(value: string) {
+    return value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9\s_-]/g, "")
+      .replace(/[\s_]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+  }
+
+  function formatSkillExecutionPrompt(skill: SkillShortcut, userInput?: string) {
+    const trimmedInput = userInput?.trim();
+    const blocks: string[] = [
+      `Execute the following ${skill.scope} skill in this workspace.`,
+      `<skill name="${skill.name}" scope="${skill.scope}" command="/${skill.commandName}" path="${skill.relativePath}">\n${skill.content}\n</skill>`,
+    ];
+    if (trimmedInput) {
+      blocks.push(`User request:\n${trimmedInput}`);
+    }
+    return blocks.join("\n\n");
+  }
+
+  function resolveSkillSlashCommand(rawCommand: string): { skill: SkillShortcut; args: string } | null {
+    const trimmed = rawCommand.trim();
+    if (!trimmed) return null;
+
+    const normalizedFull = normalizeSkillCommand(trimmed);
+    const exactMatches = allSkills.filter((skill) => {
+      const command = normalizeSkillCommand(skill.commandName);
+      const name = normalizePromptName(skill.name);
+      const relative = normalizeSkillCommand(skill.relativePath);
+      return command === normalizedFull || name === normalizePromptName(trimmed) || relative === normalizedFull;
+    });
+
+    if (exactMatches.length === 1) {
+      return { skill: exactMatches[0], args: "" };
+    }
+    if (exactMatches.length > 1) {
+      setError(`Multiple skills match '${trimmed}'. Use /project:... or /user:...`);
+      return null;
+    }
+
+    const firstSpace = trimmed.indexOf(" ");
+    if (firstSpace <= 0) return null;
+
+    const token = trimmed.slice(0, firstSpace).trim();
+    const args = trimmed.slice(firstSpace + 1).trim();
+    const normalizedToken = normalizeSkillCommand(token);
+    const tokenMatches = allSkills.filter((skill) => {
+      const command = normalizeSkillCommand(skill.commandName);
+      const relative = normalizeSkillCommand(skill.relativePath);
+      const scopedRelative = `${skill.scope}:${relative}`;
+      return command === normalizedToken || relative === normalizedToken || scopedRelative === normalizedToken;
+    });
+
+    if (tokenMatches.length === 1) {
+      return { skill: tokenMatches[0], args };
+    }
+    if (tokenMatches.length > 1) {
+      setError(`Multiple skills match '${token}'. Use /project:... or /user:...`);
+    }
+    return null;
+  }
+
+  async function loadSkills(repoId: string | null) {
+    setIsSkillsLoading(true);
+    try {
+      const data = await invoke<SkillCatalogResponse>("list_skills", {
+        repoId: repoId ?? null,
+      });
+      setProjectSkills(data.projectSkills || []);
+      setUserSkills(data.userSkills || []);
+      setProjectSkillsRoot(data.projectRoot ?? null);
+      setUserSkillsRoot(data.userRoot ?? null);
+    } catch (err) {
+      console.error("Failed to load skills:", err);
+      setError(String(err));
+    } finally {
+      setIsSkillsLoading(false);
+    }
+  }
+
+  function openAddSkillForm(scope: SkillScope) {
+    setEditingSkillId(null);
+    setSkillScopeDraft(scope);
+    setSkillRelativePathDraft(null);
+    setSkillNameDraft("");
+    setSkillBodyDraft("");
+    setShowSkillForm(true);
+  }
+
+  function openEditSkillForm(skill: SkillShortcut) {
+    setEditingSkillId(skill.id);
+    setSkillScopeDraft(skill.scope);
+    setSkillRelativePathDraft(skill.relativePath);
+    setSkillNameDraft(skill.name);
+    setSkillBodyDraft(skill.content);
+    setShowSkillForm(true);
+  }
+
+  async function saveSkillDraft() {
+    const name = skillNameDraft.trim();
+    const body = skillBodyDraft.trim();
+    if (!name || !body) return;
+    if (skillScopeDraft === "project" && !selectedRepo) {
+      setError("Select a repository before saving a project skill.");
+      return;
+    }
+
+    try {
+      await invoke<SkillShortcut>("save_skill", {
+        scope: skillScopeDraft,
+        repoId: skillScopeDraft === "project" ? selectedRepo : null,
+        relativePath: skillRelativePathDraft,
+        name,
+        content: body,
+      });
+      setShowSkillForm(false);
+      setEditingSkillId(null);
+      await loadSkills(selectedRepo);
+    } catch (err) {
+      console.error("Failed to save skill:", err);
+      setError(String(err));
+    }
+  }
+
+  async function runSkillShortcut(skill: SkillShortcut, args?: string) {
+    const trimmedArgs = args?.trim();
+    const command = trimmedArgs ? `/${skill.commandName} ${trimmedArgs}` : `/${skill.commandName}`;
+    const payload = formatSkillExecutionPrompt(skill, trimmedArgs);
+    await sendMessage(payload, command);
+  }
+
   function parseEnvOverrides(raw: string): Record<string, string> {
     const map: Record<string, string> = {};
     for (const line of raw.split("\n")) {
@@ -1503,14 +1676,21 @@ function App() {
     let visibleMessage = visibleOverride ?? composedInput;
 
     if (!rawMessage && composedInput.startsWith("/")) {
-      const commandName = normalizePromptName(composedInput.slice(1));
-      const matched = promptShortcuts.find((shortcut) => normalizePromptName(shortcut.name) === commandName);
-      if (!matched) {
-        setError(`Prompt not found: ${commandName}`);
-        return false;
+      const commandBody = composedInput.slice(1).trim();
+      const commandName = normalizePromptName(commandBody);
+      const matchedPrompt = promptShortcuts.find((shortcut) => normalizePromptName(shortcut.name) === commandName);
+      if (matchedPrompt) {
+        messageToSend = matchedPrompt.prompt;
+        visibleMessage = `/${matchedPrompt.name}`;
+      } else {
+        const matchedSkill = resolveSkillSlashCommand(commandBody);
+        if (matchedSkill) {
+          messageToSend = formatSkillExecutionPrompt(matchedSkill.skill, matchedSkill.args);
+          visibleMessage = matchedSkill.args
+            ? `/${matchedSkill.skill.commandName} ${matchedSkill.args}`
+            : `/${matchedSkill.skill.commandName}`;
+        }
       }
-      messageToSend = matched.prompt;
-      visibleMessage = `/${matched.name}`;
     }
 
     const workspace = workspaces.find((item) => item.id === selectedWorkspace);
@@ -2813,7 +2993,7 @@ function App() {
                         }
                       }}
                       rows={3}
-                      placeholder="Ask to make changes... or /prompt name"
+                      placeholder="Ask to make changes... or /prompt name /project:skill-path"
                       style={{ resize: "vertical" }}
                       className="w-full overflow-y-auto rounded-lg border md-outline bg-black/10 px-2 py-1 text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted min-h-[96px] max-h-[45vh]"
                     />
@@ -2994,7 +3174,7 @@ function App() {
 
         <div className="min-h-0 flex-1 overflow-y-auto md-px-4 md-py-4">
           {activeRightTab === "prompts" && (
-            <div className="space-y-2 text-sm">
+            <div className="space-y-3 text-sm">
               <p className="md-label-medium">Prompt Library</p>
               <div className="md-card p-3 md-text-secondary">
                 {promptShortcuts.length === 0 ? (
@@ -3069,8 +3249,161 @@ function App() {
                   </button>
                 </div>
               </div>
+              <div className="md-card p-3 md-text-secondary">
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    className="flex min-w-0 items-center gap-1 text-left"
+                    onClick={() => setProjectSkillsExpanded((prev) => !prev)}
+                    aria-expanded={projectSkillsExpanded}
+                  >
+                    <span className="material-symbols-rounded !text-[16px] md-text-muted">
+                      {projectSkillsExpanded ? "expand_more" : "chevron_right"}
+                    </span>
+                    <span className="truncate text-sm md-text-strong">Project Skills ({projectSkills.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openAddSkillForm("project")}
+                    disabled={!selectedRepo}
+                    className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle disabled:cursor-not-allowed disabled:opacity-40"
+                    title={selectedRepo ? "Add project skill" : "Select a repository to add project skills"}
+                    aria-label="Add project skill"
+                  >
+                    <span className="material-symbols-rounded !text-[18px]">add</span>
+                  </button>
+                </div>
+                {projectSkillsExpanded && (
+                  <div className="mt-2 space-y-2">
+                    {isSkillsLoading && <p className="text-xs md-text-muted">Loading project skills...</p>}
+                    {!isSkillsLoading && projectSkills.length === 0 && (
+                      <p className="text-xs md-text-muted">No project skills found.</p>
+                    )}
+                    {!isSkillsLoading &&
+                      projectSkills.map((skill) => (
+                        <div
+                          key={skill.id}
+                          className="md-card cursor-pointer md-px-2 md-py-2 transition hover:md-surface-subtle"
+                          onClick={() => {
+                            void runSkillShortcut(skill);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              void runSkillShortcut(skill);
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                          aria-label={`Run skill ${skill.name}`}
+                          title={skill.filePath}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="truncate text-sm md-text-strong">{skill.name}</p>
+                              <p className="truncate text-[11px] md-text-muted">/{skill.commandName}</p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openEditSkillForm(skill);
+                              }}
+                              className="md-icon-plain"
+                              title="Edit skill"
+                              aria-label={`Edit ${skill.name}`}
+                            >
+                              <span className="material-symbols-rounded !text-[16px]">edit</span>
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+                {projectSkillsRoot && (
+                  <p className="mt-2 truncate text-[11px] md-text-muted" title={projectSkillsRoot}>
+                    {projectSkillsRoot}
+                  </p>
+                )}
+              </div>
+              <div className="md-card p-3 md-text-secondary">
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    className="flex min-w-0 items-center gap-1 text-left"
+                    onClick={() => setUserSkillsExpanded((prev) => !prev)}
+                    aria-expanded={userSkillsExpanded}
+                  >
+                    <span className="material-symbols-rounded !text-[16px] md-text-muted">
+                      {userSkillsExpanded ? "expand_more" : "chevron_right"}
+                    </span>
+                    <span className="truncate text-sm md-text-strong">User Skills ({userSkills.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openAddSkillForm("user")}
+                    className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle"
+                    title="Add user skill"
+                    aria-label="Add user skill"
+                  >
+                    <span className="material-symbols-rounded !text-[18px]">add</span>
+                  </button>
+                </div>
+                {userSkillsExpanded && (
+                  <div className="mt-2 space-y-2">
+                    {isSkillsLoading && <p className="text-xs md-text-muted">Loading user skills...</p>}
+                    {!isSkillsLoading && userSkills.length === 0 && (
+                      <p className="text-xs md-text-muted">No user skills found.</p>
+                    )}
+                    {!isSkillsLoading &&
+                      userSkills.map((skill) => (
+                        <div
+                          key={skill.id}
+                          className="md-card cursor-pointer md-px-2 md-py-2 transition hover:md-surface-subtle"
+                          onClick={() => {
+                            void runSkillShortcut(skill);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              void runSkillShortcut(skill);
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                          aria-label={`Run skill ${skill.name}`}
+                          title={skill.filePath}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="truncate text-sm md-text-strong">{skill.name}</p>
+                              <p className="truncate text-[11px] md-text-muted">/{skill.commandName}</p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openEditSkillForm(skill);
+                              }}
+                              className="md-icon-plain"
+                              title="Edit skill"
+                              aria-label={`Edit ${skill.name}`}
+                            >
+                              <span className="material-symbols-rounded !text-[16px]">edit</span>
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+                {userSkillsRoot && (
+                  <p className="mt-2 truncate text-[11px] md-text-muted" title={userSkillsRoot}>
+                    {userSkillsRoot}
+                  </p>
+                )}
+              </div>
               <p className="text-xs md-text-muted">
-                Click a prompt to run it. Use `/prompt name` in chat, or enable auto-run for new workspaces.
+                Click to run. Use `/prompt name`, `/project:skill-path`, `/user:skill-path`, or `/skill-path` when unique.
               </p>
 
               {currentWorkspace && (
@@ -3608,6 +3941,103 @@ function App() {
                 className="md-btn md-btn-tonal disabled:opacity-50"
               >
                 {editingPromptId ? "Save Prompt" : "Add Prompt"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showSkillForm && (
+        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
+          <div className="md-dialog mx-4 w-full max-w-2xl">
+            <div className="border-b md-outline p-4">
+              <h3 className="text-lg font-semibold md-text-strong">
+                {editingSkillId ? "Edit Skill" : "Add Skill"}
+              </h3>
+              <p className="mt-1 text-sm md-text-muted">
+                {editingSkillId
+                  ? "Update this skill's instructions."
+                  : "Create a reusable project or user skill."}
+              </p>
+            </div>
+            <div className="space-y-4 p-4">
+              <div>
+                <label className="mb-1 block text-sm font-medium md-text-secondary">Scope</label>
+                <select
+                  value={skillScopeDraft}
+                  onChange={(e) => setSkillScopeDraft(e.target.value as SkillScope)}
+                  className="md-select"
+                  disabled={editingSkillId !== null}
+                >
+                  <option value="project">Project</option>
+                  <option value="user">User</option>
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block text-sm font-medium md-text-secondary">Name</label>
+                <input
+                  type="text"
+                  value={skillNameDraft}
+                  onChange={(e) => setSkillNameDraft(e.target.value)}
+                  className="md-field"
+                  placeholder="e.g. release-engineer"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-sm font-medium md-text-secondary">Skill Content (SKILL.md)</label>
+                <textarea
+                  value={skillBodyDraft}
+                  onChange={(e) => setSkillBodyDraft(e.target.value)}
+                  rows={14}
+                  className="md-field font-mono"
+                  placeholder="# Skill name&#10;&#10;Write the skill instructions here."
+                />
+              </div>
+              <div className="space-y-1 rounded-lg border md-outline p-3 text-xs md-text-muted">
+                {skillRelativePathDraft && (
+                  <p>
+                    Path: <span className="font-mono md-text-secondary">{skillRelativePathDraft}/SKILL.md</span>
+                  </p>
+                )}
+                <p>
+                  Command preview:{" "}
+                  <span className="font-mono md-text-secondary">
+                    /
+                    {skillScopeDraft}
+                    :
+                    {skillRelativePathDraft || sanitizeSkillDirName(skillNameDraft.trim() || "skill")}
+                  </span>
+                </p>
+                {skillScopeDraft === "project" && projectSkillsRoot && (
+                  <p>
+                    Project root: <span className="font-mono md-text-secondary">{projectSkillsRoot}</span>
+                  </p>
+                )}
+                {skillScopeDraft === "user" && userSkillsRoot && (
+                  <p>
+                    User root: <span className="font-mono md-text-secondary">{userSkillsRoot}</span>
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 border-t md-outline p-4">
+              <button
+                onClick={() => {
+                  setShowSkillForm(false);
+                  setEditingSkillId(null);
+                }}
+                className="md-btn"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  void saveSkillDraft();
+                }}
+                disabled={!skillNameDraft.trim() || !skillBodyDraft.trim()}
+                className="md-btn md-btn-tonal disabled:opacity-50"
+              >
+                {editingSkillId ? "Save Skill" : "Add Skill"}
               </button>
             </div>
           </div>
