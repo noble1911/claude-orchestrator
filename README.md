@@ -91,6 +91,35 @@ The release workflow uploads `latest.json` plus updater bundles/signatures to th
 If updater signing secrets are missing or invalid, the workflow still uploads desktop app zip + dmg, and skips updater tar/signature/latest.json.
 If a release run fails, you can re-run artifact generation from Actions using the `Release Artifacts` workflow `Run workflow` button with `release_tag` (for example `v0.0.3`).
 
+### Manual Release (No GitHub Actions Minutes)
+
+You can build and upload release artifacts locally with:
+
+```bash
+scripts/manual-release.sh --tag v0.1.3 --target all --create-releases
+```
+
+Useful variants:
+
+```bash
+# Build/upload Android APK only
+scripts/manual-release.sh --tag v0.1.3 --target mobile --create-releases
+
+# Build only, do not upload
+scripts/manual-release.sh --tag v0.1.3 --target desktop --no-upload
+```
+
+Requirements:
+
+- `gh` authenticated (`gh auth login`)
+- `jq`
+- macOS for desktop `.app/.dmg` builds
+- Android toolchain for APK builds
+
+The script syncs app versions from the tag, builds artifacts, uploads to both
+`noble1911/claude-orchestrator` and `noble1911/claude-orchestrator-releases`,
+then restores version files unless `--keep-version-files` is passed.
+
 ## Mobile App
 
 A companion React Native (Expo) app lives in the `mobile/` directory. It connects to the desktop app over WebSocket for remote monitoring and control of workspaces.
