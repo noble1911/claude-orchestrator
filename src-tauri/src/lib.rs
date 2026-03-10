@@ -961,7 +961,7 @@ fn load_cli_shell_env() -> HashMap<String, String> {
         .env("ZSH_COMPDUMP", "/tmp/.zcompdump-claude-orchestrator")
         .output();
 
-    let mut env_map: HashMap<String, String> = match output {
+    let env_map: HashMap<String, String> = match output {
         Ok(ref out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             let mut map = HashMap::new();
@@ -998,6 +998,115 @@ fn env_nonempty(env_map: &HashMap<String, String>, key: &str) -> bool {
         .get(key)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false)
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ClaudeSettingsFile {
+    env: Option<HashMap<String, String>>,
+    #[serde(rename = "model")]
+    _model: Option<String>,
+    #[serde(rename = "awsAuthRefresh")]
+    aws_auth_refresh: Option<String>,
+}
+
+fn parse_claude_settings(raw: &str) -> ClaudeSettingsFile {
+    serde_json::from_str::<ClaudeSettingsFile>(raw).unwrap_or_default()
+}
+
+#[cfg(test)]
+fn parse_claude_settings_env(raw: &str) -> HashMap<String, String> {
+    parse_claude_settings(raw)
+        .env
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
+        .collect()
+}
+
+fn load_claude_settings() -> ClaudeSettingsFile {
+    let home = match std::env::var("HOME") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return ClaudeSettingsFile::default(),
+    };
+
+    let settings_path = PathBuf::from(home).join(".claude").join("settings.json");
+    let raw = match std::fs::read_to_string(settings_path) {
+        Ok(content) => content,
+        Err(_) => return ClaudeSettingsFile::default(),
+    };
+
+    parse_claude_settings(&raw)
+}
+
+fn load_claude_settings_env() -> HashMap<String, String> {
+    load_claude_settings()
+        .env
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
+        .collect()
+}
+
+fn load_claude_settings_auth_refresh_command() -> Option<String> {
+    load_claude_settings()
+        .aws_auth_refresh
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn summarize_command_output(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+fn run_aws_auth_refresh(env_map: &HashMap<String, String>) -> Option<Result<String, String>> {
+    if !env_truthy(env_map.get("CLAUDE_CODE_USE_BEDROCK")) {
+        return None;
+    }
+
+    let refresh_cmd = load_claude_settings_auth_refresh_command()?;
+    let shell = env_map
+        .get("SHELL")
+        .cloned()
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    let mut cmd = Command::new(shell);
+    cmd.args(["-lc", &refresh_cmd]);
+    configure_cli_env(&mut cmd, env_map);
+
+    let output = match cmd.output() {
+        Ok(value) => value,
+        Err(e) => {
+            return Some(Err(format!(
+                "Failed to execute awsAuthRefresh command: {}",
+                e
+            )));
+        }
+    };
+
+    if output.status.success() {
+        if let Some(line) = summarize_command_output(&output.stdout) {
+            Some(Ok(format!("awsAuthRefresh completed: {}", line)))
+        } else {
+            Some(Ok("awsAuthRefresh completed successfully.".to_string()))
+        }
+    } else {
+        let detail = summarize_command_output(&output.stderr)
+            .or_else(|| summarize_command_output(&output.stdout))
+            .unwrap_or_else(|| "No error output from command.".to_string());
+        let code = output
+            .status
+            .code()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        Some(Err(format!(
+            "awsAuthRefresh failed (exit {}): {}",
+            code, detail
+        )))
+    }
 }
 
 fn aws_shared_profile_exists(profile: &str) -> bool {
@@ -1048,6 +1157,13 @@ fn build_effective_cli_env(env_overrides: &HashMap<String, String>) -> HashMap<S
         format!("{}:{}", extra, existing)
     };
     env_map.insert("PATH".to_string(), merged);
+
+    // Merge env values from ~/.claude/settings.json so Claude's local
+    // Bedrock/SSO setup works without duplicating vars in this app.
+    // Precedence: shell env < Claude settings env < app overrides.
+    for (key, value) in load_claude_settings_env() {
+        env_map.insert(key, value);
+    }
 
     for (key, value) in env_overrides {
         if !key.trim().is_empty() {
@@ -2129,7 +2245,7 @@ async fn send_message_to_agent(
                 k.starts_with("CLAUDE") || k.starts_with("AWS") || k.starts_with("ANTHROPIC")
             })
             .collect();
-        debug_env.sort_by_key(|(k, _)| k.clone());
+        debug_env.sort_by_key(|(k, _)| k.as_str());
         for (k, v) in &debug_env {
             eprintln!("[orchestrator] env: {}={}", k, v);
         }
@@ -2195,6 +2311,7 @@ async fn send_message_to_agent(
         let mut last_question: Option<String> = None;
         let mut last_plan: Option<String> = None;
         let mut error_emitted = false;
+        let mut saw_credential_error = false;
         let mut missing_conversation_session_id: Option<String> = None;
         let stderr_handle = child.stderr.take().map(|stderr| {
             std::thread::spawn(move || {
@@ -2394,6 +2511,7 @@ async fn send_message_to_agent(
                                     extract_missing_conversation_session_id(&errors);
                             }
                             if detect_credential_error(&errors) {
+                                saw_credential_error = true;
                                 emit_agent_message(
                                     &app,
                                     &db,
@@ -2429,6 +2547,7 @@ async fn send_message_to_agent(
                     }
                     let line_has_credential_error = detect_credential_error(&cli_line);
                     if line_has_credential_error {
+                        saw_credential_error = true;
                         emit_agent_message(
                             &app,
                             &db,
@@ -2619,6 +2738,7 @@ async fn send_message_to_agent(
                 );
             }
             if detect_credential_error(&error_content) {
+                saw_credential_error = true;
                 emit_agent_message(
                     &app,
                     &db,
@@ -2665,6 +2785,38 @@ async fn send_message_to_agent(
                     true,
                     "error",
                 );
+            }
+        }
+
+        if saw_credential_error {
+            if let Some(refresh_result) = run_aws_auth_refresh(&effective_env) {
+                match refresh_result {
+                    Ok(message) => emit_agent_message(
+                        &app,
+                        &db,
+                        &session_id,
+                        &agent_id_clone,
+                        &workspace_id,
+                        &ws_server,
+                        format!(
+                            "{} Resend your last message once browser authentication completes.",
+                            message
+                        ),
+                        false,
+                        "system",
+                    ),
+                    Err(message) => emit_agent_message(
+                        &app,
+                        &db,
+                        &session_id,
+                        &agent_id_clone,
+                        &workspace_id,
+                        &ws_server,
+                        message,
+                        true,
+                        "error",
+                    ),
+                }
             }
         }
     });
@@ -3947,6 +4099,7 @@ async fn handle_ws_commands(
                                 let mut last_question: Option<String> = None;
                                 let mut last_plan: Option<String> = None;
                                 let mut error_emitted = false;
+                                let mut saw_credential_error = false;
                                 let mut missing_conversation_session_id: Option<String> = None;
                                 let stderr_handle = child.stderr.take().map(|stderr| {
                                     std::thread::spawn(move || {
@@ -4171,6 +4324,7 @@ async fn handle_ws_commands(
                                                             extract_missing_conversation_session_id(&errors);
                                                     }
                                                     if detect_credential_error(&errors) {
+                                                        saw_credential_error = true;
                                                         emit_agent_message(
                                                             &app_clone,
                                                             &db,
@@ -4205,6 +4359,7 @@ async fn handle_ws_commands(
                                             }
                                             let line_has_credential_error = detect_credential_error(&cli_line);
                                             if line_has_credential_error {
+                                                saw_credential_error = true;
                                                 emit_agent_message(
                                                     &app_clone,
                                                     &db,
@@ -4400,6 +4555,7 @@ async fn handle_ws_commands(
                                         );
                                     }
                                     if detect_credential_error(&error_content) {
+                                        saw_credential_error = true;
                                         emit_agent_message(
                                             &app_clone,
                                             &db,
@@ -4446,6 +4602,38 @@ async fn handle_ws_commands(
                                             true,
                                             "error",
                                         );
+                                    }
+                                }
+
+                                if saw_credential_error {
+                                    if let Some(refresh_result) = run_aws_auth_refresh(&effective_env) {
+                                        match refresh_result {
+                                            Ok(message) => emit_agent_message(
+                                                &app_clone,
+                                                &db,
+                                                &session_id,
+                                                &agent_id_clone,
+                                                &workspace_id_clone,
+                                                &ws_server,
+                                                format!(
+                                                    "{} Resend your last message once browser authentication completes.",
+                                                    message
+                                                ),
+                                                false,
+                                                "system",
+                                            ),
+                                            Err(message) => emit_agent_message(
+                                                &app_clone,
+                                                &db,
+                                                &session_id,
+                                                &agent_id_clone,
+                                                &workspace_id_clone,
+                                                &ws_server,
+                                                message,
+                                                true,
+                                                "error",
+                                            ),
+                                        }
                                     }
                                 }
                             }
@@ -4732,6 +4920,37 @@ mod tests {
         assert_eq!(
             normalize_model(Some("global.anthropic.claude-sonnet-4-6-20260115-v1:0")),
             Some("global.anthropic.claude-sonnet-4-6-20260115-v1:0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_claude_settings_env_extracts_non_empty_values() {
+        let raw = r#"{
+            "env": {
+                "AWS_PROFILE": "obsidianos-stage",
+                "EMPTY": "   ",
+                "": "ignored"
+            },
+            "awsAuthRefresh": "aws sso login --profile obsidianos-stage"
+        }"#;
+        let env = parse_claude_settings_env(raw);
+        assert_eq!(
+            env.get("AWS_PROFILE"),
+            Some(&"obsidianos-stage".to_string())
+        );
+        assert!(!env.contains_key("EMPTY"));
+        assert!(!env.contains_key(""));
+    }
+
+    #[test]
+    fn parse_claude_settings_reads_auth_refresh_command() {
+        let raw = r#"{
+            "awsAuthRefresh": "aws sso login --profile obsidianos-stage"
+        }"#;
+        let settings = parse_claude_settings(raw);
+        assert_eq!(
+            settings.aws_auth_refresh,
+            Some("aws sso login --profile obsidianos-stage".to_string())
         );
     }
 
