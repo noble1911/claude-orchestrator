@@ -1,8 +1,10 @@
 import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
-import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import ReactMarkdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
+import remarkGfm from "remark-gfm";
 
 interface Repository {
   id: string;
@@ -191,275 +193,84 @@ function shortText(value: string, maxLength = 120): string {
   return `${value.slice(0, maxLength)}...`;
 }
 
-function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
-  const pattern =
-    /(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__|\*([^*\n]+)\*|_([^_\n]+)_)/g;
-  const output: ReactNode[] = [];
-  let cursor = 0;
-  let matchIndex = 0;
-
-  for (;;) {
-    const match = pattern.exec(text);
-    if (!match) break;
-    const start = match.index;
-    const end = pattern.lastIndex;
-    if (start > cursor) {
-      output.push(text.slice(cursor, start));
-    }
-
-    if (match[2] && match[3]) {
-      output.push(
-        <a
-          key={`${keyPrefix}-link-${matchIndex}`}
-          href={match[3]}
-          target="_blank"
-          rel="noreferrer"
-          className="underline decoration-white/35 underline-offset-2 hover:decoration-white/70"
-        >
-          {renderInlineMarkdown(match[2], `${keyPrefix}-link-content-${matchIndex}`)}
-        </a>,
-      );
-    } else if (match[4]) {
-      output.push(
-        <code
-          key={`${keyPrefix}-code-${matchIndex}`}
-          className="rounded-md bg-white/10 px-1.5 py-0.5 font-mono text-[12px]"
-        >
-          {match[4]}
-        </code>,
-      );
-    } else if (match[5] || match[6]) {
-      const value = match[5] ?? match[6] ?? "";
-      output.push(
-        <strong key={`${keyPrefix}-strong-${matchIndex}`} className="font-semibold md-text-strong">
-          {renderInlineMarkdown(value, `${keyPrefix}-strong-content-${matchIndex}`)}
-        </strong>,
-      );
-    } else if (match[7] || match[8]) {
-      const value = match[7] ?? match[8] ?? "";
-      output.push(
-        <em key={`${keyPrefix}-em-${matchIndex}`} className="italic">
-          {renderInlineMarkdown(value, `${keyPrefix}-em-content-${matchIndex}`)}
-        </em>,
-      );
-    }
-
-    cursor = end;
-    matchIndex += 1;
-  }
-
-  if (cursor < text.length) {
-    output.push(text.slice(cursor));
-  }
-
-  return output;
-}
-
 function MarkdownMessage({ content }: { content: string }) {
-  const lines = content.replace(/\r\n/g, "\n").split("\n");
-  const blocks: ReactNode[] = [];
-  let paragraphLines: string[] = [];
-  let listType: "ul" | "ol" | null = null;
-  let listItems: string[] = [];
-  let inCodeBlock = false;
-  let codeBlockLines: string[] = [];
-  let codeLanguage = "";
-  let blockIndex = 0;
+  const normalizedContent = content.replace(/\r\n/g, "\n");
+  if (!normalizedContent.trim()) {
+    return <p className="whitespace-pre-wrap text-sm md-text-primary">{normalizedContent}</p>;
+  }
 
-  const flushParagraph = () => {
-    if (paragraphLines.length === 0) return;
-    const text = paragraphLines.join("\n").trim();
-    if (text) {
-      blocks.push(
-        <p key={`p-${blockIndex}`} className="whitespace-pre-wrap text-sm leading-relaxed md-text-primary">
-          {renderInlineMarkdown(text, `p-${blockIndex}`)}
-        </p>,
-      );
-      blockIndex += 1;
-    }
-    paragraphLines = [];
-  };
-
-  const flushList = () => {
-    if (!listType || listItems.length === 0) return;
-    const ListTag = listType;
-    blocks.push(
-      <ListTag
-        key={`list-${blockIndex}`}
-        className={`ml-5 space-y-1 text-sm md-text-primary ${listType === "ol" ? "list-decimal" : "list-disc"}`}
+  return (
+    <div className="space-y-2">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkBreaks]}
+        components={{
+          p: ({ children }) => (
+            <p className="m-0 whitespace-pre-wrap text-sm leading-relaxed md-text-primary">{children}</p>
+          ),
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="underline decoration-white/35 underline-offset-2 hover:decoration-white/70"
+            >
+              {children}
+            </a>
+          ),
+          strong: ({ children }) => <strong className="font-semibold md-text-strong">{children}</strong>,
+          em: ({ children }) => <em className="italic">{children}</em>,
+          code: ({ className, children }) => {
+            const text = String(children ?? "");
+            const isBlock = Boolean(className?.includes("language-")) || text.includes("\n");
+            if (isBlock) {
+              return <code className={className}>{children}</code>;
+            }
+            return <code className="rounded-md bg-white/10 px-1.5 py-0.5 font-mono text-[12px]">{children}</code>;
+          },
+          pre: ({ children }) => (
+            <pre className="m-0 max-h-[50vh] overflow-auto rounded-xl border md-outline bg-black/45 px-3 py-2 whitespace-pre font-mono text-[12px] md-text-primary">
+              {children}
+            </pre>
+          ),
+          h1: ({ children }) => <h1 className="m-0 text-xl font-semibold md-text-strong">{children}</h1>,
+          h2: ({ children }) => <h2 className="m-0 text-lg font-semibold md-text-strong">{children}</h2>,
+          h3: ({ children }) => <h3 className="m-0 text-base font-semibold md-text-strong">{children}</h3>,
+          h4: ({ children }) => <h4 className="m-0 text-sm font-semibold md-text-strong">{children}</h4>,
+          h5: ({ children }) => <h5 className="m-0 text-sm font-medium md-text-strong">{children}</h5>,
+          h6: ({ children }) => <h6 className="m-0 text-sm font-medium md-text-dim">{children}</h6>,
+          ul: ({ children }) => <ul className="m-0 ml-5 list-disc space-y-1 text-sm md-text-primary">{children}</ul>,
+          ol: ({ children }) => (
+            <ol className="m-0 ml-5 list-decimal space-y-1 text-sm md-text-primary">{children}</ol>
+          ),
+          li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+          hr: () => <hr className="border-0 border-t md-outline" />,
+          blockquote: ({ children }) => (
+            <blockquote className="m-0 border-l-2 border-white/20 pl-3 text-sm italic md-text-dim">
+              {children}
+            </blockquote>
+          ),
+          table: ({ children }) => (
+            <div className="my-1 overflow-x-auto rounded-lg border md-outline">
+              <table className="w-full border-collapse text-xs md-text-primary">{children}</table>
+            </div>
+          ),
+          thead: ({ children }) => <thead className="bg-white/5">{children}</thead>,
+          tbody: ({ children }) => <tbody>{children}</tbody>,
+          tr: ({ children }) => <tr className="border-t md-outline">{children}</tr>,
+          th: ({ children }) => (
+            <th className="border-r md-outline px-2 py-1 text-left font-semibold md-text-strong last:border-r-0">
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td className="border-r md-outline px-2 py-1 align-top last:border-r-0">{children}</td>
+          ),
+        }}
       >
-        {listItems.map((item, itemIndex) => (
-          <li key={`li-${blockIndex}-${itemIndex}`}>{renderInlineMarkdown(item, `li-${blockIndex}-${itemIndex}`)}</li>
-        ))}
-      </ListTag>,
-    );
-    blockIndex += 1;
-    listType = null;
-    listItems = [];
-  };
-
-  const flushCodeBlock = () => {
-    if (codeBlockLines.length === 0 && !codeLanguage) return;
-    blocks.push(
-      <div key={`code-${blockIndex}`} className="overflow-hidden rounded-xl border md-outline bg-black/45">
-        {codeLanguage ? (
-          <div className="border-b md-outline px-3 py-1 text-[11px] uppercase tracking-wide md-text-faint">
-            {codeLanguage}
-          </div>
-        ) : null}
-        <pre className="max-h-[50vh] overflow-auto px-3 py-2 whitespace-pre font-mono text-[12px] md-text-primary">
-          {codeBlockLines.join("\n")}
-        </pre>
-      </div>,
-    );
-    blockIndex += 1;
-    codeBlockLines = [];
-    codeLanguage = "";
-  };
-
-  for (const line of lines) {
-    if (inCodeBlock) {
-      if (line.trim().startsWith("```")) {
-        inCodeBlock = false;
-        flushCodeBlock();
-      } else {
-        codeBlockLines.push(line);
-      }
-      continue;
-    }
-
-    const fenceMatch = line.trim().match(/^```(.*)$/);
-    if (fenceMatch) {
-      flushParagraph();
-      flushList();
-      inCodeBlock = true;
-      codeLanguage = fenceMatch[1].trim();
-      codeBlockLines = [];
-      continue;
-    }
-
-    if (!line.trim()) {
-      flushParagraph();
-      flushList();
-      continue;
-    }
-
-    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
-    if (headingMatch) {
-      flushParagraph();
-      flushList();
-      const level = headingMatch[1].length;
-      const text = headingMatch[2].trim();
-      if (!text) continue;
-      const headingClasses = {
-        1: "text-xl font-semibold md-text-strong",
-        2: "text-lg font-semibold md-text-strong",
-        3: "text-base font-semibold md-text-strong",
-        4: "text-sm font-semibold md-text-strong",
-        5: "text-sm font-medium md-text-strong",
-        6: "text-sm font-medium md-text-dim",
-      } as const;
-      const safeLevel = Math.min(level, 6) as 1 | 2 | 3 | 4 | 5 | 6;
-      const className = headingClasses[safeLevel];
-      const headingContent = renderInlineMarkdown(text, `h-${blockIndex}`);
-      if (safeLevel === 1) {
-        blocks.push(
-          <h1 key={`h-${blockIndex}`} className={className}>
-            {headingContent}
-          </h1>,
-        );
-      } else if (safeLevel === 2) {
-        blocks.push(
-          <h2 key={`h-${blockIndex}`} className={className}>
-            {headingContent}
-          </h2>,
-        );
-      } else if (safeLevel === 3) {
-        blocks.push(
-          <h3 key={`h-${blockIndex}`} className={className}>
-            {headingContent}
-          </h3>,
-        );
-      } else if (safeLevel === 4) {
-        blocks.push(
-          <h4 key={`h-${blockIndex}`} className={className}>
-            {headingContent}
-          </h4>,
-        );
-      } else if (safeLevel === 5) {
-        blocks.push(
-          <h5 key={`h-${blockIndex}`} className={className}>
-            {headingContent}
-          </h5>,
-        );
-      } else {
-        blocks.push(
-          <h6 key={`h-${blockIndex}`} className={className}>
-            {headingContent}
-          </h6>,
-        );
-      }
-      blockIndex += 1;
-      continue;
-    }
-
-    if (/^(\*{3,}|-{3,}|_{3,})$/.test(line.trim())) {
-      flushParagraph();
-      flushList();
-      blocks.push(<hr key={`hr-${blockIndex}`} className="border-0 border-t md-outline" />);
-      blockIndex += 1;
-      continue;
-    }
-
-    const quoteMatch = line.match(/^>\s?(.*)$/);
-    if (quoteMatch) {
-      flushParagraph();
-      flushList();
-      blocks.push(
-        <blockquote key={`q-${blockIndex}`} className="border-l-2 border-white/20 pl-3 text-sm italic md-text-dim">
-          {renderInlineMarkdown(quoteMatch[1], `q-${blockIndex}`)}
-        </blockquote>,
-      );
-      blockIndex += 1;
-      continue;
-    }
-
-    const orderedMatch = line.match(/^\s*\d+\.\s+(.*)$/);
-    if (orderedMatch) {
-      flushParagraph();
-      if (listType && listType !== "ol") {
-        flushList();
-      }
-      listType = "ol";
-      listItems.push(orderedMatch[1]);
-      continue;
-    }
-
-    const unorderedMatch = line.match(/^\s*[-*+]\s+(.*)$/);
-    if (unorderedMatch) {
-      flushParagraph();
-      if (listType && listType !== "ul") {
-        flushList();
-      }
-      listType = "ul";
-      listItems.push(unorderedMatch[1]);
-      continue;
-    }
-
-    paragraphLines.push(line);
-  }
-
-  flushParagraph();
-  flushList();
-  if (inCodeBlock) {
-    flushCodeBlock();
-  }
-
-  if (blocks.length === 0) {
-    return <p className="whitespace-pre-wrap text-sm md-text-primary">{content}</p>;
-  }
-
-  return <div className="space-y-2">{blocks}</div>;
+        {normalizedContent}
+      </ReactMarkdown>
+    </div>
+  );
 }
 
 function toWorkspaceRelativePath(absolutePath: string, workspaceRoot: string): string | null {
