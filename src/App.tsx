@@ -200,7 +200,7 @@ function MarkdownMessage({ content }: { content: string }) {
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkBreaks]}
         components={{
@@ -232,25 +232,25 @@ function MarkdownMessage({ content }: { content: string }) {
               {children}
             </pre>
           ),
-          h1: ({ children }) => <h1 className="m-0 text-xl font-semibold md-text-strong">{children}</h1>,
-          h2: ({ children }) => <h2 className="m-0 text-lg font-semibold md-text-strong">{children}</h2>,
-          h3: ({ children }) => <h3 className="m-0 text-base font-semibold md-text-strong">{children}</h3>,
-          h4: ({ children }) => <h4 className="m-0 text-sm font-semibold md-text-strong">{children}</h4>,
-          h5: ({ children }) => <h5 className="m-0 text-sm font-medium md-text-strong">{children}</h5>,
-          h6: ({ children }) => <h6 className="m-0 text-sm font-medium md-text-dim">{children}</h6>,
-          ul: ({ children }) => <ul className="m-0 ml-5 list-disc space-y-1 text-sm md-text-primary">{children}</ul>,
+          h1: ({ children }) => <h1 className="m-0 text-xl font-semibold leading-snug md-text-strong">{children}</h1>,
+          h2: ({ children }) => <h2 className="m-0 text-lg font-semibold leading-snug md-text-strong">{children}</h2>,
+          h3: ({ children }) => <h3 className="m-0 text-base font-semibold leading-snug md-text-strong">{children}</h3>,
+          h4: ({ children }) => <h4 className="m-0 text-sm font-semibold leading-snug md-text-strong">{children}</h4>,
+          h5: ({ children }) => <h5 className="m-0 text-sm font-medium leading-snug md-text-strong">{children}</h5>,
+          h6: ({ children }) => <h6 className="m-0 text-sm font-medium leading-snug md-text-dim">{children}</h6>,
+          ul: ({ children }) => <ul className="m-0 ml-5 list-disc space-y-1.5 text-sm md-text-primary">{children}</ul>,
           ol: ({ children }) => (
-            <ol className="m-0 ml-5 list-decimal space-y-1 text-sm md-text-primary">{children}</ol>
+            <ol className="m-0 ml-5 list-decimal space-y-1.5 text-sm md-text-primary">{children}</ol>
           ),
           li: ({ children }) => <li className="leading-relaxed">{children}</li>,
           hr: () => <hr className="border-0 border-t md-outline" />,
           blockquote: ({ children }) => (
-            <blockquote className="m-0 border-l-2 border-white/20 pl-3 text-sm italic md-text-dim">
+            <blockquote className="m-0 border-l-2 border-white/20 pl-3 text-sm leading-relaxed italic md-text-dim">
               {children}
             </blockquote>
           ),
           table: ({ children }) => (
-            <div className="my-1 overflow-x-auto rounded-lg border md-outline">
+            <div className="my-2 overflow-x-auto rounded-lg border md-outline">
               <table className="w-full border-collapse text-xs md-text-primary">{children}</table>
             </div>
           ),
@@ -445,7 +445,7 @@ function QuestionCard({ message, rowId, isAnswered, onAnswer }: QuestionCardProp
   };
 
   return (
-    <div className="mt-3 rounded-xl border md-outline bg-white/[0.03] p-3">
+    <div className="rounded-xl border md-outline bg-white/[0.03] p-3">
       <div className="mb-2 text-[11px] uppercase tracking-wide md-text-faint">Question</div>
       <div className="space-y-3">
         {payload.questions.map((question, questionIdx) => (
@@ -2412,7 +2412,7 @@ function App() {
               </div>
 
               <div className="flex-1 overflow-y-auto md-px-3 md-py-3">
-                <div className="space-y-1">
+                <div className="space-y-3">
                   {activeCenterTab.type === "chat" && workspaceMessages.length === 0 ? (
                     <div className="flex h-[55vh] items-center justify-center md-text-muted">
                       {workspaceAgents.length > 0 || isAutoStartingCurrentWorkspace ? (
@@ -2433,7 +2433,7 @@ function App() {
                           <div key={row.id}>
                             <button
                               onClick={() => toggleActivityGroup(row.id)}
-                              className="flex w-full items-center gap-2 py-1 text-left transition hover:bg-white/5"
+                              className="flex w-full items-center gap-2 py-1.5 text-left transition hover:bg-white/5"
                             >
                               <span className="text-xs md-text-faint">
                                 Agent activity ({row.group.messages.length} events)
@@ -2450,7 +2450,7 @@ function App() {
                             </button>
 
                             {expanded && (
-                              <div className="space-y-1 pl-2 pt-1 pb-1">
+                              <div className="space-y-1.5 pl-2 pt-1 pb-1">
                                 {row.group.lines.map((line, lineIdx) => (
                                   <div key={`${row.id}-line-${lineIdx}`} className="flex items-start gap-2 text-xs md-text-faint">
                                     <span className="mt-1 h-1 w-1 flex-none rounded-full bg-white/20" />
@@ -2475,7 +2475,7 @@ function App() {
                       if (msg.isError) {
                         if (msg.role === "credential_error") {
                           return (
-                            <div key={row.id} className="mt-3 border-l-2 border-amber-600 pl-3">
+                            <div key={row.id} className="rounded-xl border border-amber-700/60 bg-amber-950/25 px-3 py-2">
                               <div className="mb-1 text-[11px] uppercase tracking-wide text-amber-300">Credential Error</div>
                               <pre className="overflow-x-auto whitespace-pre-wrap text-sm text-amber-200">{msg.content}</pre>
                               <button
@@ -2489,7 +2489,7 @@ function App() {
                           );
                         }
                         return (
-                          <div key={row.id} className="mt-3 border-l-2 border-rose-700 pl-3">
+                          <div key={row.id} className="rounded-xl border border-rose-700/60 bg-rose-950/20 px-3 py-2">
                             <div className="mb-1 text-[11px] uppercase tracking-wide text-rose-300">Error</div>
                             <pre className="overflow-x-auto whitespace-pre-wrap text-sm text-rose-200">{msg.content}</pre>
                           </div>
@@ -2521,8 +2521,8 @@ function App() {
                       if (isUser) {
                         return (
                           <div key={row.id} className="flex justify-end">
-                            <div className="max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-2.5">
-                              <pre className="overflow-x-auto whitespace-pre-wrap text-sm md-text-strong">
+                            <div className="max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-3">
+                              <pre className="overflow-x-auto whitespace-pre-wrap text-sm leading-relaxed md-text-strong">
                                 {msg.content.replace(/^>\s?/, "")}
                               </pre>
                             </div>
@@ -2531,7 +2531,7 @@ function App() {
                       }
 
                       return (
-                        <div key={row.id} className="mt-3">
+                        <div key={row.id}>
                           <MarkdownMessage content={msg.content} />
                         </div>
                       );
