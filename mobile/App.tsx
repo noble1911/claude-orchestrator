@@ -14,7 +14,10 @@ import {
   Platform,
   ScrollView,
   Dimensions,
+  Linking,
 } from "react-native";
+import Markdown from "react-native-markdown-display";
+import MarkdownIt from "markdown-it";
 
 type WorkspaceInfo = {
   id: string;
@@ -129,6 +132,28 @@ const THINKING_LEVELS: Array<"off" | "low" | "medium" | "high"> = ["off", "low",
 const DRAWER_ANIMATION_MS = 220;
 const NAME_ADJECTIVES = ["swift", "brisk", "neat", "solid", "lively", "calm", "bold", "quiet"];
 const NAME_NOUNS = ["otter", "falcon", "maple", "harbor", "comet", "forest", "breeze", "ember"];
+const MARKDOWN_IT = MarkdownIt({
+  breaks: true,
+  linkify: true,
+  typographer: false,
+});
+
+function MarkdownText({ content }: { content: string }) {
+  const normalized = content.replace(/\r\n/g, "\n");
+  return (
+    <Markdown
+      markdownit={MARKDOWN_IT}
+      style={markdownStyles}
+      mergeStyle={false}
+      onLinkPress={(url) => {
+        Linking.openURL(url).catch(() => {});
+        return false;
+      }}
+    >
+      {normalized}
+    </Markdown>
+  );
+}
 
 function parseAskUserQuestionPayload(raw: string): AskUserQuestionPayload | null {
   try {
@@ -203,7 +228,7 @@ function QuestionCard({ message, rowId, isAnswered, onAnswer }: QuestionCardProp
   if (!payload) {
     return (
       <View style={styles.questionCard}>
-        <Text style={styles.messageText}>{message.content}</Text>
+        <MarkdownText content={message.content} />
       </View>
     );
   }
@@ -1064,7 +1089,7 @@ function App() {
                     item.is_error ? styles.errorBubble : null,
                   ]}
                 >
-                  <Text style={styles.messageText}>{item.content}</Text>
+                  <MarkdownText content={item.content} />
                 </View>
               </View>
             );
@@ -1547,7 +1572,6 @@ const styles = StyleSheet.create({
   userBubble: { backgroundColor: "#1f3d57", borderWidth: 1, borderColor: "#2f5e86" },
   aiBubble: { backgroundColor: "#1c1815", borderWidth: 1, borderColor: "#39312b" },
   errorBubble: { backgroundColor: "#4a1f1f", borderColor: "#7f2f2f" },
-  messageText: { color: "#ece8e4", fontSize: 14 },
   questionCard: {
     borderWidth: 1,
     borderColor: "#3c332d",
@@ -1854,6 +1878,161 @@ const styles = StyleSheet.create({
   },
   actionIcon: { color: "#918880", fontSize: 15 },
   actionLabel: { color: "#ece8e4", fontSize: 13, fontWeight: "500" },
+});
+
+const markdownStyles = StyleSheet.create({
+  body: {
+    color: "#ece8e4",
+    fontSize: 14,
+    marginTop: 0,
+    marginBottom: 0,
+  },
+  paragraph: {
+    marginTop: 0,
+    marginBottom: 0,
+  },
+  text: {
+    color: "#ece8e4",
+  },
+  strong: {
+    color: "#f7f2ed",
+    fontWeight: "700",
+  },
+  em: {
+    fontStyle: "italic",
+  },
+  code_inline: {
+    color: "#e6ddd6",
+    backgroundColor: "#2a2521",
+    borderRadius: 4,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    fontSize: 12,
+  },
+  code_block: {
+    color: "#ddd4cd",
+    backgroundColor: "#151210",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#3a312b",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    fontSize: 12,
+  },
+  fence: {
+    color: "#ddd4cd",
+    backgroundColor: "#151210",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#3a312b",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    fontSize: 12,
+  },
+  link: {
+    color: "#8cbbe6",
+    textDecorationLine: "underline",
+  },
+  blockquote: {
+    borderLeftWidth: 2,
+    borderLeftColor: "#5c534d",
+    paddingLeft: 8,
+    marginTop: 2,
+    marginBottom: 2,
+  },
+  bullet_list: {
+    marginTop: 2,
+    marginBottom: 2,
+  },
+  ordered_list: {
+    marginTop: 2,
+    marginBottom: 2,
+  },
+  list_item: {
+    marginTop: 1,
+    marginBottom: 1,
+  },
+  heading1: {
+    color: "#f0e9e2",
+    fontSize: 20,
+    fontWeight: "700",
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  heading2: {
+    color: "#f0e9e2",
+    fontSize: 18,
+    fontWeight: "700",
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  heading3: {
+    color: "#ece8e4",
+    fontSize: 16,
+    fontWeight: "700",
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  heading4: {
+    color: "#ece8e4",
+    fontSize: 15,
+    fontWeight: "600",
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  heading5: {
+    color: "#d6cdc5",
+    fontSize: 14,
+    fontWeight: "600",
+    marginTop: 2,
+    marginBottom: 3,
+  },
+  heading6: {
+    color: "#c4b9b0",
+    fontSize: 13,
+    fontWeight: "600",
+    marginTop: 2,
+    marginBottom: 3,
+  },
+  hr: {
+    backgroundColor: "#3f3630",
+    height: 1,
+    marginVertical: 6,
+  },
+  table: {
+    borderWidth: 1,
+    borderColor: "#4a4038",
+    borderRadius: 6,
+    overflow: "hidden",
+    marginVertical: 4,
+  },
+  thead: {
+    backgroundColor: "#201a16",
+  },
+  tr: {
+    borderBottomWidth: 1,
+    borderBottomColor: "#3a312b",
+  },
+  th: {
+    color: "#f0e9e2",
+    fontSize: 12,
+    fontWeight: "700",
+    paddingHorizontal: 6,
+    paddingVertical: 5,
+    borderRightWidth: 1,
+    borderRightColor: "#3a312b",
+  },
+  td: {
+    color: "#ddd4cd",
+    fontSize: 12,
+    paddingHorizontal: 6,
+    paddingVertical: 5,
+    borderRightWidth: 1,
+    borderRightColor: "#3a312b",
+  },
 });
 
 export default App;
