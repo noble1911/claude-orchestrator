@@ -2850,6 +2850,99 @@ async fn get_agent_messages(
         .map_err(|e| format!("Failed to get messages: {}", e))
 }
 
+fn try_launch_editor(binary: &str, args: &[&str]) -> bool {
+    Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn open_workspace_in_vscode(path: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if try_launch_editor("open", &["-b", "com.microsoft.VSCode", path]) {
+            return true;
+        }
+        if try_launch_editor("open", &["-b", "com.microsoft.VSCodeInsiders", path]) {
+            return true;
+        }
+        if try_launch_editor("open", &["-a", "Visual Studio Code", path]) {
+            return true;
+        }
+    }
+
+    try_launch_editor("code", &[path])
+}
+
+fn open_workspace_in_intellij(path: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if try_launch_editor("open", &["-b", "com.jetbrains.intellij", path]) {
+            return true;
+        }
+        if try_launch_editor("open", &["-b", "com.jetbrains.intellij.ce", path]) {
+            return true;
+        }
+        if try_launch_editor("open", &["-a", "IntelliJ IDEA", path]) {
+            return true;
+        }
+        if try_launch_editor("open", &["-a", "IntelliJ IDEA CE", path]) {
+            return true;
+        }
+    }
+
+    if try_launch_editor("idea", &[path]) {
+        return true;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if try_launch_editor("idea64.exe", &[path]) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[tauri::command]
+async fn open_workspace_in_editor(
+    workspace_id: String,
+    editor: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let worktree_path = {
+        let workspaces = state.workspaces.read();
+        let workspace = workspaces
+            .get(&workspace_id)
+            .ok_or("Workspace not found")?;
+        workspace.worktree_path.clone()
+    };
+
+    let opened = match editor.trim().to_lowercase().as_str() {
+        "vscode" | "vs_code" | "code" => open_workspace_in_vscode(&worktree_path),
+        "intellij" | "idea" => open_workspace_in_intellij(&worktree_path),
+        _ => {
+            return Err(
+                "Unsupported editor. Use 'vscode' or 'intellij'.".to_string(),
+            );
+        }
+    };
+
+    if opened {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not open '{}' in {}. Ensure the editor is installed and available on this machine.",
+            worktree_path, editor
+        ))
+    }
+}
+
 #[tauri::command]
 async fn create_pull_request(
     workspace_id: String,
@@ -4975,6 +5068,7 @@ pub fn run() {
             interrupt_agent,
             send_message_to_agent,
             get_agent_messages,
+            open_workspace_in_editor,
             create_pull_request,
             sync_pr_statuses,
             list_workspace_files,

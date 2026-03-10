@@ -122,6 +122,7 @@ interface CenterTab {
 }
 
 type ClaudeMode = "normal" | "plan";
+type EditorKind = "vscode" | "intellij";
 
 interface ActivityLine {
   text: string;
@@ -1981,6 +1982,16 @@ function App() {
     }
   }
 
+  async function openCurrentWorkspaceInEditor(editor: EditorKind) {
+    if (!selectedWorkspace) return;
+    try {
+      await invoke("open_workspace_in_editor", { workspaceId: selectedWorkspace, editor });
+    } catch (err) {
+      const editorLabel = editor === "vscode" ? "VS Code" : "IntelliJ";
+      setError(`Failed to open workspace in ${editorLabel}: ${String(err)}`);
+    }
+  }
+
   function getDiffLineClass(line: string): string {
     if (line.startsWith("+++ ") || line.startsWith("--- ")) return "text-indigo-300";
     if (line.startsWith("+")) return "text-emerald-300";
@@ -2413,6 +2424,26 @@ function App() {
             {currentWorkspace && <span className="truncate md-label-large">{currentWorkspace.branch}</span>}
           </div>
           <div className="flex items-center gap-1">
+            {currentWorkspace && (
+              <>
+                <button
+                  onClick={() => void openCurrentWorkspaceInEditor("vscode")}
+                  className="md-btn md-btn-tonal !min-h-0 !px-2 !py-1 text-[11px]"
+                  title="Open current workspace in VS Code"
+                  aria-label="Open current workspace in VS Code"
+                >
+                  VS Code
+                </button>
+                <button
+                  onClick={() => void openCurrentWorkspaceInEditor("intellij")}
+                  className="md-btn md-btn-tonal !min-h-0 !px-2 !py-1 text-[11px]"
+                  title="Open current workspace in IntelliJ IDEA"
+                  aria-label="Open current workspace in IntelliJ IDEA"
+                >
+                  IntelliJ
+                </button>
+              </>
+            )}
             {currentWorkspace && workspaceAgents.length > 0 && (
               <button
                 onClick={() => stopAgent(workspaceAgents[0].id)}
@@ -2712,9 +2743,9 @@ function App() {
                           void sendMessage();
                         }
                       }}
-                      rows={2}
+                      rows={3}
                       placeholder="Ask to make changes... or /prompt name"
-                      className="w-full resize-none border-0 bg-transparent text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted"
+                      className="w-full resize-y border-0 bg-transparent text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted min-h-[72px]"
                     />
 
                     {attachedFiles.length > 0 && (
