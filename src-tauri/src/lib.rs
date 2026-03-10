@@ -2908,43 +2908,112 @@ async fn create_pull_request(
     Ok(pr_url)
 }
 
-/// Check PR status for all InReview workspaces using `gh pr view`.
-/// Returns a list of workspace IDs that transitioned to Merged.
+fn lookup_branch_pr_state(repo_path: &str, branch: &str) -> Option<(String, String)> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "url,state",
+            "--limit",
+            "1",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let items = serde_json::from_slice::<Vec<Value>>(&output.stdout).ok()?;
+    let first = items.first()?;
+    let url = first
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let state = first
+        .get("state")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_lowercase();
+    if url.is_empty() || state.is_empty() {
+        return None;
+    }
+    Some((url, state))
+}
+
+/// Sync workspace review state from GitHub PR state.
+/// - OPEN PR => InReview
+/// - MERGED PR => Merged
+/// Returns workspace IDs that transitioned to Merged.
 #[tauri::command]
 async fn sync_pr_statuses(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<String>, String> {
-    // Collect InReview workspaces with PR URLs
-    let to_check: Vec<(String, String, String)> = {
+    // Collect all non-merged workspaces and discover PRs by branch.
+    let to_check: Vec<(String, String, String, WorkspaceStatus, Option<String>)> = {
         let workspaces = state.workspaces.read();
         let repos = state.repositories.read();
         workspaces.values()
-            .filter(|ws| matches!(ws.status, WorkspaceStatus::InReview))
+            .filter(|ws| !matches!(ws.status, WorkspaceStatus::Merged))
             .filter_map(|ws| {
-                let pr_url = ws.pr_url.as_ref()?;
                 let repo = repos.get(&ws.repo_id)?;
-                Some((ws.id.clone(), pr_url.clone(), repo.path.clone()))
+                Some((
+                    ws.id.clone(),
+                    repo.path.clone(),
+                    ws.branch.clone(),
+                    ws.status.clone(),
+                    ws.pr_url.clone(),
+                ))
             })
             .collect()
     };
 
     let mut merged_ids = Vec::new();
-    for (ws_id, pr_url, repo_path) in to_check {
-        // gh pr view <url> --json state -q .state
-        let output = Command::new("gh")
-            .args(["pr", "view", &pr_url, "--json", "state", "-q", ".state"])
-            .current_dir(&repo_path)
-            .output();
-        if let Ok(output) = output {
-            let state_str = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
-            if state_str == "merged" {
+    for (ws_id, repo_path, branch, current_status, current_pr_url) in to_check {
+        let Some((pr_url, state_str)) = lookup_branch_pr_state(&repo_path, &branch) else {
+            continue;
+        };
+
+        if state_str == "open" {
+            let should_update = !matches!(current_status, WorkspaceStatus::InReview)
+                || current_pr_url.as_deref() != Some(pr_url.as_str());
+            if should_update {
+                {
+                    let mut workspaces = state.workspaces.write();
+                    if let Some(ws) = workspaces.get_mut(&ws_id) {
+                        ws.status = WorkspaceStatus::InReview;
+                        ws.pr_url = Some(pr_url.clone());
+                    }
+                }
+                let _ = state
+                    .db
+                    .update_workspace_pr_url(&ws_id, &pr_url, &WorkspaceStatus::InReview);
+            }
+            continue;
+        }
+
+        if state_str == "merged" {
+            let should_update = !matches!(current_status, WorkspaceStatus::Merged)
+                || current_pr_url.as_deref() != Some(pr_url.as_str());
+            if should_update {
                 {
                     let mut workspaces = state.workspaces.write();
                     if let Some(ws) = workspaces.get_mut(&ws_id) {
                         ws.status = WorkspaceStatus::Merged;
+                        ws.pr_url = Some(pr_url.clone());
                     }
                 }
-                let _ = state.db.update_workspace_status(&ws_id, &WorkspaceStatus::Merged, None);
+                let _ = state
+                    .db
+                    .update_workspace_pr_url(&ws_id, &pr_url, &WorkspaceStatus::Merged);
                 merged_ids.push(ws_id);
             }
         }

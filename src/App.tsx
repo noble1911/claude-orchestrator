@@ -784,20 +784,14 @@ function App() {
     terminalEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [terminalLinesByWorkspace, selectedWorkspace, isRunningTerminalCommand]);
 
-  // Periodically sync PR statuses for InReview workspaces
+  // Periodically sync workspace review states from GitHub PR state.
   useEffect(() => {
-    const hasInReview = workspaces.some((ws) => ws.status === "inReview");
-    if (!hasInReview) return;
+    const hasUnmerged = workspaces.some((ws) => ws.status !== "merged");
+    if (!hasUnmerged || !selectedRepo) return;
     const sync = async () => {
       try {
-        const mergedIds = await invoke<string[]>("sync_pr_statuses");
-        if (mergedIds.length > 0) {
-          setWorkspaces((prev) =>
-            prev.map((ws) =>
-              mergedIds.includes(ws.id) ? { ...ws, status: "merged" as const } : ws
-            )
-          );
-        }
+        await invoke<string[]>("sync_pr_statuses");
+        await loadWorkspaces(selectedRepo);
       } catch {
         // Silently ignore — gh CLI may not be available
       }
@@ -805,7 +799,7 @@ function App() {
     void sync();
     const interval = setInterval(() => void sync(), 60_000);
     return () => clearInterval(interval);
-  }, [workspaces.filter((ws) => ws.status === "inReview").length]);
+  }, [selectedRepo, workspaces.filter((ws) => ws.status !== "merged").length]);
 
   useEffect(() => {
     const onMouseMove = (event: MouseEvent) => {
