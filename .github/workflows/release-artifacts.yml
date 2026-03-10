@@ -293,6 +293,13 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: gradle
+          cache-dependency-path: |
+            mobile/android/**/*.gradle*
+            mobile/android/**/gradle-wrapper.properties
+            mobile/package-lock.json
+            mobile/package.json
+            mobile/app.json
 
       - name: Install mobile dependencies
         run: npm ci --prefix mobile
@@ -303,10 +310,13 @@ jobs:
         run: |
           TAG="${{ env.RELEASE_TAG }}"
           cd mobile
-          npx expo prebuild --platform android --non-interactive --clean
+          # Generate native Android project only when it is not already present.
+          if [ ! -d android ]; then
+            npx expo prebuild --platform android --non-interactive
+          fi
           cd android
           chmod +x ./gradlew
-          ./gradlew --no-daemon assembleRelease
+          ./gradlew --no-daemon --parallel --build-cache assembleRelease
 
           APK_PATH="app/build/outputs/apk/release/app-release.apk"
           if [ ! -f "$APK_PATH" ]; then
