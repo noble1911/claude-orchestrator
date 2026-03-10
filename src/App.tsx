@@ -2783,7 +2783,7 @@ function App() {
                     <span className="material-symbols-rounded text-amber-400 !text-xl mt-0.5">key</span>
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium text-amber-200">AWS credentials expired or invalid</div>
-                      <div className="text-xs text-amber-300/70 mt-0.5">Update your AWS credentials in the environment overrides, then retry your message.</div>
+                      <div className="text-xs text-amber-300/70 mt-0.5">Run `aws sso login` (or update environment overrides), then retry your message.</div>
                     </div>
                     <button
                       type="button"
@@ -3339,7 +3339,7 @@ function App() {
                   onChange={(e) => setEnvOverridesText(e.target.value)}
                   rows={6}
                   className="md-field font-mono"
-                  placeholder={"export CLAUDE_CODE_USE_BEDROCK=1\nexport AWS_PROFILE=your-profile"}
+                  placeholder={"export CLAUDE_CODE_USE_BEDROCK=1\n# optional if not using default profile\nexport AWS_PROFILE=your-profile"}
                 />
               </div>
             </div>

@@ -993,6 +993,43 @@ fn env_truthy(value: Option<&String>) -> bool {
     }
 }
 
+fn env_nonempty(env_map: &HashMap<String, String>, key: &str) -> bool {
+    env_map
+        .get(key)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn aws_shared_profile_exists(profile: &str) -> bool {
+    let home = match std::env::var("HOME") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return false,
+    };
+
+    let aws_dir = PathBuf::from(home).join(".aws");
+    let candidates = [aws_dir.join("config"), aws_dir.join("credentials")];
+    let profile_header = format!("[{}]", profile);
+    let config_profile_header = format!("[profile {}]", profile);
+
+    for candidate in candidates {
+        let content = match std::fs::read_to_string(candidate) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.eq_ignore_ascii_case(&profile_header)
+                || trimmed.eq_ignore_ascii_case(&config_profile_header)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn build_effective_cli_env(env_overrides: &HashMap<String, String>) -> HashMap<String, String> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut env_map = load_cli_shell_env();
@@ -1015,6 +1052,23 @@ fn build_effective_cli_env(env_overrides: &HashMap<String, String>) -> HashMap<S
     for (key, value) in env_overrides {
         if !key.trim().is_empty() {
             env_map.insert(key.clone(), value.clone());
+        }
+    }
+
+    // Bedrock with AWS SSO typically relies on shared config files in ~/.aws.
+    // Ensure the SDK config chain is enabled and fall back to `default` profile
+    // when static keys/profile env vars are not explicitly provided.
+    if env_truthy(env_map.get("CLAUDE_CODE_USE_BEDROCK")) {
+        if !env_nonempty(&env_map, "AWS_SDK_LOAD_CONFIG") {
+            env_map.insert("AWS_SDK_LOAD_CONFIG".to_string(), "1".to_string());
+        }
+
+        let has_profile_env =
+            env_nonempty(&env_map, "AWS_PROFILE") || env_nonempty(&env_map, "AWS_DEFAULT_PROFILE");
+        let has_static_keys =
+            env_nonempty(&env_map, "AWS_ACCESS_KEY_ID") && env_nonempty(&env_map, "AWS_SECRET_ACCESS_KEY");
+        if !has_profile_env && !has_static_keys && aws_shared_profile_exists("default") {
+            env_map.insert("AWS_PROFILE".to_string(), "default".to_string());
         }
     }
 
@@ -1046,24 +1100,31 @@ fn configure_cli_env(cmd: &mut Command, env_map: &HashMap<String, String>) {
 
 fn auth_env_feedback(env_map: &HashMap<String, String>) -> (String, Option<String>) {
     let bedrock = env_truthy(env_map.get("CLAUDE_CODE_USE_BEDROCK"));
-    let aws_key = env_map.get("AWS_ACCESS_KEY_ID").map(|v| !v.trim().is_empty()).unwrap_or(false);
-    let aws_secret = env_map.get("AWS_SECRET_ACCESS_KEY").map(|v| !v.trim().is_empty()).unwrap_or(false);
-    let aws_session = env_map.get("AWS_SESSION_TOKEN").map(|v| !v.trim().is_empty()).unwrap_or(false);
-    let aws_profile = env_map.get("AWS_PROFILE").map(|v| !v.trim().is_empty()).unwrap_or(false);
-    let anthropic_key = env_map
-        .get("ANTHROPIC_API_KEY")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
+    let aws_key = env_nonempty(env_map, "AWS_ACCESS_KEY_ID");
+    let aws_secret = env_nonempty(env_map, "AWS_SECRET_ACCESS_KEY");
+    let aws_session = env_nonempty(env_map, "AWS_SESSION_TOKEN");
+    let aws_profile = env_nonempty(env_map, "AWS_PROFILE");
+    let aws_default_profile = env_nonempty(env_map, "AWS_DEFAULT_PROFILE");
+    let aws_default_profile_config = aws_shared_profile_exists("default");
+    let anthropic_key = env_nonempty(env_map, "ANTHROPIC_API_KEY");
+    let has_profile_chain = aws_profile || aws_default_profile || aws_default_profile_config;
 
     let summary = format!(
-        "env mode: bedrock={}, aws_key={}, aws_secret={}, aws_session={}, aws_profile={}, anthropic_key={}",
-        bedrock, aws_key, aws_secret, aws_session, aws_profile, anthropic_key
+        "env mode: bedrock={}, aws_key={}, aws_secret={}, aws_session={}, aws_profile={}, aws_default_profile={}, aws_default_profile_config={}, anthropic_key={}",
+        bedrock,
+        aws_key,
+        aws_secret,
+        aws_session,
+        aws_profile,
+        aws_default_profile,
+        aws_default_profile_config,
+        anthropic_key
     );
 
     let hint = if bedrock {
-        if !(aws_profile || (aws_key && aws_secret)) {
+        if !(has_profile_chain || (aws_key && aws_secret)) {
             Some(
-                "Bedrock mode is enabled but AWS credentials are missing. Set AWS_PROFILE or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY."
+                "Bedrock mode is enabled but no AWS auth chain was detected. Run `aws sso login` for your profile (or default), or set AWS_PROFILE / AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY."
                     .to_string(),
             )
         } else {
@@ -1220,11 +1281,11 @@ fn extract_http_status_code(text: &str) -> Option<u16> {
 fn credential_error_message(details: &str) -> String {
     if let Some(status) = extract_http_status_code(details) {
         format!(
-            "AWS authentication failed (HTTP {}). Your credentials appear invalid or expired. Update your environment in the Setup tab.",
+            "AWS authentication failed (HTTP {}). Your credentials appear invalid or expired. Run `aws sso login` for your profile, or update environment overrides in Setup.",
             status
         )
     } else {
-        "AWS authentication failed. Your credentials appear invalid or expired. Update your environment in the Setup tab.".to_string()
+        "AWS authentication failed. Your credentials appear invalid or expired. Run `aws sso login` for your profile, or update environment overrides in Setup.".to_string()
     }
 }
 
