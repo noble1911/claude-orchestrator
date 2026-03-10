@@ -49,6 +49,39 @@ jobs:
 
           echo "RELEASE_PUBLISHED_AT=$PUBLISHED_AT" >> "$GITHUB_ENV"
 
+      - name: Sync desktop app version from release tag
+        run: |
+          set -euo pipefail
+
+          VERSION="${RELEASE_TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::RELEASE_TAG '$RELEASE_TAG' does not map to a valid semantic version."
+            exit 1
+          fi
+
+          echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          awk -v version="$VERSION" '
+            BEGIN { updated = 0 }
+            !updated && /^version = "/ {
+              print "version = \"" version "\""
+              updated = 1
+              next
+            }
+            { print }
+            END {
+              if (!updated) {
+                exit 1
+              }
+            }
+          ' src-tauri/Cargo.toml > src-tauri/Cargo.toml.tmp
+          mv src-tauri/Cargo.toml.tmp src-tauri/Cargo.toml
+
+          jq --arg version "$VERSION" '.version = $version' src-tauri/tauri.conf.json > src-tauri/tauri.conf.json.tmp
+          mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
+
+          echo "Desktop build version set to $VERSION from tag $RELEASE_TAG"
+
       - name: Require public release mirror token
         run: |
           if [ -z "${PUBLIC_RELEASES_TOKEN:-}" ]; then
@@ -212,7 +245,7 @@ jobs:
             UPDATER_SIG_CONTENT="$(cat "release-assets/$UPDATER_SIG_FILE")"
             UPDATER_DOWNLOAD_URL="${RELEASE_URL_BASE}/${UPDATER_FILE}"
             UPDATE_TARGET="${TARGET_BASE}"
-            UPDATE_VERSION="${TAG#v}"
+            UPDATE_VERSION="${APP_VERSION:-${TAG#v}}"
             UPDATE_PUB_DATE="${{ env.RELEASE_PUBLISHED_AT }}"
             jq -n \
               --arg version "$UPDATE_VERSION" \
@@ -273,6 +306,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref }}
+
+      - name: Sync mobile app version from release tag
+        run: |
+          set -euo pipefail
+
+          VERSION="${RELEASE_TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::RELEASE_TAG '$RELEASE_TAG' does not map to a valid semantic version."
+            exit 1
+          fi
+
+          echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          jq --arg version "$VERSION" '.expo.version = $version' mobile/app.json > mobile/app.json.tmp
+          mv mobile/app.json.tmp mobile/app.json
+
+          echo "Mobile build version set to $VERSION from tag $RELEASE_TAG"
 
       - name: Require public release mirror token
         run: |
