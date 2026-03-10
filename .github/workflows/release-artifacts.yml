@@ -21,6 +21,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.event.release.tag_name }}
       PUBLIC_RELEASE_REPOSITORY: noble1911/claude-orchestrator-releases
+      PUBLIC_RELEASES_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,10 +50,11 @@ jobs:
           echo "RELEASE_PUBLISHED_AT=$PUBLISHED_AT" >> "$GITHUB_ENV"
 
       - name: Require public release mirror token
-        if: ${{ secrets.PUBLIC_RELEASES_TOKEN == '' }}
         run: |
-          echo "::error::PUBLIC_RELEASES_TOKEN secret is required to publish public release artifacts."
-          exit 1
+          if [ -z "${PUBLIC_RELEASES_TOKEN:-}" ]; then
+            echo "::error::PUBLIC_RELEASES_TOKEN secret is required to publish public release artifacts."
+            exit 1
+          fi
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -257,7 +259,7 @@ jobs:
             release-assets/Claude-Orchestrator-${{ env.RELEASE_TAG }}-macos-updater.tar.gz.sig
             release-assets/latest.json
         env:
-          GITHUB_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
+          GITHUB_TOKEN: ${{ env.PUBLIC_RELEASES_TOKEN }}
 
   mobile_release:
     name: Build Mobile Release Artifact (Android APK)
@@ -265,6 +267,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.event.release.tag_name }}
       PUBLIC_RELEASE_REPOSITORY: noble1911/claude-orchestrator-releases
+      PUBLIC_RELEASES_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -272,10 +275,11 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref }}
 
       - name: Require public release mirror token
-        if: ${{ secrets.PUBLIC_RELEASES_TOKEN == '' }}
         run: |
-          echo "::error::PUBLIC_RELEASES_TOKEN secret is required to publish public release artifacts."
-          exit 1
+          if [ -z "${PUBLIC_RELEASES_TOKEN:-}" ]; then
+            echo "::error::PUBLIC_RELEASES_TOKEN secret is required to publish public release artifacts."
+            exit 1
+          fi
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -326,4 +330,4 @@ jobs:
           files: |
             Claude-Orchestrator-${{ env.RELEASE_TAG }}-android.apk
         env:
-          GITHUB_TOKEN: ${{ secrets.PUBLIC_RELEASES_TOKEN }}
+          GITHUB_TOKEN: ${{ env.PUBLIC_RELEASES_TOKEN }}
