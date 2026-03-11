@@ -7,12 +7,23 @@ import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import {
-  THEME_OPTIONS,
+  COLOR_TOKEN_KEYS,
+  DEFAULT_THEME_ID,
   THEME_STORAGE_KEY,
+  THEME_COLOR_FIELDS,
+  type ThemeColorTokenKey,
+  type ThemeDefinition,
+  type ThemeMap,
   applyTheme,
+  createThemeId,
+  getAllThemes,
   getStoredThemeId,
+  getThemeOptions,
+  isBuiltInTheme,
+  isHexColor,
+  loadCustomThemes,
   normalizeThemeId,
-  type ThemeId,
+  saveCustomThemes,
 } from "./themes";
 
 interface Repository {
@@ -177,6 +188,14 @@ interface QuestionItem {
 
 interface AskUserQuestionPayload {
   questions: QuestionItem[];
+}
+
+interface ThemeDraft {
+  label: string;
+  description: string;
+  rootText: string;
+  rootBackground: string;
+  colors: Record<ThemeColorTokenKey, string>;
 }
 
 type ChatRow =
@@ -374,6 +393,24 @@ const MODEL_STORAGE_KEY = "claude_orchestrator_model";
 const THINKING_MODE_STORAGE_KEY = "claude_orchestrator_thinking_mode";
 const DEFAULT_REPOSITORY_STORAGE_KEY = "claude_orchestrator_default_repository";
 const BEDROCK_ENV_KEY = "CLAUDE_CODE_USE_BEDROCK";
+
+function cloneThemeColors(source: Record<ThemeColorTokenKey, string>): Record<ThemeColorTokenKey, string> {
+  const colors = {} as Record<ThemeColorTokenKey, string>;
+  for (const key of COLOR_TOKEN_KEYS) {
+    colors[key] = source[key];
+  }
+  return colors;
+}
+
+function createThemeDraftFromTheme(theme: ThemeDefinition): ThemeDraft {
+  return {
+    label: theme.label,
+    description: theme.description,
+    rootText: theme.rootText,
+    rootBackground: theme.rootBackground,
+    colors: cloneThemeColors(theme.colors),
+  };
+}
 
 function isTruthyEnvValue(value: string | undefined): boolean {
   if (!value) return false;
@@ -666,7 +703,18 @@ function App() {
   const [skillRelativePathDraft, setSkillRelativePathDraft] = useState<string | null>(null);
   const [skillNameDraft, setSkillNameDraft] = useState("");
   const [skillBodyDraft, setSkillBodyDraft] = useState("");
-  const [selectedTheme, setSelectedTheme] = useState<ThemeId>(() => getStoredThemeId());
+  const [customThemes, setCustomThemes] = useState<ThemeMap>(() => loadCustomThemes());
+  const [selectedTheme, setSelectedTheme] = useState<string>(() => {
+    const themes = getAllThemes(loadCustomThemes());
+    return getStoredThemeId(themes);
+  });
+  const [showThemeForm, setShowThemeForm] = useState(false);
+  const [editingThemeId, setEditingThemeId] = useState<string | null>(null);
+  const [themeDraft, setThemeDraft] = useState<ThemeDraft>(() => {
+    const themes = getAllThemes(loadCustomThemes());
+    const baseTheme = themes[DEFAULT_THEME_ID];
+    return createThemeDraftFromTheme(baseTheme);
+  });
   const [envOverridesText, setEnvOverridesText] = useState("");
   const [claudeMode, setClaudeMode] = useState<ClaudeMode>("normal");
   const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
@@ -709,6 +757,8 @@ function App() {
     [envOverridesText],
   );
   const allSkills = useMemo(() => [...projectSkills, ...userSkills], [projectSkills, userSkills]);
+  const availableThemes = useMemo(() => getAllThemes(customThemes), [customThemes]);
+  const themeOptions = useMemo(() => getThemeOptions(availableThemes), [availableThemes]);
 
   useEffect(() => {
     selectedWorkspaceRef.current = selectedWorkspace;
@@ -968,13 +1018,22 @@ function App() {
   }, [promptShortcuts]);
 
   useEffect(() => {
-    applyTheme(selectedTheme);
+    saveCustomThemes(customThemes);
+  }, [customThemes]);
+
+  useEffect(() => {
+    const normalizedTheme = normalizeThemeId(selectedTheme, availableThemes);
+    if (normalizedTheme !== selectedTheme) {
+      setSelectedTheme(normalizedTheme);
+      return;
+    }
+    applyTheme(normalizedTheme, availableThemes);
     try {
-      localStorage.setItem(THEME_STORAGE_KEY, selectedTheme);
+      localStorage.setItem(THEME_STORAGE_KEY, normalizedTheme);
     } catch (err) {
       console.error("Failed to persist theme selection:", err);
     }
-  }, [selectedTheme]);
+  }, [availableThemes, selectedTheme]);
 
   useEffect(() => {
     try {
@@ -1623,6 +1682,88 @@ function App() {
     const command = trimmedArgs ? `/${skill.commandName} ${trimmedArgs}` : `/${skill.commandName}`;
     const payload = formatSkillExecutionPrompt(skill, trimmedArgs);
     await sendMessage(payload, command);
+  }
+
+  function openCreateThemeForm() {
+    const baseTheme = availableThemes[selectedTheme] ?? availableThemes[DEFAULT_THEME_ID];
+    if (!baseTheme) return;
+    setEditingThemeId(null);
+    setThemeDraft({
+      ...createThemeDraftFromTheme(baseTheme),
+      label: `${baseTheme.label} copy`,
+      description: `Custom theme based on ${baseTheme.label}.`,
+    });
+    setShowThemeForm(true);
+  }
+
+  function openEditThemeForm() {
+    const currentTheme = availableThemes[selectedTheme];
+    if (!currentTheme || isBuiltInTheme(currentTheme.id)) {
+      return;
+    }
+    setEditingThemeId(currentTheme.id);
+    setThemeDraft(createThemeDraftFromTheme(currentTheme));
+    setShowThemeForm(true);
+  }
+
+  function closeThemeForm() {
+    setShowThemeForm(false);
+    setEditingThemeId(null);
+  }
+
+  function updateThemeDraftColor(token: ThemeColorTokenKey, value: string) {
+    setThemeDraft((prev) => ({
+      ...prev,
+      colors: {
+        ...prev.colors,
+        [token]: value,
+      },
+    }));
+  }
+
+  function saveThemeDraft() {
+    const label = themeDraft.label.trim();
+    if (!label) {
+      setError("Theme name is required.");
+      return;
+    }
+    if (!isHexColor(themeDraft.rootText) || !isHexColor(themeDraft.rootBackground)) {
+      setError("Root colors must be valid hex values like #1a2b3c.");
+      return;
+    }
+    for (const token of COLOR_TOKEN_KEYS) {
+      if (!isHexColor(themeDraft.colors[token])) {
+        setError(`Invalid color for ${token}. Use hex format like #1a2b3c.`);
+        return;
+      }
+    }
+
+    const id = editingThemeId ?? createThemeId(label, availableThemes);
+    const nextTheme: ThemeDefinition = {
+      id,
+      label,
+      description: themeDraft.description.trim() || `Custom theme: ${label}`,
+      rootText: themeDraft.rootText,
+      rootBackground: themeDraft.rootBackground,
+      colors: cloneThemeColors(themeDraft.colors),
+    };
+
+    setCustomThemes((prev) => ({
+      ...prev,
+      [id]: nextTheme,
+    }));
+    setSelectedTheme(id);
+    closeThemeForm();
+  }
+
+  function deleteSelectedCustomTheme() {
+    if (isBuiltInTheme(selectedTheme)) return;
+    setCustomThemes((prev) => {
+      const next = { ...prev };
+      delete next[selectedTheme];
+      return next;
+    });
+    setSelectedTheme(DEFAULT_THEME_ID);
   }
 
   function parseEnvOverrides(raw: string): Record<string, string> {
@@ -3680,23 +3821,54 @@ function App() {
               <div className="border-t md-outline pt-3">
                 <p className="md-text-dim">Theme</p>
                 <div className="mt-2 space-y-2">
-                  <select
-                    value={selectedTheme}
-                    onChange={(event) => setSelectedTheme(normalizeThemeId(event.target.value))}
-                    className="md-select !min-h-0"
-                    aria-label="Theme selection"
-                  >
-                    {THEME_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={selectedTheme}
+                      onChange={(event) => setSelectedTheme(normalizeThemeId(event.target.value, availableThemes))}
+                      className="md-select !min-h-0"
+                      aria-label="Theme selection"
+                    >
+                      {themeOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={openCreateThemeForm}
+                      className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle"
+                      title="Create theme"
+                      aria-label="Create theme"
+                    >
+                      <span className="material-symbols-rounded !text-[18px]">add</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={openEditThemeForm}
+                      disabled={isBuiltInTheme(selectedTheme)}
+                      className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle disabled:cursor-not-allowed disabled:opacity-40"
+                      title={isBuiltInTheme(selectedTheme) ? "Only custom themes are editable" : "Edit theme"}
+                      aria-label="Edit theme"
+                    >
+                      <span className="material-symbols-rounded !text-[16px]">edit</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={deleteSelectedCustomTheme}
+                      disabled={isBuiltInTheme(selectedTheme)}
+                      className="md-icon-plain md-icon-plain-danger !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle disabled:cursor-not-allowed disabled:opacity-40"
+                      title={isBuiltInTheme(selectedTheme) ? "Built-in themes cannot be deleted" : "Delete custom theme"}
+                      aria-label="Delete custom theme"
+                    >
+                      <span className="material-symbols-rounded !text-[16px]">delete</span>
+                    </button>
+                  </div>
                   <p className="text-[11px] md-text-muted">
-                    {THEME_OPTIONS.find((option) => option.value === selectedTheme)?.description}
+                    {themeOptions.find((option) => option.value === selectedTheme)?.description}
                   </p>
                   <p className="text-[11px] md-text-muted">
-                    Add or adjust theme palettes in `src/themes.ts`.
+                    Use + to create themes from the app. Built-ins stay unchanged.
                   </p>
                 </div>
               </div>
@@ -4080,6 +4252,118 @@ function App() {
                 className="md-btn md-btn-tonal disabled:opacity-50"
               >
                 {editingSkillId ? "Save Skill" : "Add Skill"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showThemeForm && (
+        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
+          <div className="md-dialog mx-4 w-full max-w-2xl">
+            <div className="border-b md-outline p-4">
+              <h3 className="text-lg font-semibold md-text-strong">
+                {editingThemeId ? "Edit Theme" : "Create Theme"}
+              </h3>
+              <p className="mt-1 text-sm md-text-muted">
+                Configure palette colors and save as a reusable custom theme.
+              </p>
+            </div>
+
+            <div className="space-y-4 p-4">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="mb-1 block text-sm font-medium md-text-secondary">Theme name</label>
+                  <input
+                    type="text"
+                    value={themeDraft.label}
+                    onChange={(event) => setThemeDraft((prev) => ({ ...prev, label: event.target.value }))}
+                    className="md-field"
+                    placeholder="e.g. Solarized Dark"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-sm font-medium md-text-secondary">Description</label>
+                  <input
+                    type="text"
+                    value={themeDraft.description}
+                    onChange={(event) => setThemeDraft((prev) => ({ ...prev, description: event.target.value }))}
+                    className="md-field"
+                    placeholder="Short note shown in theme picker"
+                  />
+                </div>
+              </div>
+
+              <div className="rounded-lg border md-outline p-3">
+                <p className="mb-2 text-xs font-medium uppercase tracking-wide md-text-muted">Root Colors</p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <label className="flex items-center gap-2 text-xs md-text-muted">
+                    <span className="w-28">Root text</span>
+                    <input
+                      type="color"
+                      value={themeDraft.rootText}
+                      onChange={(event) => setThemeDraft((prev) => ({ ...prev, rootText: event.target.value }))}
+                      className="h-8 w-10 rounded border md-outline bg-transparent p-0"
+                    />
+                    <input
+                      type="text"
+                      value={themeDraft.rootText}
+                      onChange={(event) => setThemeDraft((prev) => ({ ...prev, rootText: event.target.value }))}
+                      className="md-field !min-h-0 h-8 font-mono text-xs"
+                    />
+                  </label>
+                  <label className="flex items-center gap-2 text-xs md-text-muted">
+                    <span className="w-28">Root background</span>
+                    <input
+                      type="color"
+                      value={themeDraft.rootBackground}
+                      onChange={(event) =>
+                        setThemeDraft((prev) => ({ ...prev, rootBackground: event.target.value }))
+                      }
+                      className="h-8 w-10 rounded border md-outline bg-transparent p-0"
+                    />
+                    <input
+                      type="text"
+                      value={themeDraft.rootBackground}
+                      onChange={(event) =>
+                        setThemeDraft((prev) => ({ ...prev, rootBackground: event.target.value }))
+                      }
+                      className="md-field !min-h-0 h-8 font-mono text-xs"
+                    />
+                  </label>
+                </div>
+              </div>
+
+              <div className="rounded-lg border md-outline p-3">
+                <p className="mb-2 text-xs font-medium uppercase tracking-wide md-text-muted">Material Tokens</p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {THEME_COLOR_FIELDS.map((field) => (
+                    <label key={field.key} className="flex items-center gap-2 text-xs md-text-muted">
+                      <span className="w-36 truncate">{field.label}</span>
+                      <input
+                        type="color"
+                        value={themeDraft.colors[field.key]}
+                        onChange={(event) => updateThemeDraftColor(field.key, event.target.value)}
+                        className="h-8 w-10 rounded border md-outline bg-transparent p-0"
+                      />
+                      <input
+                        type="text"
+                        value={themeDraft.colors[field.key]}
+                        onChange={(event) => updateThemeDraftColor(field.key, event.target.value)}
+                        className="md-field !min-h-0 h-8 font-mono text-xs"
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 border-t md-outline p-4">
+              <button onClick={closeThemeForm} className="md-btn">
+                Cancel
+              </button>
+              <button onClick={saveThemeDraft} className="md-btn md-btn-tonal">
+                {editingThemeId ? "Save Theme" : "Create Theme"}
               </button>
             </div>
           </div>
