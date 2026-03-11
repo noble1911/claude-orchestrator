@@ -237,6 +237,36 @@ function isAssistantStreamingMessage(message: AgentMessage): boolean {
   return (message.role ?? "") === "assistant" && !message.isError;
 }
 
+function shouldAppendAssistantCheckpoint(previousContent: string, nextContent: string): boolean {
+  const previous = previousContent.replace(/\r\n/g, "\n");
+  const next = nextContent.replace(/\r\n/g, "\n");
+  if (!next.trim() || next === previous) {
+    return false;
+  }
+
+  // If Claude rewrites/shortens the draft, keep both versions visible.
+  if (next.length <= previous.length) {
+    return true;
+  }
+
+  const addedLength = next.length - previous.length;
+  const previousNewlines = (previous.match(/\n/g) || []).length;
+  const nextNewlines = (next.match(/\n/g) || []).length;
+  const previousFenceCount = (previous.match(/```/g) || []).length;
+  const nextFenceCount = (next.match(/```/g) || []).length;
+
+  if (nextNewlines > previousNewlines && addedLength >= 12) {
+    return true;
+  }
+  if (/[.!?]\s*$/.test(next) && addedLength >= 24) {
+    return true;
+  }
+  if (nextFenceCount > previousFenceCount) {
+    return true;
+  }
+  return addedLength >= 160;
+}
+
 function upsertMessageByIdentity(messages: AgentMessage[], incoming: AgentMessage): AgentMessage[] {
   const key = messageIdentity(incoming);
   let existingIndex = -1;
@@ -259,6 +289,9 @@ function upsertMessageByIdentity(messages: AgentMessage[], incoming: AgentMessag
   }
 
   if (isAssistantStreamingMessage(existing) && isAssistantStreamingMessage(incoming)) {
+    if (shouldAppendAssistantCheckpoint(existing.content, incoming.content)) {
+      return [...messages, incoming];
+    }
     const next = [...messages];
     next[existingIndex] = incoming;
     return next;
@@ -851,12 +884,15 @@ function App() {
   const [terminalHistoryIndex, setTerminalHistoryIndex] = useState<number | null>(null);
   const [terminalLinesByWorkspace, setTerminalLinesByWorkspace] = useState<Record<string, TerminalLine[]>>({});
   const [unreadByWorkspace, setUnreadByWorkspace] = useState<Record<string, number>>({});
+  const [pendingUnreadByWorkspace, setPendingUnreadByWorkspace] = useState<Record<string, boolean>>({});
   const [isRunningTerminalCommand, setIsRunningTerminalCommand] = useState(false);
   const [isTogglingRemoteServer, setIsTogglingRemoteServer] = useState(false);
   const [terminalTab, setTerminalTab] = useState<"setup" | "remote" | "terminal">("terminal");
   const [pendingAutoPromptsByWorkspace, setPendingAutoPromptsByWorkspace] = useState<Record<string, PromptShortcut[]>>({});
   const startingWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const selectedWorkspaceRef = useRef<string | null>(null);
+  const thinkingSinceByWorkspaceRef = useRef<Record<string, number | null>>({});
+  const pendingUnreadByWorkspaceRef = useRef<Record<string, boolean>>({});
   const detectedPrUrlByWorkspaceRef = useRef<Record<string, string>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
@@ -872,6 +908,14 @@ function App() {
   useEffect(() => {
     selectedWorkspaceRef.current = selectedWorkspace;
   }, [selectedWorkspace]);
+
+  useEffect(() => {
+    thinkingSinceByWorkspaceRef.current = thinkingSinceByWorkspace;
+  }, [thinkingSinceByWorkspace]);
+
+  useEffect(() => {
+    pendingUnreadByWorkspaceRef.current = pendingUnreadByWorkspace;
+  }, [pendingUnreadByWorkspace]);
 
   function normalizeUpdateErrorMessage(rawError: string): string {
     const message = rawError.trim();
@@ -915,10 +959,20 @@ function App() {
         selectedWorkspaceRef.current !== messageWorkspaceId &&
         isUnreadCandidateMessage(event.payload)
       ) {
-        setUnreadByWorkspace((prev) => ({
-          ...prev,
-          [messageWorkspaceId]: (prev[messageWorkspaceId] || 0) + 1,
-        }));
+        const isWorkspaceRunning = (thinkingSinceByWorkspaceRef.current[messageWorkspaceId] ?? null) !== null;
+        if (isWorkspaceRunning) {
+          setPendingUnreadByWorkspace((prev) => {
+            if (prev[messageWorkspaceId]) return prev;
+            const next = { ...prev, [messageWorkspaceId]: true };
+            pendingUnreadByWorkspaceRef.current = next;
+            return next;
+          });
+        } else {
+          setUnreadByWorkspace((prev) => ({
+            ...prev,
+            [messageWorkspaceId]: (prev[messageWorkspaceId] || 0) + 1,
+          }));
+        }
       }
       if (event.payload.role === "credential_error" && messageWorkspaceId) {
         setCredentialErrorWorkspaces((prev) => new Set(prev).add(messageWorkspaceId));
@@ -954,11 +1008,42 @@ function App() {
           if (current !== null) return prev;
           const parsedTimestamp = Date.parse(timestamp);
           const startedAt = Number.isFinite(parsedTimestamp) ? parsedTimestamp : Date.now();
-          return { ...prev, [workspaceId]: startedAt };
+          const next = { ...prev, [workspaceId]: startedAt };
+          thinkingSinceByWorkspaceRef.current = next;
+          return next;
         }
         if (current === null) return prev;
-        return { ...prev, [workspaceId]: null };
+        const next = { ...prev, [workspaceId]: null };
+        thinkingSinceByWorkspaceRef.current = next;
+        return next;
       });
+
+      if (running) {
+        return;
+      }
+      if (selectedWorkspaceRef.current === workspaceId) {
+        setPendingUnreadByWorkspace((prev) => {
+          if (!prev[workspaceId]) return prev;
+          const next = { ...prev };
+          delete next[workspaceId];
+          pendingUnreadByWorkspaceRef.current = next;
+          return next;
+        });
+        return;
+      }
+      if (pendingUnreadByWorkspaceRef.current[workspaceId]) {
+        setUnreadByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: (prev[workspaceId] || 0) + 1,
+        }));
+        setPendingUnreadByWorkspace((prev) => {
+          if (!prev[workspaceId]) return prev;
+          const next = { ...prev };
+          delete next[workspaceId];
+          pendingUnreadByWorkspaceRef.current = next;
+          return next;
+        });
+      }
     });
     const unlistenClients = listen<number>("remote-clients-updated", (event) => {
       setServerStatus((prev) => {
@@ -1018,6 +1103,13 @@ function App() {
         delete next[selectedWorkspace];
         return next;
       });
+      setPendingUnreadByWorkspace((prev) => {
+        if (!prev[selectedWorkspace]) return prev;
+        const next = { ...prev };
+        delete next[selectedWorkspace];
+        pendingUnreadByWorkspaceRef.current = next;
+        return next;
+      });
     } else {
       setMessages([]);
     }
@@ -1036,6 +1128,22 @@ function App() {
         }
       }
       return changed ? next : prev;
+    });
+    setPendingUnreadByWorkspace((prev) => {
+      let changed = false;
+      const next: Record<string, boolean> = {};
+      for (const [workspaceId, pending] of Object.entries(prev)) {
+        if (validWorkspaceIds.has(workspaceId) && pending) {
+          next[workspaceId] = true;
+        } else {
+          changed = true;
+        }
+      }
+      if (changed) {
+        pendingUnreadByWorkspaceRef.current = next;
+        return next;
+      }
+      return prev;
     });
   }, [workspaces]);
 
