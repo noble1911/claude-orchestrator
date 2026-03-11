@@ -118,6 +118,15 @@ pub struct AgentMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentRunStateEvent {
+    pub workspace_id: String,
+    pub agent_id: String,
+    pub running: bool,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceFileEntry {
     pub name: String,
     pub path: String,
@@ -1588,6 +1597,34 @@ fn emit_agent_message(
     );
 }
 
+fn emit_agent_run_state(
+    app: &tauri::AppHandle,
+    ws_server: &Option<Arc<WebSocketServer>>,
+    workspace_id: &str,
+    agent_id: &str,
+    running: bool,
+) {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let event = AgentRunStateEvent {
+        workspace_id: workspace_id.to_string(),
+        agent_id: agent_id.to_string(),
+        running,
+        timestamp: timestamp.clone(),
+    };
+    let _ = app.emit("agent-run-state", event.clone());
+    if let Some(ws) = ws_server {
+        ws.broadcast_to_workspace(
+            workspace_id,
+            &WsResponse::AgentRunState {
+                workspace_id: workspace_id.to_string(),
+                agent_id: agent_id.to_string(),
+                running,
+                timestamp,
+            },
+        );
+    }
+}
+
 fn summarize_tool_call(tool_name: &str, input_json: &str) -> Option<String> {
     let parsed = serde_json::from_str::<Value>(input_json).ok();
     let lower = tool_name.to_lowercase();
@@ -2240,6 +2277,13 @@ async fn send_message_to_agent(
     let requested_effort = normalize_effort(effort.as_deref()).map(str::to_string);
 
     std::thread::spawn(move || {
+        emit_agent_run_state(
+            &app,
+            &ws_server,
+            &workspace_id,
+            &agent_id_clone,
+            true,
+        );
         let effective_env = build_effective_cli_env(&env_overrides);
         let claude_path = match find_claude_cli_with_env(Some(&effective_env)) {
             Some(p) => p,
@@ -2263,6 +2307,13 @@ async fn send_message_to_agent(
                         timestamp: msg.timestamp,
                     });
                 }
+                emit_agent_run_state(
+                    &app,
+                    &ws_server,
+                    &workspace_id,
+                    &agent_id_clone,
+                    false,
+                );
                 return;
             }
         };
@@ -2343,6 +2394,13 @@ async fn send_message_to_agent(
                         "error",
                     );
                 }
+                emit_agent_run_state(
+                    &app,
+                    &ws_server,
+                    &workspace_id,
+                    &agent_id_clone,
+                    false,
+                );
                 return;
             }
         };
@@ -2647,6 +2705,13 @@ async fn send_message_to_agent(
                     true,
                     "error",
                 );
+                emit_agent_run_state(
+                    &app,
+                    &ws_server,
+                    &workspace_id,
+                    &agent_id_clone,
+                    false,
+                );
                 return;
             }
         };
@@ -2889,6 +2954,13 @@ async fn send_message_to_agent(
                 }
             }
         }
+        emit_agent_run_state(
+            &app,
+            &ws_server,
+            &workspace_id,
+            &agent_id_clone,
+            false,
+        );
     });
 
     Ok(())
@@ -4593,6 +4665,13 @@ async fn handle_ws_commands(
                         let requested_effort = normalize_effort(effort.as_deref()).map(str::to_string);
                         
                         std::thread::spawn(move || {
+                            emit_agent_run_state(
+                                &app_clone,
+                                &ws_server,
+                                &workspace_id_clone,
+                                &agent_id_clone,
+                                true,
+                            );
                             let effective_env = build_effective_cli_env(&env_overrides);
                             if let Some(claude_path) = find_claude_cli_with_env(Some(&effective_env)) {
                                 let mut cmd = Command::new(&claude_path);
@@ -4655,6 +4734,13 @@ async fn handle_ws_commands(
                                                 "error",
                                             );
                                         }
+                                        emit_agent_run_state(
+                                            &app_clone,
+                                            &ws_server,
+                                            &workspace_id_clone,
+                                            &agent_id_clone,
+                                            false,
+                                        );
                                         return;
                                     }
                                 };
@@ -4984,6 +5070,13 @@ async fn handle_ws_commands(
                                             true,
                                             "error",
                                         );
+                                        emit_agent_run_state(
+                                            &app_clone,
+                                            &ws_server,
+                                            &workspace_id_clone,
+                                            &agent_id_clone,
+                                            false,
+                                        );
                                         return;
                                     }
                                 };
@@ -5230,6 +5323,32 @@ async fn handle_ws_commands(
                                         }
                                     }
                                 }
+                                emit_agent_run_state(
+                                    &app_clone,
+                                    &ws_server,
+                                    &workspace_id_clone,
+                                    &agent_id_clone,
+                                    false,
+                                );
+                            } else {
+                                emit_agent_message(
+                                    &app_clone,
+                                    &db,
+                                    &session_id,
+                                    &agent_id_clone,
+                                    &workspace_id_clone,
+                                    &ws_server,
+                                    "Error: Claude CLI not found".to_string(),
+                                    true,
+                                    "error",
+                                );
+                                emit_agent_run_state(
+                                    &app_clone,
+                                    &ws_server,
+                                    &workspace_id_clone,
+                                    &agent_id_clone,
+                                    false,
+                                );
                             }
                         });
                     }

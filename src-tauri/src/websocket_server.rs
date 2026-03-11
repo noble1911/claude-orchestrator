@@ -123,6 +123,12 @@ pub enum WsResponse {
         workspace_id: String,
         agent_id: String,
     },
+    AgentRunState {
+        workspace_id: String,
+        agent_id: String,
+        running: bool,
+        timestamp: String,
+    },
     AgentStopped {
         workspace_id: String,
     },

@@ -137,6 +137,99 @@ const MARKDOWN_IT = MarkdownIt({
   linkify: true,
   typographer: false,
 });
+const URL_PATTERN = /(?:https?:\/\/|www\.)[^\s<>"'`]+/gi;
+
+function normalizeExternalUrl(raw?: string | null): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const candidate = /^www\./i.test(trimmed) ? `https://${trimmed}` : trimmed;
+  try {
+    const url = new URL(candidate);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function splitTextWithUrls(text: string): Array<{ text: string; href?: string }> {
+  const output: Array<{ text: string; href?: string }> = [];
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(URL_PATTERN)) {
+    const index = match.index ?? -1;
+    if (index < 0) continue;
+    const raw = match[0];
+    if (index > lastIndex) {
+      output.push({ text: text.slice(lastIndex, index) });
+    }
+
+    let candidate = raw;
+    let trailing = "";
+    while (candidate.length > 0 && /[),.;!?]$/.test(candidate)) {
+      trailing = candidate.slice(-1) + trailing;
+      candidate = candidate.slice(0, -1);
+    }
+
+    const href = normalizeExternalUrl(candidate);
+    if (href) {
+      output.push({ text: candidate, href });
+    } else {
+      output.push({ text: raw });
+      trailing = "";
+    }
+
+    if (trailing) {
+      output.push({ text: trailing });
+    }
+    lastIndex = index + raw.length;
+  }
+
+  if (lastIndex < text.length) {
+    output.push({ text: text.slice(lastIndex) });
+  }
+
+  return output.length > 0 ? output : [{ text }];
+}
+
+function LinkifiedText({
+  text,
+  style,
+  linkStyle,
+}: {
+  text: string;
+  style: any;
+  linkStyle?: any;
+}) {
+  const segments = splitTextWithUrls(text);
+  return (
+    <Text style={style}>
+      {segments.map((segment, index) => {
+        if (!segment.href) {
+          return (
+            <Text key={`plain-${index}`} style={style}>
+              {segment.text}
+            </Text>
+          );
+        }
+        return (
+          <Text
+            key={`link-${index}`}
+            style={[style, linkStyle]}
+            onPress={() => {
+              Linking.openURL(segment.href || "").catch(() => {});
+            }}
+          >
+            {segment.text}
+          </Text>
+        );
+      })}
+    </Text>
+  );
+}
 
 function MarkdownText({ content }: { content: string }) {
   const normalized = content.replace(/\r\n/g, "\n");
@@ -1076,7 +1169,11 @@ function App() {
                       {row.group.lines.map((line, lineIdx) => (
                         <View key={`${row.id}-line-${lineIdx}`} style={styles.activityLineRow}>
                           <Text style={styles.activityBullet}>•</Text>
-                          <Text style={styles.activityLineText}>{line.text}</Text>
+                          <LinkifiedText
+                            text={line.text}
+                            style={styles.activityLineText}
+                            linkStyle={styles.activityLink}
+                          />
                           {line.count > 1 ? <Text style={styles.activityLineCount}>x{line.count}</Text> : null}
                         </View>
                       ))}
@@ -1589,6 +1686,7 @@ const styles = StyleSheet.create({
   activityLineRow: { flexDirection: "row", alignItems: "flex-start", gap: 6 },
   activityBullet: { color: "#6a5f57", fontSize: 11, marginTop: 1 },
   activityLineText: { color: "#9f968f", fontSize: 11, flex: 1, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
+  activityLink: { color: "#8cbbe6", textDecorationLine: "underline" },
   activityLineCount: { color: "#6d645e", fontSize: 10 },
   messageRow: { flexDirection: "row" },
   messageRowUser: { justifyContent: "flex-end" },

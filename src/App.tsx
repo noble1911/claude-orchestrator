@@ -1,7 +1,8 @@
-import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, type MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
@@ -59,6 +60,13 @@ interface AgentMessage {
   role?: "user" | "assistant" | "system" | "error" | string;
   content: string;
   isError: boolean;
+  timestamp: string;
+}
+
+interface AgentRunStateEvent {
+  workspaceId: string;
+  agentId: string;
+  running: boolean;
   timestamp: string;
 }
 
@@ -264,6 +272,102 @@ function shortText(value: string, maxLength = 120): string {
   return `${value.slice(0, maxLength)}...`;
 }
 
+const URL_PATTERN = /(?:https?:\/\/|www\.)[^\s<>"'`]+/gi;
+
+function splitTextWithUrls(text: string): Array<{ text: string; href?: string }> {
+  const output: Array<{ text: string; href?: string }> = [];
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(URL_PATTERN)) {
+    const index = match.index ?? -1;
+    if (index < 0) continue;
+    const raw = match[0];
+    if (index > lastIndex) {
+      output.push({ text: text.slice(lastIndex, index) });
+    }
+
+    let candidate = raw;
+    let trailing = "";
+    while (candidate.length > 0 && /[),.;!?]$/.test(candidate)) {
+      trailing = candidate.slice(-1) + trailing;
+      candidate = candidate.slice(0, -1);
+    }
+
+    const href = normalizeExternalHref(candidate);
+    if (href) {
+      output.push({ text: candidate, href });
+    } else {
+      output.push({ text: raw });
+      trailing = "";
+    }
+
+    if (trailing) {
+      output.push({ text: trailing });
+    }
+    lastIndex = index + raw.length;
+  }
+
+  if (lastIndex < text.length) {
+    output.push({ text: text.slice(lastIndex) });
+  }
+
+  return output.length > 0 ? output : [{ text }];
+}
+
+function normalizeExternalHref(rawHref?: string | null): string | null {
+  if (!rawHref) return null;
+  const trimmed = rawHref.trim();
+  if (!trimmed) return null;
+  const candidate = /^www\./i.test(trimmed) ? `https://${trimmed}` : trimmed;
+  try {
+    const url = new URL(candidate);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function openExternalHref(rawHref?: string | null): Promise<void> {
+  const href = normalizeExternalHref(rawHref);
+  if (!href) return;
+  try {
+    await openUrl(href);
+  } catch {
+    window.open(href, "_blank", "noopener,noreferrer");
+  }
+}
+
+function LinkifiedInlineText({ text, className = "" }: { text: string; className?: string }) {
+  const segments = splitTextWithUrls(text);
+  return (
+    <>
+      {segments.map((segment, index) => {
+        if (!segment.href) {
+          return <span key={`plain-${index}`}>{segment.text}</span>;
+        }
+        return (
+          <a
+            key={`link-${index}`}
+            href={segment.href}
+            target="_blank"
+            rel="noreferrer"
+            className={className}
+            onClick={(event: ReactMouseEvent<HTMLAnchorElement>) => {
+              event.preventDefault();
+              void openExternalHref(segment.href);
+            }}
+          >
+            {segment.text}
+          </a>
+        );
+      })}
+    </>
+  );
+}
+
 function MarkdownMessage({ content }: { content: string }) {
   const normalizedContent = content.replace(/\r\n/g, "\n");
   if (!normalizedContent.trim()) {
@@ -284,6 +388,10 @@ function MarkdownMessage({ content }: { content: string }) {
               target="_blank"
               rel="noreferrer"
               className="underline decoration-white/35 underline-offset-2 hover:decoration-white/70"
+              onClick={(event: ReactMouseEvent<HTMLAnchorElement>) => {
+                event.preventDefault();
+                void openExternalHref(href);
+              }}
             >
               {children}
             </a>
@@ -835,18 +943,22 @@ function App() {
           });
         }
       }
-      const inferredRole =
-        event.payload.role ??
-        (event.payload.agentId === "user" || event.payload.content.trimStart().startsWith(">")
-          ? "user"
-          : "assistant");
-      const isTerminalResponse =
-        event.payload.isError || inferredRole === "assistant" || inferredRole === "question";
-      if (isTerminalResponse) {
-        if (messageWorkspaceId) {
-          setThinkingSinceByWorkspace((prev) => ({ ...prev, [messageWorkspaceId]: null }));
+    });
+    const unlistenRunState = listen<AgentRunStateEvent>("agent-run-state", (event) => {
+      const { workspaceId, running, timestamp } = event.payload;
+      if (!workspaceId) return;
+
+      setThinkingSinceByWorkspace((prev) => {
+        const current = prev[workspaceId] ?? null;
+        if (running) {
+          if (current !== null) return prev;
+          const parsedTimestamp = Date.parse(timestamp);
+          const startedAt = Number.isFinite(parsedTimestamp) ? parsedTimestamp : Date.now();
+          return { ...prev, [workspaceId]: startedAt };
         }
-      }
+        if (current === null) return prev;
+        return { ...prev, [workspaceId]: null };
+      });
     });
     const unlistenClients = listen<number>("remote-clients-updated", (event) => {
       setServerStatus((prev) => {
@@ -857,6 +969,7 @@ function App() {
     
     return () => {
       unlisten.then(fn => fn());
+      unlistenRunState.then(fn => fn());
       unlistenClients.then(fn => fn());
     };
   }, []);
@@ -2528,6 +2641,9 @@ function App() {
     ? (thinkingSinceByWorkspace[selectedWorkspace] ?? null)
     : null;
   const isThinkingCurrentWorkspace = currentThinkingSince !== null;
+  const composerPlaceholder = isThinkingCurrentWorkspace
+    ? "Agent is still running... Draft your next message while activity events continue."
+    : "Ask to make changes... or /prompt name /project:skill-path";
   const activeCenterTab = centerTabs.find((tab) => tab.id === activeCenterTabId) || centerTabs[0];
   const workspaceMessages = selectedWorkspace ? messages : [];
   const latestSystemMessage = [...workspaceMessages]
@@ -3002,7 +3118,12 @@ function App() {
                                 {row.group.lines.map((line, lineIdx) => (
                                   <div key={`${row.id}-line-${lineIdx}`} className="flex items-start gap-2 text-xs md-text-faint">
                                     <span className="mt-1 h-1 w-1 flex-none rounded-full bg-white/20" />
-                                    <span className="break-all font-mono">{line.text}</span>
+                                    <span className="break-all font-mono">
+                                      <LinkifiedInlineText
+                                        text={line.text}
+                                        className="underline decoration-white/35 underline-offset-2 hover:decoration-white/70"
+                                      />
+                                    </span>
                                     {line.count > 1 && (
                                       <span className="text-[10px] md-text-faint">x{line.count}</span>
                                     )}
@@ -3168,6 +3289,14 @@ function App() {
               {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && (
                 <div className="border-t md-outline md-surface-container-high md-px-3 md-py-2">
                   <div className="rounded-2xl border md-outline md-surface-container md-px-3 md-py-2">
+                    {isThinkingCurrentWorkspace && (
+                      <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-600/40 bg-amber-950/30 px-2 py-1 text-[11px] text-amber-200">
+                        <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
+                        <span>
+                          Agent still working. More activity events may arrive. You can draft now and send after this run finishes.
+                        </span>
+                      </div>
+                    )}
                     <textarea
                       value={inputMessage}
                       onChange={(e) => setInputMessage(e.target.value)}
@@ -3178,7 +3307,8 @@ function App() {
                         }
                       }}
                       rows={3}
-                      placeholder="Ask to make changes... or /prompt name /project:skill-path"
+                      placeholder={composerPlaceholder}
+                      aria-busy={isThinkingCurrentWorkspace}
                       style={{ resize: "vertical" }}
                       className="w-full overflow-y-auto rounded-lg border md-outline bg-black/10 px-2 py-1 text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted min-h-[96px] max-h-[45vh]"
                     />
@@ -3244,6 +3374,11 @@ function App() {
                         </select>
 
                         <div className="ml-auto flex items-center gap-1">
+                          {isThinkingCurrentWorkspace && (
+                            <span className="text-[11px] text-amber-300/80">
+                              Receiving events...
+                            </span>
+                          )}
                           <button
                             onClick={() => setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"))}
                             className={`md-icon-plain !h-7 !w-7 ${claudeMode === "plan" ? "text-violet-300" : ""}`}
