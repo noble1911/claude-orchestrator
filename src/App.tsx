@@ -2641,9 +2641,6 @@ function App() {
     ? (thinkingSinceByWorkspace[selectedWorkspace] ?? null)
     : null;
   const isThinkingCurrentWorkspace = currentThinkingSince !== null;
-  const composerPlaceholder = isThinkingCurrentWorkspace
-    ? "Agent is still running... Draft your next message while activity events continue."
-    : "Ask to make changes... or /prompt name /project:skill-path";
   const activeCenterTab = centerTabs.find((tab) => tab.id === activeCenterTabId) || centerTabs[0];
   const workspaceMessages = selectedWorkspace ? messages : [];
   const latestSystemMessage = [...workspaceMessages]
@@ -3092,7 +3089,7 @@ function App() {
                     chatRows.map((row, rowIdx) => {
                       if (row.kind === "activity") {
                         const isLatestRunningActivity = isThinkingCurrentWorkspace && rowIdx === chatRows.length - 1;
-                        const expanded = isActivityExpanded(row.id) || isLatestRunningActivity;
+                        const expanded = isActivityExpanded(row.id);
                         return (
                           <div key={row.id}>
                             <button
@@ -3289,14 +3286,6 @@ function App() {
               {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && (
                 <div className="border-t md-outline md-surface-container-high md-px-3 md-py-2">
                   <div className="rounded-2xl border md-outline md-surface-container md-px-3 md-py-2">
-                    {isThinkingCurrentWorkspace && (
-                      <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-600/40 bg-amber-950/30 px-2 py-1 text-[11px] text-amber-200">
-                        <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
-                        <span>
-                          Agent still working. More activity events may arrive. You can draft now and send after this run finishes.
-                        </span>
-                      </div>
-                    )}
                     <textarea
                       value={inputMessage}
                       onChange={(e) => setInputMessage(e.target.value)}
@@ -3307,7 +3296,7 @@ function App() {
                         }
                       }}
                       rows={3}
-                      placeholder={composerPlaceholder}
+                      placeholder="Ask to make changes... or /prompt name /project:skill-path"
                       aria-busy={isThinkingCurrentWorkspace}
                       style={{ resize: "vertical" }}
                       className="w-full overflow-y-auto rounded-lg border md-outline bg-black/10 px-2 py-1 text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted min-h-[96px] max-h-[45vh]"
@@ -3374,11 +3363,6 @@ function App() {
                         </select>
 
                         <div className="ml-auto flex items-center gap-1">
-                          {isThinkingCurrentWorkspace && (
-                            <span className="text-[11px] text-amber-300/80">
-                              Receiving events...
-                            </span>
-                          )}
                           <button
                             onClick={() => setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"))}
                             className={`md-icon-plain !h-7 !w-7 ${claudeMode === "plan" ? "text-violet-300" : ""}`}
