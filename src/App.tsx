@@ -749,6 +749,7 @@ function App() {
   const [pendingAutoPromptsByWorkspace, setPendingAutoPromptsByWorkspace] = useState<Record<string, PromptShortcut[]>>({});
   const startingWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const selectedWorkspaceRef = useRef<string | null>(null);
+  const detectedPrUrlByWorkspaceRef = useRef<Record<string, string>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const terminalInputRef = useRef<HTMLInputElement>(null);
@@ -785,6 +786,11 @@ function App() {
     return message.isError;
   }
 
+  function extractPullRequestUrl(content: string): string | null {
+    const match = content.match(/https?:\/\/[^\s)]+\/pull\/\d+/i);
+    return match ? match[0] : null;
+  }
+
   useEffect(() => {
     loadInitialState();
     // Silent background check on launch; surfaced only on explicit user action.
@@ -808,6 +814,26 @@ function App() {
       }
       if (event.payload.role === "credential_error" && messageWorkspaceId) {
         setCredentialErrorWorkspaces((prev) => new Set(prev).add(messageWorkspaceId));
+      }
+      if (
+        messageWorkspaceId &&
+        event.payload.agentId !== "user" &&
+        (event.payload.role ?? "") !== "user"
+      ) {
+        const prUrl = extractPullRequestUrl(event.payload.content);
+        if (prUrl && detectedPrUrlByWorkspaceRef.current[messageWorkspaceId] !== prUrl) {
+          detectedPrUrlByWorkspaceRef.current[messageWorkspaceId] = prUrl;
+          setWorkspaces((prev) =>
+            prev.map((workspace) =>
+              workspace.id === messageWorkspaceId
+                ? { ...workspace, status: workspace.status === "merged" ? "merged" : "inReview", prUrl }
+                : workspace,
+            ),
+          );
+          invoke("mark_workspace_in_review", { workspaceId: messageWorkspaceId, prUrl }).catch((err) => {
+            console.error("Failed to mark workspace in review:", err);
+          });
+        }
       }
       const inferredRole =
         event.payload.role ??

@@ -249,6 +249,22 @@ fn workspace_status_to_ws(status: &WorkspaceStatus) -> String {
     }
 }
 
+fn status_for_agent_start(current: &WorkspaceStatus) -> WorkspaceStatus {
+    if matches!(current, WorkspaceStatus::InReview | WorkspaceStatus::Merged) {
+        current.clone()
+    } else {
+        WorkspaceStatus::Running
+    }
+}
+
+fn status_for_agent_stop(current: &WorkspaceStatus) -> WorkspaceStatus {
+    if matches!(current, WorkspaceStatus::InReview | WorkspaceStatus::Merged) {
+        current.clone()
+    } else {
+        WorkspaceStatus::Idle
+    }
+}
+
 fn to_workspace_info(workspace: &Workspace, has_agent: bool) -> WorkspaceInfo {
     WorkspaceInfo {
         id: workspace.id.clone(),
@@ -784,17 +800,25 @@ async fn start_agent(
     }
     
     // Update workspace status
-    {
+    let next_status = {
         let mut workspaces = state.workspaces.write();
         if let Some(workspace) = workspaces.get_mut(&workspace_id) {
-            workspace.status = WorkspaceStatus::Running;
+            let next = status_for_agent_start(&workspace.status);
+            workspace.status = next.clone();
             workspace.last_activity = Some(chrono::Utc::now().to_rfc3339());
+            Some(next)
+        } else {
+            None
         }
-    }
+    };
     
     // Update database
-    let now = chrono::Utc::now().to_rfc3339();
-    let _ = state.db.update_workspace_status(&workspace_id, &WorkspaceStatus::Running, Some(&now));
+    if let Some(status) = next_status {
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = state
+            .db
+            .update_workspace_status(&workspace_id, &status, Some(&now));
+    }
     
     // Get WebSocket server for broadcasting
     let ws_server = state.ws_server.clone();
@@ -2122,11 +2146,19 @@ async fn stop_agent(
         let has_running = agents.values().any(|a| a.workspace_id == ws_id);
         
         if !has_running {
-            let mut workspaces = state.workspaces.write();
-            if let Some(workspace) = workspaces.get_mut(&ws_id) {
-                workspace.status = WorkspaceStatus::Idle;
+            let next_status = {
+                let mut workspaces = state.workspaces.write();
+                if let Some(workspace) = workspaces.get_mut(&ws_id) {
+                    let next = status_for_agent_stop(&workspace.status);
+                    workspace.status = next.clone();
+                    Some(next)
+                } else {
+                    None
+                }
+            };
+            if let Some(status) = next_status {
+                let _ = state.db.update_workspace_status(&ws_id, &status, None);
             }
-            let _ = state.db.update_workspace_status(&ws_id, &WorkspaceStatus::Idle, None);
             
             // Broadcast to WebSocket clients
             if let Some(ws) = &state.ws_server {
@@ -3063,6 +3095,64 @@ fn lookup_branch_pr_state(repo_path: &str, branch: &str) -> Option<(String, Stri
     Some((url, state))
 }
 
+fn lookup_pr_state_by_url(repo_path: &str, pr_url: &str) -> Option<(String, String)> {
+    let output = Command::new("gh")
+        .args(["pr", "view", pr_url, "--json", "url,state"])
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let parsed = serde_json::from_slice::<Value>(&output.stdout).ok()?;
+    let url = parsed
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let state = parsed
+        .get("state")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_lowercase();
+    if url.is_empty() || state.is_empty() {
+        return None;
+    }
+    Some((url, state))
+}
+
+#[tauri::command]
+async fn mark_workspace_in_review(
+    workspace_id: String,
+    pr_url: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let trimmed_pr_url = pr_url.trim();
+    if trimmed_pr_url.is_empty() {
+        return Err("PR URL cannot be empty.".to_string());
+    }
+
+    {
+        let mut workspaces = state.workspaces.write();
+        let workspace = workspaces
+            .get_mut(&workspace_id)
+            .ok_or("Workspace not found")?;
+        if !matches!(workspace.status, WorkspaceStatus::Merged) {
+            workspace.status = WorkspaceStatus::InReview;
+        }
+        workspace.pr_url = Some(trimmed_pr_url.to_string());
+    }
+
+    state
+        .db
+        .update_workspace_pr_url(&workspace_id, trimmed_pr_url, &WorkspaceStatus::InReview)
+        .map_err(|e| format!("Failed to persist PR URL: {}", e))?;
+
+    Ok(())
+}
+
 /// Sync workspace review state from GitHub PR state.
 /// - OPEN PR => InReview
 /// - MERGED PR => Merged
@@ -3092,7 +3182,12 @@ async fn sync_pr_statuses(
 
     let mut merged_ids = Vec::new();
     for (ws_id, repo_path, branch, current_status, current_pr_url) in to_check {
-        let Some((pr_url, state_str)) = lookup_branch_pr_state(&repo_path, &branch) else {
+        let discovered = lookup_branch_pr_state(&repo_path, &branch).or_else(|| {
+            current_pr_url
+                .as_deref()
+                .and_then(|url| lookup_pr_state_by_url(&repo_path, url))
+        });
+        let Some((pr_url, state_str)) = discovered else {
             continue;
         };
 
@@ -5203,16 +5298,22 @@ async fn handle_ws_commands(
                     agents.insert(agent_id.clone(), agent);
                 }
 
-                {
+                let next_status = {
                     let mut workspaces = state.workspaces.write();
                     if let Some(workspace) = workspaces.get_mut(&workspace_id) {
-                        workspace.status = WorkspaceStatus::Running;
+                        let next = status_for_agent_start(&workspace.status);
+                        workspace.status = next.clone();
                         workspace.last_activity = Some(chrono::Utc::now().to_rfc3339());
+                        Some(next)
+                    } else {
+                        None
                     }
+                };
+                if let Some(status) = next_status {
+                    let _ = state
+                        .db
+                        .update_workspace_status(&workspace_id, &status, Some(&now));
                 }
-                let _ = state
-                    .db
-                    .update_workspace_status(&workspace_id, &WorkspaceStatus::Running, Some(&now));
 
                 // Spawn Claude bootstrap process for this workspace.
                 let ws_server = state.ws_server.clone();
@@ -5271,11 +5372,19 @@ async fn handle_ws_commands(
                     }
                     
                     if let Some(ws_id) = workspace_id {
-                        let mut workspaces = state.workspaces.write();
-                        if let Some(workspace) = workspaces.get_mut(&ws_id) {
-                            workspace.status = WorkspaceStatus::Idle;
+                        let next_status = {
+                            let mut workspaces = state.workspaces.write();
+                            if let Some(workspace) = workspaces.get_mut(&ws_id) {
+                                let next = status_for_agent_stop(&workspace.status);
+                                workspace.status = next.clone();
+                                Some(next)
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(status) = next_status {
+                            let _ = state.db.update_workspace_status(&ws_id, &status, None);
                         }
-                        let _ = state.db.update_workspace_status(&ws_id, &WorkspaceStatus::Idle, None);
                         
                         let response = WsResponse::AgentStopped { workspace_id: ws_id };
                         let _ = response_tx.send(serde_json::to_string(&response).unwrap());
@@ -5373,6 +5482,7 @@ pub fn run() {
             get_agent_messages,
             open_workspace_in_editor,
             create_pull_request,
+            mark_workspace_in_review,
             sync_pr_statuses,
             list_skills,
             save_skill,
