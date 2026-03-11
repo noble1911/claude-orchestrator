@@ -1,4 +1,13 @@
-import { useState, useEffect, useLayoutEffect, useMemo, useRef, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  isValidElement,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -305,6 +314,44 @@ function shortText(value: string, maxLength = 120): string {
   return `${value.slice(0, maxLength)}...`;
 }
 
+function extractTextFromNode(node: ReactNode): string {
+  if (node === null || node === undefined || typeof node === "boolean") {
+    return "";
+  }
+  if (typeof node === "string" || typeof node === "number") {
+    return String(node);
+  }
+  if (Array.isArray(node)) {
+    return node.map((item) => extractTextFromNode(item)).join("");
+  }
+  if (isValidElement(node)) {
+    return extractTextFromNode((node.props as { children?: ReactNode }).children);
+  }
+  return "";
+}
+
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.style.position = "fixed";
+      textArea.style.opacity = "0";
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      const success = document.execCommand("copy");
+      document.body.removeChild(textArea);
+      return success;
+    } catch {
+      return false;
+    }
+  }
+}
+
 const URL_PATTERN = /(?:https?:\/\/|www\.)[^\s<>"'`]+/gi;
 
 function splitTextWithUrls(text: string): Array<{ text: string; href?: string }> {
@@ -401,6 +448,41 @@ function LinkifiedInlineText({ text, className = "" }: { text: string; className
   );
 }
 
+function MarkdownCodeBlock({ children }: { children: ReactNode }) {
+  const [copied, setCopied] = useState(false);
+  const codeText = useMemo(() => extractTextFromNode(children).replace(/\n$/, ""), [children]);
+
+  const handleCopy = () => {
+    void copyToClipboard(codeText).then((ok) => {
+      if (!ok) return;
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1400);
+    });
+  };
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={handleCopy}
+        className="absolute right-2 top-2 z-10 rounded-md border border-white/20 bg-black/40 px-2 py-1 text-[11px] md-text-muted transition hover:border-white/35 hover:md-text-primary"
+        title={copied ? "Copied" : "Copy code"}
+        aria-label={copied ? "Copied" : "Copy code"}
+      >
+        <span className="inline-flex items-center gap-1">
+          <span className="material-symbols-rounded !text-[14px]">
+            {copied ? "check" : "content_copy"}
+          </span>
+          <span>{copied ? "Copied" : "Copy"}</span>
+        </span>
+      </button>
+      <pre className="m-0 max-h-[50vh] overflow-auto rounded-xl border md-outline bg-black/45 px-3 py-2 whitespace-pre font-mono text-[12px] md-text-primary">
+        {children}
+      </pre>
+    </div>
+  );
+}
+
 function MarkdownMessage({ content }: { content: string }) {
   const normalizedContent = content.replace(/\r\n/g, "\n");
   if (!normalizedContent.trim()) {
@@ -408,7 +490,7 @@ function MarkdownMessage({ content }: { content: string }) {
   }
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 select-text">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkBreaks]}
         components={{
@@ -439,11 +521,7 @@ function MarkdownMessage({ content }: { content: string }) {
             }
             return <code className="rounded-md bg-white/10 px-1.5 py-0.5 font-mono text-[12px]">{children}</code>;
           },
-          pre: ({ children }) => (
-            <pre className="m-0 max-h-[50vh] overflow-auto rounded-xl border md-outline bg-black/45 px-3 py-2 whitespace-pre font-mono text-[12px] md-text-primary">
-              {children}
-            </pre>
-          ),
+          pre: ({ children }) => <MarkdownCodeBlock>{children}</MarkdownCodeBlock>,
           h1: ({ children }) => <h1 className="m-0 text-xl font-semibold leading-snug md-text-strong">{children}</h1>,
           h2: ({ children }) => <h2 className="m-0 text-lg font-semibold leading-snug md-text-strong">{children}</h2>,
           h3: ({ children }) => <h3 className="m-0 text-base font-semibold leading-snug md-text-strong">{children}</h3>,
@@ -1174,6 +1252,10 @@ function App() {
   }, [selectedWorkspace, thinkingSinceByWorkspace]);
 
   useEffect(() => {
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed) {
+      return;
+    }
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
@@ -3251,7 +3333,7 @@ function App() {
                           return (
                             <div key={row.id} className="rounded-xl border border-amber-700/60 bg-amber-950/25 px-3 py-2">
                               <div className="mb-1 text-[11px] uppercase tracking-wide text-amber-300">Credential Error</div>
-                              <pre className="overflow-x-auto whitespace-pre-wrap text-sm text-amber-200">{msg.content}</pre>
+                              <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm text-amber-200">{msg.content}</pre>
                               <button
                                 type="button"
                                 className="mt-1.5 text-xs text-amber-400 underline underline-offset-2 hover:text-amber-300"
@@ -3265,7 +3347,7 @@ function App() {
                         return (
                           <div key={row.id} className="rounded-xl border border-rose-700/60 bg-rose-950/20 px-3 py-2">
                             <div className="mb-1 text-[11px] uppercase tracking-wide text-rose-300">Error</div>
-                            <pre className="overflow-x-auto whitespace-pre-wrap text-sm text-rose-200">{msg.content}</pre>
+                            <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm text-rose-200">{msg.content}</pre>
                           </div>
                         );
                       }
@@ -3296,7 +3378,7 @@ function App() {
                         return (
                           <div key={row.id} className="flex justify-end">
                             <div className="max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-3">
-                              <pre className="overflow-x-auto whitespace-pre-wrap text-sm leading-relaxed md-text-strong">
+                              <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm leading-relaxed md-text-strong">
                                 {msg.content.replace(/^>\s?/, "")}
                               </pre>
                             </div>
