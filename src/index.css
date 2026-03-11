@@ -6,22 +6,10 @@
 
 @layer base {
   :root {
+    /* Color tokens are injected at runtime from src/themes.ts. */
     font-family: "Roboto Flex", "Noto Sans", "Segoe UI Variable", "Segoe UI", sans-serif;
-    color: #d8dee9;
-    background-color: #0b0d12;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-
-    --md-sys-color-primary: #8ab4f8;
-    --md-sys-color-on-primary: #041b3f;
-    --md-sys-color-surface: #0b0d12;
-    --md-sys-color-surface-container: #11141b;
-    --md-sys-color-surface-container-high: #171b24;
-    --md-sys-color-outline: #3a4353;
-    --md-sys-color-on-surface: #d8dee9;
-    --md-sys-color-on-surface-variant: #aab4c3;
-    --md-sys-color-tertiary-container: #1f1a2b;
-    --md-sys-color-on-tertiary-container: #d9c8ff;
 
     --md-type-title-small: 500 0.95rem/1.35 "Roboto Flex", "Noto Sans", "Segoe UI Variable", "Segoe UI", sans-serif;
     --md-type-label-large: 500 0.82rem/1.2 "Roboto Flex", "Noto Sans", "Segoe UI Variable", "Segoe UI", sans-serif;

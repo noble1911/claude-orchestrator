@@ -6,6 +6,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import {
+  THEME_OPTIONS,
+  THEME_STORAGE_KEY,
+  applyTheme,
+  getStoredThemeId,
+  normalizeThemeId,
+  type ThemeId,
+} from "./themes";
 
 interface Repository {
   id: string;
@@ -658,6 +666,7 @@ function App() {
   const [skillRelativePathDraft, setSkillRelativePathDraft] = useState<string | null>(null);
   const [skillNameDraft, setSkillNameDraft] = useState("");
   const [skillBodyDraft, setSkillBodyDraft] = useState("");
+  const [selectedTheme, setSelectedTheme] = useState<ThemeId>(() => getStoredThemeId());
   const [envOverridesText, setEnvOverridesText] = useState("");
   const [claudeMode, setClaudeMode] = useState<ClaudeMode>("normal");
   const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
@@ -957,6 +966,15 @@ function App() {
       console.error("Failed to persist prompt shortcuts:", err);
     }
   }, [promptShortcuts]);
+
+  useEffect(() => {
+    applyTheme(selectedTheme);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, selectedTheme);
+    } catch (err) {
+      console.error("Failed to persist theme selection:", err);
+    }
+  }, [selectedTheme]);
 
   useEffect(() => {
     try {
@@ -3657,6 +3675,30 @@ function App() {
                   <p className="text-[11px] md-text-muted">No pending update detected.</p>
                 ) : null}
                 {updateError && <p className="mt-1 text-[11px] text-amber-300">{updateError}</p>}
+              </div>
+
+              <div className="border-t md-outline pt-3">
+                <p className="md-text-dim">Theme</p>
+                <div className="mt-2 space-y-2">
+                  <select
+                    value={selectedTheme}
+                    onChange={(event) => setSelectedTheme(normalizeThemeId(event.target.value))}
+                    className="md-select !min-h-0"
+                    aria-label="Theme selection"
+                  >
+                    {THEME_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-[11px] md-text-muted">
+                    {THEME_OPTIONS.find((option) => option.value === selectedTheme)?.description}
+                  </p>
+                  <p className="text-[11px] md-text-muted">
+                    Add or adjust theme palettes in `src/themes.ts`.
+                  </p>
+                </div>
               </div>
 
               <div className="border-t md-outline pt-3">
