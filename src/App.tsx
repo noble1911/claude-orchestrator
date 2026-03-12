@@ -875,6 +875,7 @@ function App() {
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
   const [defaultRepoId, setDefaultRepoId] = useState<string | null>(null);
+  const [defaultRepoInitialized, setDefaultRepoInitialized] = useState(false);
   const [selectedWorkspace, setSelectedWorkspace] = useState<string | null>(null);
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [isLoading, setIsLoading] = useState(true);
@@ -1158,6 +1159,7 @@ function App() {
   }, [selectedRepo]);
 
   useEffect(() => {
+    if (!defaultRepoInitialized) return;
     try {
       if (defaultRepoId) {
         localStorage.setItem(DEFAULT_REPOSITORY_STORAGE_KEY, defaultRepoId);
@@ -1167,7 +1169,7 @@ function App() {
     } catch (err) {
       console.error("Failed to persist default repository:", err);
     }
-  }, [defaultRepoId]);
+  }, [defaultRepoId, defaultRepoInitialized]);
 
   useEffect(() => {
     const id = window.setInterval(async () => {
@@ -1627,6 +1629,8 @@ function App() {
           }
         }
       }
+
+      setDefaultRepoInitialized(true);
       
       const ag = await invoke<Agent[]>("list_agents");
       setAgents(ag);
