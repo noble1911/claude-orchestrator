@@ -1,4 +1,6 @@
 import {
+  memo,
+  useCallback,
   useState,
   useEffect,
   useLayoutEffect,
@@ -276,6 +278,8 @@ function shouldAppendAssistantCheckpoint(previousContent: string, nextContent: s
   return addedLength >= 160;
 }
 
+const MAX_ASSISTANT_STREAM_CHECKPOINTS = 12;
+
 function upsertMessageByIdentity(messages: AgentMessage[], incoming: AgentMessage): AgentMessage[] {
   const key = messageIdentity(incoming);
   let existingIndex = -1;
@@ -299,6 +303,16 @@ function upsertMessageByIdentity(messages: AgentMessage[], incoming: AgentMessag
 
   if (isAssistantStreamingMessage(existing) && isAssistantStreamingMessage(incoming)) {
     if (shouldAppendAssistantCheckpoint(existing.content, incoming.content)) {
+      let checkpointCount = 0;
+      for (const message of messages) {
+        if (messageIdentity(message) !== key) continue;
+        checkpointCount += 1;
+        if (checkpointCount >= MAX_ASSISTANT_STREAM_CHECKPOINTS) {
+          const next = [...messages];
+          next[existingIndex] = incoming;
+          return next;
+        }
+      }
       return [...messages, incoming];
     }
     const next = [...messages];
@@ -484,7 +498,7 @@ function MarkdownCodeBlock({ children }: { children: ReactNode }) {
   );
 }
 
-function MarkdownMessage({ content }: { content: string }) {
+const MarkdownMessage = memo(function MarkdownMessage({ content }: { content: string }) {
   const normalizedContent = content.replace(/\r\n/g, "\n");
   if (!normalizedContent.trim()) {
     return <p className="whitespace-pre-wrap text-sm md-text-primary">{normalizedContent}</p>;
@@ -562,7 +576,7 @@ function MarkdownMessage({ content }: { content: string }) {
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 function toWorkspaceRelativePath(absolutePath: string, workspaceRoot: string): string | null {
   const normalizedAbsolute = absolutePath.replace(/\\/g, "/");
@@ -976,6 +990,7 @@ function App() {
   const thinkingSinceByWorkspaceRef = useRef<Record<string, number | null>>({});
   const pendingUnreadByWorkspaceRef = useRef<Record<string, boolean>>({});
   const detectedPrUrlByWorkspaceRef = useRef<Record<string, string>>({});
+  const sendMessageRef = useRef<(rawMessage?: string, visibleOverride?: string) => Promise<boolean>>(async () => false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const terminalInputRef = useRef<HTMLInputElement>(null);
@@ -2334,6 +2349,16 @@ function App() {
     }
     return true;
   }
+  sendMessageRef.current = sendMessage;
+
+  const handleQuestionAnswer = useCallback((questionTimestamp: string, answer: string) => {
+    setAnsweredQuestionTimestamps((prev) => {
+      const next = new Set(prev);
+      next.add(questionTimestamp);
+      return next;
+    });
+    void sendMessageRef.current(answer);
+  }, []);
 
   function generateWorkspaceName() {
     const adjective = NAME_ADJECTIVES[Math.floor(Math.random() * NAME_ADJECTIVES.length)];
@@ -2351,27 +2376,6 @@ function App() {
     setSelectedWorkspace(workspaceId);
     setIsLeftPanelOpen(false);
     void ensureAgentForWorkspace(workspaceId);
-  }
-
-  function isActivityExpanded(activityId: string): boolean {
-    if (!selectedWorkspace) return false;
-    return (expandedActivityIdsByWorkspace[selectedWorkspace] || []).includes(activityId);
-  }
-
-  function toggleActivityGroup(activityId: string) {
-    if (!selectedWorkspace) return;
-    setExpandedActivityIdsByWorkspace((prev) => {
-      const existing = new Set(prev[selectedWorkspace] || []);
-      if (existing.has(activityId)) {
-        existing.delete(activityId);
-      } else {
-        existing.add(activityId);
-      }
-      return {
-        ...prev,
-        [selectedWorkspace]: Array.from(existing),
-      };
-    });
   }
 
   async function addFilesToComposer() {
@@ -2875,28 +2879,31 @@ function App() {
     }
   };
 
-  const workspaceGroups = [
-    {
-      key: "in-progress",
-      label: "In progress",
-      items: workspaces.filter((ws) => ws.status === "running"),
-    },
-    {
-      key: "in-review",
-      label: "In review",
-      items: workspaces.filter((ws) => ws.status === "inReview"),
-    },
-    {
-      key: "ready",
-      label: "Ready",
-      items: workspaces.filter((ws) => ws.status === "idle"),
-    },
-    {
-      key: "done",
-      label: "Done",
-      items: workspaces.filter((ws) => ws.status === "merged"),
-    },
-  ];
+  const workspaceGroups = useMemo(
+    () => [
+      {
+        key: "in-progress",
+        label: "In progress",
+        items: workspaces.filter((ws) => ws.status === "running"),
+      },
+      {
+        key: "in-review",
+        label: "In review",
+        items: workspaces.filter((ws) => ws.status === "inReview"),
+      },
+      {
+        key: "ready",
+        label: "Ready",
+        items: workspaces.filter((ws) => ws.status === "idle"),
+      },
+      {
+        key: "done",
+        label: "Done",
+        items: workspaces.filter((ws) => ws.status === "merged"),
+      },
+    ],
+    [workspaces],
+  );
 
   const currentRepo = repositories.find(r => r.id === selectedRepo);
   const currentWorkspace = workspaces.find(w => w.id === selectedWorkspace);
@@ -2908,27 +2915,35 @@ function App() {
   const isThinkingCurrentWorkspace = currentThinkingSince !== null;
   const activeCenterTab = centerTabs.find((tab) => tab.id === activeCenterTabId) || centerTabs[0];
   const workspaceMessages = selectedWorkspace ? messages : [];
-  const latestSystemMessage = [...workspaceMessages]
-    .reverse()
-    .find((message) => message.role === "system" && !message.isError);
-  const derivedAnsweredQuestionTimestamps = useMemo(() => {
-    const answered = new Set<string>();
-    for (let i = 0; i < workspaceMessages.length; i += 1) {
-      const current = workspaceMessages[i];
-      if (current.role !== "question") continue;
-      for (let j = i + 1; j < workspaceMessages.length; j += 1) {
-        const next = workspaceMessages[j];
-        if (next.role === "user" || next.agentId === "user") {
-          answered.add(current.timestamp);
-          break;
-        }
-        if (next.role === "question") {
-          // A newer question supersedes an older pending one.
-          answered.add(current.timestamp);
-          break;
-        }
+  const latestSystemMessage = useMemo(() => {
+    for (let idx = workspaceMessages.length - 1; idx >= 0; idx -= 1) {
+      const message = workspaceMessages[idx];
+      if (message.role === "system" && !message.isError) {
+        return message;
       }
     }
+    return null;
+  }, [workspaceMessages]);
+  const derivedAnsweredQuestionTimestamps = useMemo(() => {
+    const answered = new Set<string>();
+    let pendingQuestionTimestamp: string | null = null;
+
+    for (const message of workspaceMessages) {
+      if (message.role === "question") {
+        if (pendingQuestionTimestamp) {
+          // A newer question supersedes an older pending one.
+          answered.add(pendingQuestionTimestamp);
+        }
+        pendingQuestionTimestamp = message.timestamp;
+        continue;
+      }
+
+      if (pendingQuestionTimestamp && (message.role === "user" || message.agentId === "user")) {
+        answered.add(pendingQuestionTimestamp);
+        pendingQuestionTimestamp = null;
+      }
+    }
+
     return answered;
   }, [workspaceMessages]);
   const chatRows = useMemo<ChatRow[]>(() => {
@@ -2972,6 +2987,143 @@ function App() {
     flushSystemBuffer();
     return rows;
   }, [workspaceMessages]);
+  const renderedChatRows = useMemo(() => {
+    const expandedActivityIds = new Set(
+      selectedWorkspace ? (expandedActivityIdsByWorkspace[selectedWorkspace] || []) : [],
+    );
+
+    return chatRows.map((row, rowIdx) => {
+      if (row.kind === "activity") {
+        const isLatestRunningActivity = isThinkingCurrentWorkspace && rowIdx === chatRows.length - 1;
+        const expanded = expandedActivityIds.has(row.id);
+        return (
+          <div key={row.id}>
+            <button
+              onClick={() => {
+                if (!selectedWorkspace) return;
+                setExpandedActivityIdsByWorkspace((prev) => {
+                  const existing = new Set(prev[selectedWorkspace] || []);
+                  if (existing.has(row.id)) {
+                    existing.delete(row.id);
+                  } else {
+                    existing.add(row.id);
+                  }
+                  return {
+                    ...prev,
+                    [selectedWorkspace]: Array.from(existing),
+                  };
+                });
+              }}
+              className="flex w-full items-center gap-2 py-1.5 text-left transition hover:bg-white/5"
+            >
+              <span className="text-xs md-text-faint">
+                Agent activity ({row.group.messages.length} events)
+              </span>
+              {isLatestRunningActivity && (
+                <span className="inline-flex items-center gap-1 rounded-full border border-amber-700/60 bg-amber-950/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-300" />
+                  running
+                </span>
+              )}
+              <span className="material-symbols-rounded ml-auto !text-sm md-text-faint">
+                {expanded ? "expand_more" : "chevron_right"}
+              </span>
+            </button>
+
+            {expanded && (
+              <div className="space-y-1.5 pl-2 pt-1 pb-1">
+                {row.group.lines.map((line, lineIdx) => (
+                  <div key={`${row.id}-line-${lineIdx}`} className="flex items-start gap-2 text-xs md-text-faint">
+                    <span className="mt-1 h-1 w-1 flex-none rounded-full bg-white/20" />
+                    <span className="break-all font-mono">
+                      <LinkifiedInlineText
+                        text={line.text}
+                        className="underline decoration-white/35 underline-offset-2 hover:decoration-white/70"
+                      />
+                    </span>
+                    {line.count > 1 && (
+                      <span className="text-[10px] md-text-faint">x{line.count}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      const msg = row.message;
+      const isUser =
+        msg.role === "user" ||
+        msg.agentId === "user" ||
+        msg.content.trimStart().startsWith(">");
+
+      if (msg.isError) {
+        if (msg.role === "credential_error") {
+          return (
+            <div key={row.id} className="rounded-xl border border-amber-700/60 bg-amber-950/25 px-3 py-2">
+              <div className="mb-1 text-[11px] uppercase tracking-wide text-amber-300">Credential Error</div>
+              <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm text-amber-200">{msg.content}</pre>
+              <button
+                type="button"
+                className="mt-1.5 text-xs text-amber-400 underline underline-offset-2 hover:text-amber-300"
+                onClick={() => setTerminalTab("setup")}
+              >
+                Open Setup tab
+              </button>
+            </div>
+          );
+        }
+        return (
+          <div key={row.id} className="rounded-xl border border-rose-700/60 bg-rose-950/20 px-3 py-2">
+            <div className="mb-1 text-[11px] uppercase tracking-wide text-rose-300">Error</div>
+            <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm text-rose-200">{msg.content}</pre>
+          </div>
+        );
+      }
+
+      if (msg.role === "question") {
+        const isAnswered =
+          answeredQuestionTimestamps.has(msg.timestamp) ||
+          derivedAnsweredQuestionTimestamps.has(msg.timestamp);
+        return (
+          <QuestionCard
+            key={row.id}
+            message={msg}
+            rowId={row.id}
+            isAnswered={isAnswered}
+            onAnswer={(answer) => handleQuestionAnswer(msg.timestamp, answer)}
+          />
+        );
+      }
+
+      if (isUser) {
+        return (
+          <div key={row.id} className="flex justify-end">
+            <div className="max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-3">
+              <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm leading-relaxed md-text-strong">
+                {msg.content.replace(/^>\s?/, "")}
+              </pre>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div key={row.id}>
+          <MarkdownMessage content={msg.content} />
+        </div>
+      );
+    });
+  }, [
+    answeredQuestionTimestamps,
+    chatRows,
+    derivedAnsweredQuestionTimestamps,
+    expandedActivityIdsByWorkspace,
+    handleQuestionAnswer,
+    isThinkingCurrentWorkspace,
+    selectedWorkspace,
+  ]);
   const sortedWorkspaceChanges = useMemo(
     () =>
       [...workspaceChanges].sort((a, b) => {
@@ -3351,122 +3503,7 @@ function App() {
                       )}
                     </div>
                   ) : activeCenterTab.type === "chat" ? (
-                    chatRows.map((row, rowIdx) => {
-                      if (row.kind === "activity") {
-                        const isLatestRunningActivity = isThinkingCurrentWorkspace && rowIdx === chatRows.length - 1;
-                        const expanded = isActivityExpanded(row.id);
-                        return (
-                          <div key={row.id}>
-                            <button
-                              onClick={() => toggleActivityGroup(row.id)}
-                              className="flex w-full items-center gap-2 py-1.5 text-left transition hover:bg-white/5"
-                            >
-                              <span className="text-xs md-text-faint">
-                                Agent activity ({row.group.messages.length} events)
-                              </span>
-                              {isLatestRunningActivity && (
-                                <span className="inline-flex items-center gap-1 rounded-full border border-amber-700/60 bg-amber-950/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
-                                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-300" />
-                                  running
-                                </span>
-                              )}
-                              <span className="material-symbols-rounded ml-auto !text-sm md-text-faint">
-                                {expanded ? "expand_more" : "chevron_right"}
-                              </span>
-                            </button>
-
-                            {expanded && (
-                              <div className="space-y-1.5 pl-2 pt-1 pb-1">
-                                {row.group.lines.map((line, lineIdx) => (
-                                  <div key={`${row.id}-line-${lineIdx}`} className="flex items-start gap-2 text-xs md-text-faint">
-                                    <span className="mt-1 h-1 w-1 flex-none rounded-full bg-white/20" />
-                                    <span className="break-all font-mono">
-                                      <LinkifiedInlineText
-                                        text={line.text}
-                                        className="underline decoration-white/35 underline-offset-2 hover:decoration-white/70"
-                                      />
-                                    </span>
-                                    {line.count > 1 && (
-                                      <span className="text-[10px] md-text-faint">x{line.count}</span>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      }
-
-                      const msg = row.message;
-                      const isUser =
-                        msg.role === "user" ||
-                        msg.agentId === "user" ||
-                        msg.content.trimStart().startsWith(">");
-
-                      if (msg.isError) {
-                        if (msg.role === "credential_error") {
-                          return (
-                            <div key={row.id} className="rounded-xl border border-amber-700/60 bg-amber-950/25 px-3 py-2">
-                              <div className="mb-1 text-[11px] uppercase tracking-wide text-amber-300">Credential Error</div>
-                              <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm text-amber-200">{msg.content}</pre>
-                              <button
-                                type="button"
-                                className="mt-1.5 text-xs text-amber-400 underline underline-offset-2 hover:text-amber-300"
-                                onClick={() => setTerminalTab("setup")}
-                              >
-                                Open Setup tab
-                              </button>
-                            </div>
-                          );
-                        }
-                        return (
-                          <div key={row.id} className="rounded-xl border border-rose-700/60 bg-rose-950/20 px-3 py-2">
-                            <div className="mb-1 text-[11px] uppercase tracking-wide text-rose-300">Error</div>
-                            <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm text-rose-200">{msg.content}</pre>
-                          </div>
-                        );
-                      }
-
-                      if (msg.role === "question") {
-                        const isAnswered =
-                          answeredQuestionTimestamps.has(msg.timestamp) ||
-                          derivedAnsweredQuestionTimestamps.has(msg.timestamp);
-                        return (
-                          <QuestionCard
-                            key={row.id}
-                            message={msg}
-                            rowId={row.id}
-                            isAnswered={isAnswered}
-                            onAnswer={(answer) => {
-                              setAnsweredQuestionTimestamps((prev) => {
-                                const next = new Set(prev);
-                                next.add(msg.timestamp);
-                                return next;
-                              });
-                              void sendMessage(answer);
-                            }}
-                          />
-                        );
-                      }
-
-                      if (isUser) {
-                        return (
-                          <div key={row.id} className="flex justify-end">
-                            <div className="max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-3">
-                              <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm leading-relaxed md-text-strong">
-                                {msg.content.replace(/^>\s?/, "")}
-                              </pre>
-                            </div>
-                          </div>
-                        );
-                      }
-
-                      return (
-                        <div key={row.id}>
-                          <MarkdownMessage content={msg.content} />
-                        </div>
-                      );
-                    })
+                    renderedChatRows
                   ) : activeCenterTab.type === "file" ? (
                     <div>
                       <p className="mb-2 truncate text-xs md-text-muted">{activeCenterTab.path}</p>
