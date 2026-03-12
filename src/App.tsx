@@ -886,7 +886,7 @@ function App() {
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
-  const [inputMessage, setInputMessage] = useState("");
+  const [inputMessageByWorkspace, setInputMessageByWorkspace] = useState<Record<string, string>>({});
   const [activeRightTab, setActiveRightTab] = useState<"prompts" | "files" | "changes" | "checks">("prompts");
   const [workspaceFilesByPath, setWorkspaceFilesByPath] = useState<Record<string, WorkspaceFileEntry[]>>({});
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
@@ -936,8 +936,10 @@ function App() {
     return createThemeDraftFromTheme(baseTheme);
   });
   const [envOverridesText, setEnvOverridesText] = useState("");
-  const [claudeMode, setClaudeMode] = useState<ClaudeMode>("normal");
-  const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
+  const [defaultClaudeMode, setDefaultClaudeMode] = useState<ClaudeMode>("normal");
+  const [claudeModeByWorkspace, setClaudeModeByWorkspace] = useState<Record<string, ClaudeMode>>({});
+  const [defaultModel, setDefaultModel] = useState(DEFAULT_MODEL_ID);
+  const [selectedModelByWorkspace, setSelectedModelByWorkspace] = useState<Record<string, string>>({});
   const [thinkingMode, setThinkingMode] = useState<"off" | "low" | "medium" | "high">("off");
   const [attachedFiles, setAttachedFiles] = useState<string[]>([]);
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(false);
@@ -983,6 +985,13 @@ function App() {
   const allSkills = useMemo(() => [...projectSkills, ...userSkills], [projectSkills, userSkills]);
   const availableThemes = useMemo(() => getAllThemes(customThemes), [customThemes]);
   const themeOptions = useMemo(() => getThemeOptions(availableThemes), [availableThemes]);
+  const inputMessage = selectedWorkspace ? (inputMessageByWorkspace[selectedWorkspace] ?? "") : "";
+  const claudeMode = selectedWorkspace
+    ? (claudeModeByWorkspace[selectedWorkspace] ?? defaultClaudeMode)
+    : defaultClaudeMode;
+  const selectedModel = selectedWorkspace
+    ? (selectedModelByWorkspace[selectedWorkspace] ?? defaultModel)
+    : defaultModel;
 
   useEffect(() => {
     selectedWorkspaceRef.current = selectedWorkspace;
@@ -1224,6 +1233,42 @@ function App() {
       }
       return prev;
     });
+    setInputMessageByWorkspace((prev) => {
+      let changed = false;
+      const next: Record<string, string> = {};
+      for (const [workspaceId, draft] of Object.entries(prev)) {
+        if (validWorkspaceIds.has(workspaceId)) {
+          next[workspaceId] = draft;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setSelectedModelByWorkspace((prev) => {
+      let changed = false;
+      const next: Record<string, string> = {};
+      for (const [workspaceId, model] of Object.entries(prev)) {
+        if (validWorkspaceIds.has(workspaceId)) {
+          next[workspaceId] = model;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setClaudeModeByWorkspace((prev) => {
+      let changed = false;
+      const next: Record<string, ClaudeMode> = {};
+      for (const [workspaceId, mode] of Object.entries(prev)) {
+        if (validWorkspaceIds.has(workspaceId)) {
+          next[workspaceId] = mode;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
   }, [workspaces]);
 
   useEffect(() => {
@@ -1388,7 +1433,7 @@ function App() {
     try {
       const raw = localStorage.getItem(CLAUDE_MODE_STORAGE_KEY);
       if (raw === "plan" || raw === "normal") {
-        setClaudeMode(raw);
+        setDefaultClaudeMode(raw);
       }
     } catch (err) {
       console.error("Failed to load Claude mode:", err);
@@ -1397,11 +1442,11 @@ function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(CLAUDE_MODE_STORAGE_KEY, claudeMode);
+      localStorage.setItem(CLAUDE_MODE_STORAGE_KEY, defaultClaudeMode);
     } catch (err) {
       console.error("Failed to persist Claude mode:", err);
     }
-  }, [claudeMode]);
+  }, [defaultClaudeMode]);
 
   useEffect(() => {
     try {
@@ -1410,9 +1455,9 @@ function App() {
         const normalized = raw.trim();
         const isKnownOption = MODEL_OPTIONS.some((option) => option.value === normalized);
         if (isKnownOption) {
-          setSelectedModel(normalized);
+          setDefaultModel(normalized);
         } else {
-          setSelectedModel(DEFAULT_MODEL_ID);
+          setDefaultModel(DEFAULT_MODEL_ID);
         }
       }
     } catch (err) {
@@ -1422,11 +1467,11 @@ function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(MODEL_STORAGE_KEY, selectedModel);
+      localStorage.setItem(MODEL_STORAGE_KEY, defaultModel);
     } catch (err) {
       console.error("Failed to persist model selection:", err);
     }
-  }, [selectedModel]);
+  }, [defaultModel]);
 
   useEffect(() => {
     try {
@@ -2126,6 +2171,31 @@ function App() {
     return map;
   }
 
+  function setWorkspaceInputDraft(value: string) {
+    if (!selectedWorkspace) return;
+    setInputMessageByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: value }));
+  }
+
+  function setWorkspaceModel(value: string) {
+    const normalized = value.trim();
+    const isKnownOption = MODEL_OPTIONS.some((option) => option.value === normalized);
+    const nextValue = isKnownOption ? normalized : DEFAULT_MODEL_ID;
+    if (!selectedWorkspace) {
+      setDefaultModel(nextValue);
+      return;
+    }
+    setSelectedModelByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: nextValue }));
+  }
+
+  function toggleWorkspaceClaudeMode() {
+    const nextMode: ClaudeMode = claudeMode === "plan" ? "normal" : "plan";
+    if (!selectedWorkspace) {
+      setDefaultClaudeMode(nextMode);
+      return;
+    }
+    setClaudeModeByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: nextMode }));
+  }
+
   function setBedrockEnabled(enabled: boolean) {
     setEnvOverridesText((current) => upsertEnvOverrideLine(current, BEDROCK_ENV_KEY, enabled ? "1" : null));
   }
@@ -2246,8 +2316,8 @@ function App() {
         model: selectedModel,
         effort: thinkingMode === "off" ? null : thinkingMode,
       });
-      if (!rawMessage) {
-        setInputMessage("");
+      if (!rawMessage && selectedWorkspace) {
+        setInputMessageByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: "" }));
       }
       setAttachedFiles([]);
     } catch (err) {
@@ -3479,7 +3549,7 @@ function App() {
                   <div className="rounded-2xl border md-outline md-surface-container md-px-3 md-py-2">
                     <textarea
                       value={inputMessage}
-                      onChange={(e) => setInputMessage(e.target.value)}
+                      onChange={(e) => setWorkspaceInputDraft(e.target.value)}
                       onKeyDown={(e) => {
                         if (e.key === "Enter" && !e.shiftKey) {
                           e.preventDefault();
@@ -3529,7 +3599,7 @@ function App() {
                         </button>
                         <select
                           value={selectedModel}
-                          onChange={(e) => setSelectedModel(e.target.value)}
+                          onChange={(e) => setWorkspaceModel(e.target.value)}
                           className="md-select !min-h-0 h-7 py-0 pl-2 pr-6 text-[11px]"
                           style={{ width: "auto" }}
                           aria-label="Model selection"
@@ -3555,7 +3625,7 @@ function App() {
 
                         <div className="ml-auto flex items-center gap-1">
                           <button
-                            onClick={() => setClaudeMode((prev) => (prev === "plan" ? "normal" : "plan"))}
+                            onClick={toggleWorkspaceClaudeMode}
                             className={`md-icon-plain !h-7 !w-7 ${claudeMode === "plan" ? "text-violet-300" : ""}`}
                             title={claudeMode === "plan" ? "Planning mode (click for normal)" : "Normal mode (click for plan)"}
                             aria-label={claudeMode === "plan" ? "Switch to normal mode" : "Switch to planning mode"}
