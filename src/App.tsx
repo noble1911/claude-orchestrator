@@ -50,7 +50,7 @@ interface Workspace {
   name: string;
   branch: string;
   worktreePath: string;
-  status: "idle" | "running" | "inReview" | "merged";
+  status: "idle" | "running" | "inReview" | "merged" | "initializing";
   lastActivity?: string;
   prUrl?: string;
 }
@@ -96,6 +96,21 @@ interface UpdateInfo {
   version: string;
   body?: string | null;
   date?: string | null;
+}
+
+// orchestrator.json configuration (Conductor pattern)
+interface OrchestratorConfig {
+  setupScript?: string;
+  runScript?: string;
+  runMode: string;
+  archiveScript?: string;
+  checks: OrchestratorCheck[];
+}
+
+interface OrchestratorCheck {
+  name: string;
+  command: string;
+  description?: string;
 }
 
 interface WorkspaceFileEntry {
@@ -950,6 +965,7 @@ function App() {
   const [showRenameForm, setShowRenameForm] = useState(false);
   const [renameWorkspaceId, setRenameWorkspaceId] = useState<string | null>(null);
   const [renameWorkspaceName, setRenameWorkspaceName] = useState("");
+  const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false);
   const [workspaceOpenTarget, setWorkspaceOpenTarget] = useState<WorkspaceOpenTarget>("");
   const [leftPanelWidth, setLeftPanelWidth] = useState(280);
   const [rightPanelWidth, setRightPanelWidth] = useState(360);
@@ -967,6 +983,8 @@ function App() {
   const [isTogglingRemoteServer, setIsTogglingRemoteServer] = useState(false);
   const [terminalTab, setTerminalTab] = useState<"setup" | "remote" | "terminal">("terminal");
   const [pendingAutoPromptsByWorkspace, setPendingAutoPromptsByWorkspace] = useState<Record<string, PromptShortcut[]>>({});
+  const [orchestratorConfig, setOrchestratorConfig] = useState<OrchestratorConfig | null>(null);
+  const [isRunningScript, setIsRunningScript] = useState(false);
   const startingWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const selectedWorkspaceRef = useRef<string | null>(null);
   const thinkingSinceByWorkspaceRef = useRef<Record<string, number | null>>({});
@@ -994,6 +1012,39 @@ function App() {
   useEffect(() => {
     pendingUnreadByWorkspaceRef.current = pendingUnreadByWorkspace;
   }, [pendingUnreadByWorkspace]);
+
+  // Global keyboard shortcuts (Conductor pattern)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't trigger shortcuts when typing in inputs
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      // Cmd+B: Toggle left sidebar
+      if (e.metaKey && e.key === "b" && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        setIsLeftPanelOpen(prev => !prev);
+      }
+
+      // Cmd+/: Show keyboard shortcuts
+      if (e.metaKey && e.key === "/" && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        setShowKeyboardShortcuts(true);
+      }
+
+      // Escape: Close any open dialog/form
+      if (e.key === "Escape") {
+        if (showKeyboardShortcuts) setShowKeyboardShortcuts(false);
+        else if (showCreateForm) setShowCreateForm(false);
+        else if (showRenameForm) setShowRenameForm(false);
+        else if (showThemeForm) setShowThemeForm(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [showKeyboardShortcuts, showCreateForm, showRenameForm, showThemeForm]);
 
   function normalizeUpdateErrorMessage(rawError: string): string {
     const message = rawError.trim();
@@ -1731,26 +1782,62 @@ function App() {
 
   async function createWorkspace() {
     if (!newWorkspaceName.trim() || !selectedRepo) return;
-    
+
+    // Check if git is busy (Conductor pattern: git-busy-check)
     try {
-      const workspace = await invoke<Workspace>("create_workspace", { 
+      const gitStatus = await invoke<string>("check_git_busy", { repoId: selectedRepo });
+      if (gitStatus.startsWith("busy:")) {
+        const reason = gitStatus.replace("busy:", "");
+        setError(`Cannot create workspace: git ${reason} in progress. Complete or abort the ${reason} first.`);
+        return;
+      }
+    } catch (err) {
+      console.warn("Git busy check failed, proceeding anyway:", err);
+    }
+
+    // Generate optimistic workspace immediately for instant UI feedback
+    const tempId = crypto.randomUUID();
+    const workspaceName = newWorkspaceName.trim();
+    const optimisticWorkspace: Workspace = {
+      id: tempId,
+      repoId: selectedRepo,
+      name: workspaceName,
+      branch: `workspace/${workspaceName}`,
+      worktreePath: "", // placeholder until backend confirms
+      status: "initializing",
+    };
+
+    // Update UI immediately - user sees workspace appear instantly
+    const autoRunPrompts = promptShortcuts.filter((shortcut) => shortcut.autoRunOnCreate);
+    setWorkspaces(prev => [...prev, optimisticWorkspace]);
+    setNewWorkspaceName("");
+    setShowCreateForm(false);
+    setSelectedWorkspace(tempId);
+    setIsLeftPanelOpen(false);
+
+    try {
+      // Backend creates actual workspace (git worktree add, etc.)
+      const workspace = await invoke<Workspace>("create_workspace", {
         repoId: selectedRepo,
-        name: newWorkspaceName.trim() 
+        name: workspaceName
       });
-      const autoRunPrompts = promptShortcuts.filter((shortcut) => shortcut.autoRunOnCreate);
-      setWorkspaces(prev => [...prev, workspace]);
-      setNewWorkspaceName("");
-      setShowCreateForm(false);
+
+      // Replace optimistic placeholder with real workspace data
+      setWorkspaces(prev => prev.map(w => w.id === tempId ? workspace : w));
+      setSelectedWorkspace(workspace.id);
+
+      // Handle auto-run prompts with real workspace ID
       if (autoRunPrompts.length > 0) {
         setPendingAutoPromptsByWorkspace((prev) => ({
           ...prev,
           [workspace.id]: autoRunPrompts,
         }));
       }
-      setSelectedWorkspace(workspace.id);
-      setIsLeftPanelOpen(false);
     } catch (err) {
+      // Rollback: remove optimistic workspace on failure
       console.error("Failed to create workspace:", err);
+      setWorkspaces(prev => prev.filter(w => w.id !== tempId));
+      setSelectedWorkspace(null);
       setError(String(err));
     }
   }
@@ -2276,6 +2363,52 @@ function App() {
     setSelectedWorkspace(workspaceId);
     setIsLeftPanelOpen(false);
     void ensureAgentForWorkspace(workspaceId);
+    // Load orchestrator.json config for the workspace
+    void loadOrchestratorConfig(workspaceId);
+  }
+
+  async function loadOrchestratorConfig(workspaceId: string) {
+    try {
+      const config = await invoke<OrchestratorConfig>("get_workspace_config", { workspaceId });
+      setOrchestratorConfig(config);
+    } catch (err) {
+      console.warn("Failed to load orchestrator config:", err);
+      setOrchestratorConfig(null);
+    }
+  }
+
+  async function runOrchestratorScript(scriptType: "setup" | "run" | "archive") {
+    if (!selectedWorkspace) return;
+    setIsRunningScript(true);
+    try {
+      const [stdout, stderr, exitCode] = await invoke<[string, string, number]>("run_orchestrator_script", {
+        workspaceId: selectedWorkspace,
+        scriptType,
+      });
+      // Add output to terminal
+      const newLines: TerminalLine[] = [
+        { id: crypto.randomUUID(), kind: "command", text: `orchestrator ${scriptType}` },
+      ];
+      if (stdout) {
+        newLines.push({ id: crypto.randomUUID(), kind: "stdout", text: stdout });
+      }
+      if (stderr) {
+        newLines.push({ id: crypto.randomUUID(), kind: "stderr", text: stderr });
+      }
+      newLines.push({
+        id: crypto.randomUUID(),
+        kind: exitCode === 0 ? "meta" : "stderr",
+        text: `Exit code: ${exitCode}`,
+      });
+      setTerminalLinesByWorkspace(prev => ({
+        ...prev,
+        [selectedWorkspace]: [...(prev[selectedWorkspace] || []), ...newLines],
+      }));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setIsRunningScript(false);
+    }
   }
 
   function isActivityExpanded(activityId: string): boolean {
@@ -2792,6 +2925,7 @@ function App() {
 
   const getStatusColor = (status: string) => {
     switch (status) {
+      case "initializing": return "bg-sky-400 animate-pulse";
       case "running": return "bg-emerald-400";
       case "inReview": return "bg-amber-400";
       case "merged": return "bg-violet-400";
@@ -3085,6 +3219,9 @@ function App() {
                       <div className="flex items-center gap-2">
                         <span className={`h-2 w-2 rounded-full ${getStatusColor(workspace.status)}`} />
                         <span className="truncate md-body-small md-text-primary">{workspace.name}</span>
+                        {workspace.status === "initializing" && (
+                          <span className="text-[10px] md-text-dim animate-pulse">Setting up...</span>
+                        )}
                         {(unreadByWorkspace[workspace.id] || 0) > 0 && (
                           <span
                             className="inline-flex min-h-[18px] min-w-[18px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-none text-white"
@@ -3100,9 +3237,10 @@ function App() {
                       <button
                         type="button"
                         onClick={() => openRenameWorkspaceForm(workspace)}
-                        className="md-icon-plain"
-                        title="Rename workspace"
+                        className="md-icon-plain disabled:opacity-30 disabled:cursor-not-allowed"
+                        title={workspace.status === "initializing" ? "Wait for setup to complete" : "Rename workspace"}
                         aria-label={`Rename ${workspace.name}`}
+                        disabled={workspace.status === "initializing"}
                       >
                         <span className="material-symbols-rounded !text-[16px]">edit</span>
                       </button>
@@ -3111,9 +3249,10 @@ function App() {
                         onClick={() => {
                           void removeWorkspace(workspace.id);
                         }}
-                        className="md-icon-plain md-icon-plain-danger"
-                        title="Delete workspace"
+                        className="md-icon-plain md-icon-plain-danger disabled:opacity-30 disabled:cursor-not-allowed"
+                        title={workspace.status === "initializing" ? "Wait for setup to complete" : "Delete workspace"}
                         aria-label={`Delete ${workspace.name}`}
+                        disabled={workspace.status === "initializing"}
                       >
                         <span className="material-symbols-rounded !text-[16px]">delete</span>
                       </button>
@@ -4230,6 +4369,59 @@ function App() {
                   placeholder={"export CLAUDE_CODE_USE_BEDROCK=1\n# optional if not using default profile\nexport AWS_PROFILE=your-profile"}
                 />
               </div>
+
+              {/* Scripts (conductor.json / orchestrator.json) */}
+              <div className="border-t md-outline pt-3">
+                <p className="md-text-dim">Scripts</p>
+                <p className="mb-2 text-[11px] md-text-muted">
+                  Configure via conductor.json or orchestrator.json at repo/workspace root.
+                </p>
+                {orchestratorConfig && (orchestratorConfig.setupScript || orchestratorConfig.runScript) ? (
+                  <div className="space-y-2">
+                    {orchestratorConfig.setupScript && (
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void runOrchestratorScript("setup")}
+                          disabled={isRunningScript}
+                          className="md-btn md-btn-tonal !min-h-0 flex-1 !px-2 !py-1 text-[11px] disabled:opacity-50"
+                        >
+                          {isRunningScript ? "Running..." : "Run Setup"}
+                        </button>
+                        <code className="flex-1 truncate rounded bg-black/20 px-1 py-0.5 text-[10px] md-text-muted">
+                          {orchestratorConfig.setupScript}
+                        </code>
+                      </div>
+                    )}
+                    {orchestratorConfig.runScript && (
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void runOrchestratorScript("run")}
+                          disabled={isRunningScript}
+                          className="md-btn md-btn-tonal !min-h-0 flex-1 !px-2 !py-1 text-[11px] disabled:opacity-50"
+                        >
+                          {isRunningScript ? "Running..." : "Run Script"}
+                        </button>
+                        <code className="flex-1 truncate rounded bg-black/20 px-1 py-0.5 text-[10px] md-text-muted">
+                          {orchestratorConfig.runScript}
+                        </code>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-[11px] md-text-muted">
+                    No scripts configured. Create conductor.json:
+                  </p>
+                )}
+                <pre className="mt-2 rounded bg-black/20 p-2 text-[10px] md-text-muted">
+{`{
+  "setupScript": "npm install",
+  "runScript": "npm run dev",
+  "runMode": "concurrent"
+}`}
+                </pre>
+              </div>
             </div>
           )}
           {terminalTab === "terminal" && (
@@ -4699,6 +4891,41 @@ function App() {
               </button>
               <button onClick={saveThemeDraft} className="md-btn md-btn-tonal">
                 {editingThemeId ? "Save Theme" : "Create Theme"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Keyboard Shortcuts Dialog (Conductor pattern: Cmd+/) */}
+      {showKeyboardShortcuts && (
+        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
+          <div className="md-dialog mx-4 w-full max-w-md">
+            <div className="border-b md-outline p-4">
+              <h3 className="text-lg font-semibold md-text-strong">Keyboard Shortcuts</h3>
+              <p className="mt-1 text-sm md-text-muted">
+                Quick actions to boost your productivity
+              </p>
+            </div>
+
+            <div className="p-4 space-y-3">
+              <div className="flex items-center justify-between py-2 border-b md-outline">
+                <span className="md-text-secondary">Toggle sidebar</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘B</kbd>
+              </div>
+              <div className="flex items-center justify-between py-2 border-b md-outline">
+                <span className="md-text-secondary">Show shortcuts</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘/</kbd>
+              </div>
+              <div className="flex items-center justify-between py-2 border-b md-outline">
+                <span className="md-text-secondary">Close dialog</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">Esc</kbd>
+              </div>
+            </div>
+
+            <div className="flex justify-end border-t md-outline p-4">
+              <button onClick={() => setShowKeyboardShortcuts(false)} className="md-btn md-btn-tonal">
+                Done
               </button>
             </div>
           </div>

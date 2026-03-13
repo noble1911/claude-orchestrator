@@ -38,6 +38,41 @@ pub struct Repository {
     pub added_at: String,
 }
 
+/// Configuration file for repository-specific scripts (orchestrator.json)
+/// Inspired by Conductor's script system
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratorConfig {
+    /// Script to run when setting up a new workspace
+    #[serde(default)]
+    pub setup_script: Option<String>,
+    /// Script to run for the "Run" command
+    #[serde(default)]
+    pub run_script: Option<String>,
+    /// How to handle concurrent run scripts: "concurrent" or "sequential"
+    #[serde(default = "default_run_mode")]
+    pub run_mode: String,
+    /// Script to run before archiving a workspace
+    #[serde(default)]
+    pub archive_script: Option<String>,
+    /// Custom check commands (like lint, test, build)
+    #[serde(default)]
+    pub checks: Vec<OrchestratorCheck>,
+}
+
+fn default_run_mode() -> String {
+    "concurrent".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratorCheck {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -59,6 +94,7 @@ pub enum WorkspaceStatus {
     #[serde(rename = "inReview")]
     InReview,
     Merged,
+    Initializing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +291,7 @@ fn workspace_status_to_ws(status: &WorkspaceStatus) -> String {
         WorkspaceStatus::Running => "running".to_string(),
         WorkspaceStatus::InReview => "inReview".to_string(),
         WorkspaceStatus::Merged => "merged".to_string(),
+        WorkspaceStatus::Initializing => "initializing".to_string(),
     }
 }
 
@@ -320,6 +357,91 @@ fn is_git_repo(path: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Check if a git repository has an operation in progress that would prevent commits.
+/// Returns "clean" if safe, or "busy:<reason>" if an operation is in progress.
+/// Pattern from Conductor's git-busy-check.sh
+fn git_busy_check(repo_path: &str) -> String {
+    let git_dir = {
+        let output = Command::new("git")
+            .args(["rev-parse", "--git-dir"])
+            .current_dir(repo_path)
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if dir.starts_with('/') {
+                    PathBuf::from(dir)
+                } else {
+                    PathBuf::from(repo_path).join(dir)
+                }
+            }
+            _ => return "error:not_a_git_repo".to_string(),
+        }
+    };
+
+    // Check for rebase (directory-based, more reliable than REBASE_HEAD)
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        return "busy:rebase".to_string();
+    }
+
+    // Check for merge
+    if git_dir.join("MERGE_HEAD").exists() {
+        return "busy:merge".to_string();
+    }
+
+    // Check for cherry-pick
+    if git_dir.join("CHERRY_PICK_HEAD").exists() {
+        return "busy:cherry-pick".to_string();
+    }
+
+    // Check for revert
+    if git_dir.join("REVERT_HEAD").exists() {
+        return "busy:revert".to_string();
+    }
+
+    "clean".to_string()
+}
+
+/// Read conductor.json or orchestrator.json configuration from a repository or workspace path
+/// Checks conductor.json first, then orchestrator.json as fallback
+fn read_orchestrator_config(path: &str) -> OrchestratorConfig {
+    let base = PathBuf::from(path);
+
+    // Check conductor.json first (Conductor compatibility)
+    for filename in ["conductor.json", "orchestrator.json"] {
+        let config_path = base.join(filename);
+        if config_path.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&config_path) {
+                if let Ok(config) = serde_json::from_str::<OrchestratorConfig>(&contents) {
+                    return config;
+                }
+            }
+        }
+    }
+    OrchestratorConfig::default()
+}
+
+/// Run a script in a workspace with environment variables set
+fn run_script_in_workspace(
+    workspace_path: &str,
+    workspace_name: &str,
+    script: &str,
+) -> Result<(String, String, i32), String> {
+    let output = Command::new("sh")
+        .args(["-c", script])
+        .current_dir(workspace_path)
+        .env("ORCHESTRATOR_WORKSPACE_NAME", workspace_name)
+        .env("ORCHESTRATOR_WORKSPACE_PATH", workspace_path)
+        .output()
+        .map_err(|e| format!("Failed to run script: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((stdout, stderr, exit_code))
 }
 
 fn create_worktree(repo_path: &str, worktree_path: &str, branch: &str) -> Result<(), String> {
@@ -612,6 +734,84 @@ async fn list_workspaces(
         .cloned()
         .collect();
     Ok(result)
+}
+
+/// Check if a repository has a git operation in progress (Conductor pattern)
+#[tauri::command]
+async fn check_git_busy(
+    repo_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    let repo = {
+        let repos = state.repositories.read();
+        repos.get(&repo_id).cloned()
+            .ok_or("Repository not found")?
+    };
+    Ok(git_busy_check(&repo.path))
+}
+
+/// Get orchestrator.json configuration for a repository
+#[tauri::command]
+async fn get_orchestrator_config(
+    repo_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<OrchestratorConfig, String> {
+    let repo = {
+        let repos = state.repositories.read();
+        repos.get(&repo_id).cloned()
+            .ok_or("Repository not found")?
+    };
+    Ok(read_orchestrator_config(&repo.path))
+}
+
+/// Get orchestrator.json configuration for a workspace
+#[tauri::command]
+async fn get_workspace_config(
+    workspace_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<OrchestratorConfig, String> {
+    let workspace = {
+        let workspaces = state.workspaces.read();
+        workspaces.get(&workspace_id).cloned()
+            .ok_or("Workspace not found")?
+    };
+    // First check workspace path, then fall back to repo path
+    let config = read_orchestrator_config(&workspace.worktree_path);
+    if config.setup_script.is_some() || config.run_script.is_some() || !config.checks.is_empty() {
+        return Ok(config);
+    }
+    // Fall back to repo config
+    let repo = {
+        let repos = state.repositories.read();
+        repos.get(&workspace.repo_id).cloned()
+            .ok_or("Repository not found")?
+    };
+    Ok(read_orchestrator_config(&repo.path))
+}
+
+/// Run a script from orchestrator.json in a workspace
+#[tauri::command]
+async fn run_orchestrator_script(
+    workspace_id: String,
+    script_type: String, // "setup", "run", or "archive"
+    state: State<'_, Arc<AppState>>,
+) -> Result<(String, String, i32), String> {
+    let workspace = {
+        let workspaces = state.workspaces.read();
+        workspaces.get(&workspace_id).cloned()
+            .ok_or("Workspace not found")?
+    };
+
+    let config = read_orchestrator_config(&workspace.worktree_path);
+    let script = match script_type.as_str() {
+        "setup" => config.setup_script,
+        "run" => config.run_script,
+        "archive" => config.archive_script,
+        _ => return Err(format!("Unknown script type: {}", script_type)),
+    };
+
+    let script = script.ok_or(format!("No {} script configured", script_type))?;
+    run_script_in_workspace(&workspace.worktree_path, &workspace.name, &script)
 }
 
 #[tauri::command]
@@ -5550,6 +5750,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(app_state)
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -5590,6 +5791,10 @@ pub fn run() {
             remove_repository,
             list_repositories,
             list_workspaces,
+            check_git_busy,
+            get_orchestrator_config,
+            get_workspace_config,
+            run_orchestrator_script,
             create_workspace,
             remove_workspace,
             rename_workspace,

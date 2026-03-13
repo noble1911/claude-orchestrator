@@ -84,6 +84,33 @@ impl Database {
         }
         // Normalize legacy 'error' status to 'idle'
         conn.execute("UPDATE workspaces SET status = 'idle' WHERE status = 'error'", [])?;
+
+        // Conductor-inspired schema enhancements
+        // Add unread column for activity tracking
+        if conn.prepare("SELECT unread FROM workspaces LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE workspaces ADD COLUMN unread INTEGER DEFAULT 0")?;
+        }
+        // Add display_order for drag-and-drop reordering
+        if conn.prepare("SELECT display_order FROM workspaces LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE workspaces ADD COLUMN display_order INTEGER DEFAULT 0")?;
+        }
+        // Add pinned_at for pinning workspaces
+        if conn.prepare("SELECT pinned_at FROM workspaces LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE workspaces ADD COLUMN pinned_at TEXT")?;
+        }
+        // Add notes for user annotations
+        if conn.prepare("SELECT notes FROM workspaces LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE workspaces ADD COLUMN notes TEXT")?;
+        }
+
+        // Session enhancements
+        if conn.prepare("SELECT unread_count FROM sessions LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN unread_count INTEGER DEFAULT 0")?;
+        }
+        if conn.prepare("SELECT model FROM sessions LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN model TEXT")?;
+        }
+
         Ok(())
     }
 
@@ -366,6 +393,7 @@ fn workspace_status_to_str(status: &WorkspaceStatus) -> &'static str {
         WorkspaceStatus::Running => "running",
         WorkspaceStatus::InReview => "inReview",
         WorkspaceStatus::Merged => "merged",
+        WorkspaceStatus::Initializing => "initializing",
     }
 }
 
@@ -374,6 +402,7 @@ fn workspace_status_from_str(s: &str) -> WorkspaceStatus {
         "running" => WorkspaceStatus::Running,
         "inReview" | "in_review" => WorkspaceStatus::InReview,
         "merged" => WorkspaceStatus::Merged,
+        "initializing" => WorkspaceStatus::Initializing,
         _ => WorkspaceStatus::Idle,
     }
 }

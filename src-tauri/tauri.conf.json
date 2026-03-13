@@ -51,6 +51,9 @@
         "https://github.com/noble1911/claude-orchestrator-releases/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE4NzQ1RUM1MTA5RjA5RkUKUldUK0NaOFF4VjUwR1Ayd1UrYkZiZGxISi9zcDR6RTRoYjlVNjQ3eVdUMk9sUlpZVDY4MXNpOTQK"
+    },
+    "window-state": {
+      "filename": "window-state.json"
     }
   }
 }

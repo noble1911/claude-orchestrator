@@ -7,14 +7,16 @@
 @layer base {
   :root {
     /* Color tokens are injected at runtime from src/themes.ts. */
-    font-family: "Roboto Flex", "Noto Sans", "Segoe UI Variable", "Segoe UI", sans-serif;
+    /* Use SF Pro on macOS, Inter as fallback, then system fonts */
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
 
-    --md-type-title-small: 500 0.95rem/1.35 "Roboto Flex", "Noto Sans", "Segoe UI Variable", "Segoe UI", sans-serif;
-    --md-type-label-large: 500 0.82rem/1.2 "Roboto Flex", "Noto Sans", "Segoe UI Variable", "Segoe UI", sans-serif;
-    --md-type-label-medium: 500 0.75rem/1.2 "Roboto Flex", "Noto Sans", "Segoe UI Variable", "Segoe UI", sans-serif;
-    --md-type-body-small: 400 0.78rem/1.42 "Roboto Flex", "Noto Sans", "Segoe UI Variable", "Segoe UI", sans-serif;
+    --md-type-title-small: 500 0.95rem/1.35 -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", sans-serif;
+    --md-type-label-large: 500 0.82rem/1.2 -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", sans-serif;
+    --md-type-label-medium: 500 0.75rem/1.2 -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", sans-serif;
+    --md-type-body-small: 400 0.78rem/1.42 -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", sans-serif;
   }
 
   * {
