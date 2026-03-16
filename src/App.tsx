@@ -15,6 +15,24 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  DndContext,
+  DragOverlay,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragStartEvent,
+  type DragEndEvent,
+  type DragOverEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+  useSortable,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
@@ -55,6 +73,10 @@ interface Workspace {
   status: "idle" | "running" | "inReview" | "merged" | "initializing";
   lastActivity?: string;
   prUrl?: string;
+  unread: number;
+  displayOrder: number;
+  pinnedAt?: string | null;
+  notes?: string | null;
 }
 
 interface Agent {
@@ -222,6 +244,13 @@ interface QuestionItem {
 
 interface AskUserQuestionPayload {
   questions: QuestionItem[];
+}
+
+interface QueuedMessage {
+  id: string;
+  text: string;
+  visible: string;
+  queuedAt: number;
 }
 
 interface ThemeDraft {
@@ -639,9 +668,31 @@ const PROMPT_SHORTCUTS_STORAGE_KEY = "claude_orchestrator_prompt_shortcuts";
 const ENV_OVERRIDES_STORAGE_KEY = "claude_orchestrator_env_overrides";
 const CLAUDE_MODE_STORAGE_KEY = "claude_orchestrator_mode";
 const MODEL_STORAGE_KEY = "claude_orchestrator_model";
+const MODEL_BY_WORKSPACE_STORAGE_KEY = "claude_orchestrator_model_by_workspace";
 const THINKING_MODE_STORAGE_KEY = "claude_orchestrator_thinking_mode";
 const DEFAULT_REPOSITORY_STORAGE_KEY = "claude_orchestrator_default_repository";
 const BEDROCK_ENV_KEY = "CLAUDE_CODE_USE_BEDROCK";
+const WORKSPACE_GROUPS_STORAGE_KEY = "claude_orchestrator_workspace_groups";
+
+interface WorkspaceGroup {
+  id: string;
+  label: string;
+  /** Which workspace statuses belong in this group */
+  statuses: Workspace["status"][];
+}
+
+const DEFAULT_WORKSPACE_GROUPS: WorkspaceGroup[] = [
+  { id: "in-progress", label: "In progress", statuses: ["running"] },
+  { id: "in-review", label: "In review", statuses: ["inReview"] },
+  { id: "ready", label: "Ready", statuses: ["idle", "initializing"] },
+  { id: "done", label: "Done", statuses: ["merged"] },
+];
+
+/** When a workspace is dragged into a group, which status should it get? Uses the first non-system status. */
+function statusForGroup(group: WorkspaceGroup): Workspace["status"] | null {
+  const settable = group.statuses.filter((s) => s !== "initializing");
+  return settable[0] ?? null;
+}
 
 function cloneThemeColors(source: Record<ThemeColorTokenKey, string>): Record<ThemeColorTokenKey, string> {
   const colors = {} as Record<ThemeColorTokenKey, string>;
@@ -897,6 +948,119 @@ function QuestionCard({ message, rowId, isAnswered, onAnswer }: QuestionCardProp
   );
 }
 
+interface SortableWorkspaceItemProps {
+  workspace: Workspace;
+  isSelected: boolean;
+  unreadCount: number;
+  onSelect: (id: string) => void;
+  onTogglePin: (id: string) => void;
+  onRename: (ws: Workspace) => void;
+  onRemove: (id: string) => void;
+  getStatusColor: (status: string) => string;
+}
+
+function SortableWorkspaceItem({
+  workspace,
+  isSelected,
+  unreadCount,
+  onSelect,
+  onTogglePin,
+  onRename,
+  onRemove,
+  getStatusColor,
+}: SortableWorkspaceItemProps) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: workspace.id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.4 : 1,
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={`md-list-item flex items-center gap-2 md-px-3 md-py-2 ${
+        isSelected ? "md-list-item-active" : ""
+      }`}
+    >
+      <div
+        {...attributes}
+        {...listeners}
+        className="flex shrink-0 cursor-grab items-center md-text-dim active:cursor-grabbing"
+        title="Drag to reorder or move between groups"
+      >
+        <span className="material-symbols-rounded !text-[14px]">drag_indicator</span>
+      </div>
+      <button
+        type="button"
+        onClick={() => onSelect(workspace.id)}
+        className="min-w-0 flex-1 text-left"
+      >
+        <div className="flex items-center gap-2">
+          <span className={`h-2 w-2 rounded-full ${getStatusColor(workspace.status)}`} />
+          {workspace.pinnedAt && (
+            <span className="material-symbols-rounded !text-[12px] md-text-dim" title="Pinned">keep</span>
+          )}
+          <span className="truncate md-body-small md-text-primary">{workspace.name}</span>
+          {workspace.status === "initializing" && (
+            <span className="text-[10px] md-text-dim animate-pulse">Setting up...</span>
+          )}
+          {unreadCount > 0 && (
+            <span
+              className="inline-flex min-h-[18px] min-w-[18px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-none text-white"
+              title={`${unreadCount} unread AI ${unreadCount === 1 ? "response" : "responses"}`}
+            >
+              {unreadCount}
+            </span>
+          )}
+        </div>
+        <p className="mt-1 truncate md-body-small md-text-muted">{workspace.branch}</p>
+      </button>
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={() => onTogglePin(workspace.id)}
+          className="md-icon-plain disabled:opacity-30 disabled:cursor-not-allowed"
+          title={workspace.pinnedAt ? "Unpin workspace" : "Pin workspace"}
+          aria-label={workspace.pinnedAt ? `Unpin ${workspace.name}` : `Pin ${workspace.name}`}
+          disabled={workspace.status === "initializing"}
+        >
+          <span className="material-symbols-rounded !text-[16px]">{workspace.pinnedAt ? "keep_off" : "keep"}</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onRename(workspace)}
+          className="md-icon-plain disabled:opacity-30 disabled:cursor-not-allowed"
+          title={workspace.status === "initializing" ? "Wait for setup to complete" : "Rename workspace"}
+          aria-label={`Rename ${workspace.name}`}
+          disabled={workspace.status === "initializing"}
+        >
+          <span className="material-symbols-rounded !text-[16px]">edit</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onRemove(workspace.id)}
+          className="md-icon-plain md-icon-plain-danger disabled:opacity-30 disabled:cursor-not-allowed"
+          title={workspace.status === "initializing" ? "Wait for setup to complete" : "Delete workspace"}
+          aria-label={`Delete ${workspace.name}`}
+          disabled={workspace.status === "initializing"}
+        >
+          <span className="material-symbols-rounded !text-[16px]">delete</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [repositories, setRepositories] = useState<Repository[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
@@ -971,6 +1135,11 @@ function App() {
   const [defaultModel, setDefaultModel] = useState(DEFAULT_MODEL_ID);
   const [selectedModelByWorkspace, setSelectedModelByWorkspace] = useState<Record<string, string>>({});
   const [thinkingMode, setThinkingMode] = useState<"off" | "low" | "medium" | "high">("off");
+  const [workspaceGroupConfig, setWorkspaceGroupConfig] = useState<WorkspaceGroup[]>(DEFAULT_WORKSPACE_GROUPS);
+  const [showGroupSettings, setShowGroupSettings] = useState(false);
+  const [dragActiveId, setDragActiveId] = useState<string | null>(null);
+  const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null);
+  const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   const [attachedFiles, setAttachedFiles] = useState<string[]>([]);
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(false);
   const [isRightPanelOpen, setIsRightPanelOpen] = useState(false);
@@ -1009,6 +1178,9 @@ function App() {
   const pendingUnreadByWorkspaceRef = useRef<Record<string, boolean>>({});
   const detectedPrUrlByWorkspaceRef = useRef<Record<string, string>>({});
   const sendMessageRef = useRef<(rawMessage?: string, visibleOverride?: string) => Promise<boolean>>(async () => false);
+  const [queuedMessagesByWorkspace, setQueuedMessagesByWorkspace] = useState<Record<string, QueuedMessage[]>>({});
+  const queuedMessagesByWorkspaceRef = useRef<Record<string, QueuedMessage[]>>({});
+  useEffect(() => { queuedMessagesByWorkspaceRef.current = queuedMessagesByWorkspace; }, [queuedMessagesByWorkspace]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const terminalInputRef = useRef<HTMLInputElement>(null);
@@ -1042,8 +1214,12 @@ function App() {
   // Global keyboard shortcuts (Conductor pattern)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't trigger shortcuts when typing in inputs
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+      // Don't trigger unmodified shortcuts when typing in inputs
+      // Allow Cmd/Ctrl combos and Escape through regardless of focus
+      if (
+        !e.metaKey && !e.ctrlKey && e.key !== "Escape" &&
+        (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)
+      ) {
         return;
       }
 
@@ -1061,7 +1237,8 @@ function App() {
 
       // Escape: Close any open dialog/form
       if (e.key === "Escape") {
-        if (showKeyboardShortcuts) setShowKeyboardShortcuts(false);
+        if (showGroupSettings) setShowGroupSettings(false);
+        else if (showKeyboardShortcuts) setShowKeyboardShortcuts(false);
         else if (showCreateForm) setShowCreateForm(false);
         else if (showRenameForm) setShowRenameForm(false);
         else if (showThemeForm) setShowThemeForm(false);
@@ -1070,7 +1247,7 @@ function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [showKeyboardShortcuts, showCreateForm, showRenameForm, showThemeForm]);
+  }, [showGroupSettings, showKeyboardShortcuts, showCreateForm, showRenameForm, showThemeForm]);
 
   function normalizeUpdateErrorMessage(rawError: string): string {
     const message = rawError.trim();
@@ -1123,10 +1300,11 @@ function App() {
             return next;
           });
         } else {
-          setUnreadByWorkspace((prev) => ({
-            ...prev,
-            [messageWorkspaceId]: (prev[messageWorkspaceId] || 0) + 1,
-          }));
+          setUnreadByWorkspace((prev) => {
+            const next = (prev[messageWorkspaceId] || 0) + 1;
+            persistUnread(messageWorkspaceId, next);
+            return { ...prev, [messageWorkspaceId]: next };
+          });
         }
       }
       if (event.payload.role === "credential_error" && messageWorkspaceId) {
@@ -1176,6 +1354,21 @@ function App() {
       if (running) {
         return;
       }
+
+      // Drain the next queued message for this workspace
+      const queue = queuedMessagesByWorkspaceRef.current[workspaceId];
+      if (queue && queue.length > 0) {
+        const [next, ...rest] = queue;
+        setQueuedMessagesByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: rest,
+        }));
+        // Small delay to let the agent settle before sending the next message
+        setTimeout(() => {
+          void sendMessageRef.current(next.text, next.visible);
+        }, 300);
+      }
+
       if (selectedWorkspaceRef.current === workspaceId) {
         setPendingUnreadByWorkspace((prev) => {
           if (!prev[workspaceId]) return prev;
@@ -1187,10 +1380,11 @@ function App() {
         return;
       }
       if (pendingUnreadByWorkspaceRef.current[workspaceId]) {
-        setUnreadByWorkspace((prev) => ({
-          ...prev,
-          [workspaceId]: (prev[workspaceId] || 0) + 1,
-        }));
+        setUnreadByWorkspace((prev) => {
+          const next = (prev[workspaceId] || 0) + 1;
+          persistUnread(workspaceId, next);
+          return { ...prev, [workspaceId]: next };
+        });
         setPendingUnreadByWorkspace((prev) => {
           if (!prev[workspaceId]) return prev;
           const next = { ...prev };
@@ -1255,6 +1449,7 @@ function App() {
       loadMessages(selectedWorkspace);
       setUnreadByWorkspace((prev) => {
         if (!prev[selectedWorkspace]) return prev;
+        persistUnread(selectedWorkspace, 0);
         const next = { ...prev };
         delete next[selectedWorkspace];
         return next;
@@ -1543,6 +1738,30 @@ function App() {
 
   useEffect(() => {
     try {
+      const raw = localStorage.getItem(MODEL_BY_WORKSPACE_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Record<string, string>;
+        setSelectedModelByWorkspace(parsed);
+      }
+    } catch (err) {
+      console.error("Failed to load per-workspace model selection:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      if (Object.keys(selectedModelByWorkspace).length > 0) {
+        localStorage.setItem(MODEL_BY_WORKSPACE_STORAGE_KEY, JSON.stringify(selectedModelByWorkspace));
+      } else {
+        localStorage.removeItem(MODEL_BY_WORKSPACE_STORAGE_KEY);
+      }
+    } catch (err) {
+      console.error("Failed to persist per-workspace model selection:", err);
+    }
+  }, [selectedModelByWorkspace]);
+
+  useEffect(() => {
+    try {
       const raw = localStorage.getItem(THINKING_MODE_STORAGE_KEY);
       if (raw === "off" || raw === "low" || raw === "medium" || raw === "high") {
         setThinkingMode(raw);
@@ -1559,6 +1778,26 @@ function App() {
       console.error("Failed to persist thinking mode:", err);
     }
   }, [thinkingMode]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(WORKSPACE_GROUPS_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as WorkspaceGroup[];
+        if (Array.isArray(parsed) && parsed.length > 0) setWorkspaceGroupConfig(parsed);
+      }
+    } catch (err) {
+      console.error("Failed to load workspace groups:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(WORKSPACE_GROUPS_STORAGE_KEY, JSON.stringify(workspaceGroupConfig));
+    } catch (err) {
+      console.error("Failed to persist workspace groups:", err);
+    }
+  }, [workspaceGroupConfig]);
 
   // useLayoutEffect prevents a visual flash when switching workspaces:
   // it clears stale state synchronously before the browser paints,
@@ -1750,10 +1989,118 @@ function App() {
     }
   }
 
+  function persistUnread(workspaceId: string, count: number) {
+    invoke("update_workspace_unread", { workspaceId, unread: count }).catch(() => {});
+  }
+
+  async function togglePin(workspaceId: string) {
+    try {
+      const updated = await invoke<Workspace>("toggle_workspace_pinned", { workspaceId });
+      setWorkspaces((prev) => prev.map((w) => (w.id === updated.id ? updated : w)));
+    } catch (err) {
+      console.error("Failed to toggle pin:", err);
+    }
+  }
+
+  function handleDragStart(event: DragStartEvent) {
+    setDragActiveId(event.active.id as string);
+  }
+
+  function handleDragOver(event: DragOverEvent) {
+    const overId = event.over?.id as string | undefined;
+    if (!overId) { setDragOverGroupId(null); return; }
+    // overId could be a workspace id or a group droppable id (prefixed with "group:")
+    if (overId.startsWith("group:")) {
+      setDragOverGroupId(overId.replace("group:", ""));
+    } else {
+      // Find which group the over workspace belongs to
+      const overGroup = workspaceGroups.find((g) => g.items.some((w) => w.id === overId));
+      setDragOverGroupId(overGroup?.key ?? null);
+    }
+  }
+
+  async function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    setDragActiveId(null);
+    setDragOverGroupId(null);
+    if (!over || !active) return;
+
+    const activeId = active.id as string;
+    const overId = over.id as string;
+
+    // Determine target group
+    let targetGroup: typeof workspaceGroups[0] | undefined;
+    if (overId.startsWith("group:")) {
+      targetGroup = workspaceGroups.find((g) => g.key === overId.replace("group:", ""));
+    } else {
+      targetGroup = workspaceGroups.find((g) => g.items.some((w) => w.id === overId));
+    }
+
+    // Determine source group
+    const sourceGroup = workspaceGroups.find((g) => g.items.some((w) => w.id === activeId));
+
+    if (!targetGroup || !sourceGroup) return;
+
+    if (sourceGroup.key !== targetGroup.key) {
+      // Cross-group move: change workspace status
+      const groupDef = workspaceGroupConfig.find((g) => g.id === targetGroup!.key);
+      if (!groupDef) return;
+      const newStatus = statusForGroup(groupDef);
+      if (!newStatus) return;
+      try {
+        const updated = await invoke<Workspace>("set_workspace_status", {
+          workspaceId: activeId,
+          status: newStatus,
+        });
+        setWorkspaces((prev) => prev.map((w) => (w.id === updated.id ? updated : w)));
+      } catch (err) {
+        console.error("Failed to move workspace:", err);
+      }
+    } else if (activeId !== overId && !overId.startsWith("group:")) {
+      // Same-group reorder
+      const oldIndex = sourceGroup.items.findIndex((w) => w.id === activeId);
+      const newIndex = sourceGroup.items.findIndex((w) => w.id === overId);
+      if (oldIndex !== -1 && newIndex !== -1) {
+        const reordered = arrayMove(sourceGroup.items, oldIndex, newIndex);
+        reordered.forEach((w, idx) => {
+          invoke("update_workspace_display_order", { workspaceId: w.id, displayOrder: idx }).catch(() => {});
+        });
+        setWorkspaces((prev) => {
+          const updated = new Map(reordered.map((w, idx) => [w.id, idx]));
+          return prev.map((w) => (updated.has(w.id) ? { ...w, displayOrder: updated.get(w.id)! } : w));
+        });
+      }
+    }
+  }
+
+  function removeQueuedMessage(workspaceId: string, messageId: string) {
+    setQueuedMessagesByWorkspace((prev) => ({
+      ...prev,
+      [workspaceId]: (prev[workspaceId] || []).filter((m) => m.id !== messageId),
+    }));
+  }
+
+  async function saveWorkspaceNotes(workspaceId: string, notes: string) {
+    try {
+      await invoke("update_workspace_notes", { workspaceId, notes });
+      setWorkspaces((prev) =>
+        prev.map((w) => (w.id === workspaceId ? { ...w, notes: notes || null } : w)),
+      );
+    } catch (err) {
+      console.error("Failed to save notes:", err);
+    }
+  }
+
   async function loadWorkspaces(repoId: string) {
     try {
       const ws = await invoke<Workspace[]>("list_workspaces", { repoId });
       setWorkspaces(ws);
+      // Initialize unread counts from persisted data
+      const unreadInit: Record<string, number> = {};
+      for (const w of ws) {
+        if (w.unread > 0) unreadInit[w.id] = w.unread;
+      }
+      setUnreadByWorkspace((prev) => ({ ...unreadInit, ...prev }));
     } catch (err) {
       console.error("Failed to load workspaces:", err);
     }
@@ -1870,6 +2217,10 @@ function App() {
       branch: `workspace/${workspaceName}`,
       worktreePath: "", // placeholder until backend confirms
       status: "initializing",
+      unread: 0,
+      displayOrder: 0,
+      pinnedAt: null,
+      notes: null,
     };
 
     // Update UI immediately - user sees workspace appear instantly
@@ -2323,8 +2674,22 @@ function App() {
     const workspaceThinkingSince = selectedWorkspace
       ? (thinkingSinceByWorkspace[selectedWorkspace] ?? null)
       : null;
-    if (workspaceThinkingSince !== null) {
-      return false;
+    if (workspaceThinkingSince !== null && selectedWorkspace) {
+      // Queue the message instead of dropping it
+      const queued: QueuedMessage = {
+        id: crypto.randomUUID(),
+        text: composedInput,
+        visible: visibleOverride ?? composedInput,
+        queuedAt: Date.now(),
+      };
+      setQueuedMessagesByWorkspace((prev) => ({
+        ...prev,
+        [selectedWorkspace]: [...(prev[selectedWorkspace] || []), queued],
+      }));
+      if (!rawMessage) {
+        setInputMessageByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: "" }));
+      }
+      return true;
     }
     
     const workspaceAgents = agents.filter(a => a.workspaceId === selectedWorkspace);
@@ -3014,29 +3379,14 @@ function App() {
   };
 
   const workspaceGroups = useMemo(
-    () => [
-      {
-        key: "in-progress",
-        label: "In progress",
-        items: workspaces.filter((ws) => ws.status === "running"),
-      },
-      {
-        key: "in-review",
-        label: "In review",
-        items: workspaces.filter((ws) => ws.status === "inReview"),
-      },
-      {
-        key: "ready",
-        label: "Ready",
-        items: workspaces.filter((ws) => ws.status === "idle"),
-      },
-      {
-        key: "done",
-        label: "Done",
-        items: workspaces.filter((ws) => ws.status === "merged"),
-      },
-    ],
-    [workspaces],
+    () =>
+      workspaceGroupConfig.map((group) => ({
+        key: group.id,
+        label: group.label,
+        statuses: group.statuses,
+        items: workspaces.filter((ws) => group.statuses.includes(ws.status)),
+      })),
+    [workspaces, workspaceGroupConfig],
   );
 
   const currentRepo = repositories.find(r => r.id === selectedRepo);
@@ -3047,6 +3397,7 @@ function App() {
     ? (thinkingSinceByWorkspace[selectedWorkspace] ?? null)
     : null;
   const isThinkingCurrentWorkspace = currentThinkingSince !== null;
+  const currentQueuedMessages = selectedWorkspace ? (queuedMessagesByWorkspace[selectedWorkspace] || []) : [];
   const activeCenterTab = centerTabs.find((tab) => tab.id === activeCenterTabId) || centerTabs[0];
   const workspaceMessages = selectedWorkspace ? messages : [];
   const latestSystemMessage = useMemo(() => {
@@ -3410,85 +3761,89 @@ function App() {
 
           <div className="mb-4 flex items-center justify-between md-px-1">
             <h2 className="md-title-small">Workspaces</h2>
-            <button
-              type="button"
-              onClick={openCreateWorkspaceForm}
-              className="md-icon-plain rounded-full border md-outline disabled:cursor-not-allowed disabled:opacity-45"
-              disabled={!selectedRepo}
-              title={selectedRepo ? "Add workspace" : "Select a repository first"}
-              aria-label={selectedRepo ? "Add workspace" : "Select a repository first"}
-            >
-              <span className="material-symbols-rounded !text-[18px]">add</span>
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setShowGroupSettings(true)}
+                className="md-icon-plain"
+                title="Configure workspace groups"
+                aria-label="Configure workspace groups"
+              >
+                <span className="material-symbols-rounded !text-[16px]">settings</span>
+              </button>
+              <button
+                type="button"
+                onClick={openCreateWorkspaceForm}
+                className="md-icon-plain rounded-full border md-outline disabled:cursor-not-allowed disabled:opacity-45"
+                disabled={!selectedRepo}
+                title={selectedRepo ? "Add workspace" : "Select a repository first"}
+                aria-label={selectedRepo ? "Add workspace" : "Select a repository first"}
+              >
+                <span className="material-symbols-rounded !text-[18px]">add</span>
+              </button>
+            </div>
           </div>
 
-          {workspaceGroups.map((group) => (
-            <div key={group.key} className="mb-3">
-              <div className="mb-1 flex items-center gap-2 md-px-2 md-label-large">
-                <span>{group.label}</span>
-                <span>{group.items.length}</span>
-              </div>
-              <div className="space-y-1">
-                {group.items.map((workspace) => (
-                  <div
-                    key={workspace.id}
-                    className={`md-list-item flex items-center gap-2 md-px-3 md-py-2 ${
-                      selectedWorkspace === workspace.id
-                        ? "md-list-item-active"
-                        : ""
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => handleSelectWorkspace(workspace.id)}
-                      className="min-w-0 flex-1 text-left"
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className={`h-2 w-2 rounded-full ${getStatusColor(workspace.status)}`} />
-                        <span className="truncate md-body-small md-text-primary">{workspace.name}</span>
-                        {workspace.status === "initializing" && (
-                          <span className="text-[10px] md-text-dim animate-pulse">Setting up...</span>
-                        )}
-                        {(unreadByWorkspace[workspace.id] || 0) > 0 && (
-                          <span
-                            className="inline-flex min-h-[18px] min-w-[18px] items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-none text-white"
-                            title={`${unreadByWorkspace[workspace.id]} unread AI ${unreadByWorkspace[workspace.id] === 1 ? "response" : "responses"}`}
-                          >
-                            {unreadByWorkspace[workspace.id]}
-                          </span>
-                        )}
-                      </div>
-                      <p className="mt-1 truncate md-body-small md-text-muted">{workspace.branch}</p>
-                    </button>
-                    <div className="flex items-center gap-1">
-                      <button
-                        type="button"
-                        onClick={() => openRenameWorkspaceForm(workspace)}
-                        className="md-icon-plain disabled:opacity-30 disabled:cursor-not-allowed"
-                        title={workspace.status === "initializing" ? "Wait for setup to complete" : "Rename workspace"}
-                        aria-label={`Rename ${workspace.name}`}
-                        disabled={workspace.status === "initializing"}
-                      >
-                        <span className="material-symbols-rounded !text-[16px]">edit</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void removeWorkspace(workspace.id);
-                        }}
-                        className="md-icon-plain md-icon-plain-danger disabled:opacity-30 disabled:cursor-not-allowed"
-                        title={workspace.status === "initializing" ? "Wait for setup to complete" : "Delete workspace"}
-                        aria-label={`Delete ${workspace.name}`}
-                        disabled={workspace.status === "initializing"}
-                      >
-                        <span className="material-symbols-rounded !text-[16px]">delete</span>
-                      </button>
-                    </div>
+          <DndContext
+            sensors={dndSensors}
+            collisionDetection={closestCenter}
+            onDragStart={handleDragStart}
+            onDragOver={handleDragOver}
+            onDragEnd={(e) => void handleDragEnd(e)}
+          >
+            {workspaceGroups.map((group) => (
+              <SortableContext
+                key={group.key}
+                items={[...group.items.map((w) => w.id), `group:${group.key}`]}
+                strategy={verticalListSortingStrategy}
+              >
+                <div className="mb-3">
+                  <div className="mb-1 flex items-center gap-2 md-px-2 md-label-large">
+                    <span>{group.label}</span>
+                    <span>{group.items.length}</span>
                   </div>
-                ))}
-              </div>
-            </div>
-          ))}
+                  <div
+                    className={`min-h-[4px] space-y-1 rounded transition-colors ${
+                      dragActiveId && dragOverGroupId === group.key ? "bg-sky-500/10 ring-1 ring-sky-500/30" : ""
+                    }`}
+                    data-group-id={group.key}
+                  >
+                    {group.items.map((workspace) => (
+                      <SortableWorkspaceItem
+                        key={workspace.id}
+                        workspace={workspace}
+                        isSelected={selectedWorkspace === workspace.id}
+                        unreadCount={unreadByWorkspace[workspace.id] || 0}
+                        onSelect={handleSelectWorkspace}
+                        onTogglePin={(id) => void togglePin(id)}
+                        onRename={openRenameWorkspaceForm}
+                        onRemove={(id) => void removeWorkspace(id)}
+                        getStatusColor={getStatusColor}
+                      />
+                    ))}
+                    {group.items.length === 0 && (
+                      <div
+                        id={`group:${group.key}`}
+                        className="rounded border border-dashed border-white/10 px-3 py-2 text-center text-[10px] md-text-dim"
+                      >
+                        Drop here
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </SortableContext>
+            ))}
+            <DragOverlay>
+              {dragActiveId ? (() => {
+                const ws = workspaces.find((w) => w.id === dragActiveId);
+                return ws ? (
+                  <div className="rounded-lg border md-outline md-surface-container-high px-3 py-2 shadow-lg">
+                    <span className="md-body-small md-text-primary">{ws.name}</span>
+                  </div>
+                ) : null;
+              })() : null}
+            </DragOverlay>
+          </DndContext>
         </div>
 
       </aside>
@@ -3694,6 +4049,31 @@ function App() {
                       )}
                     </div>
                     )}
+                  {activeCenterTab.type === "chat" && currentQueuedMessages.length > 0 && (
+                    <div className="mx-2 mb-2 space-y-1.5">
+                      <div className="text-[10px] font-semibold uppercase tracking-wider md-text-dim">
+                        Queued ({currentQueuedMessages.length})
+                      </div>
+                      {currentQueuedMessages.map((qm, idx) => (
+                        <div
+                          key={qm.id}
+                          className="flex items-start gap-2 rounded-lg border border-dashed border-sky-500/30 bg-sky-950/20 px-3 py-2"
+                        >
+                          <span className="mt-0.5 shrink-0 text-[10px] font-mono text-sky-400/70">#{idx + 1}</span>
+                          <p className="min-w-0 flex-1 text-xs md-text-secondary line-clamp-2">{qm.visible}</p>
+                          <button
+                            type="button"
+                            onClick={() => selectedWorkspace && removeQueuedMessage(selectedWorkspace, qm.id)}
+                            className="shrink-0 md-icon-plain !h-5 !w-5"
+                            title="Remove from queue"
+                            aria-label="Remove queued message"
+                          >
+                            <span className="material-symbols-rounded !text-[14px]">close</span>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -3815,7 +4195,7 @@ function App() {
                             </span>
                           </button>
 
-                          {isThinkingCurrentWorkspace && workspaceAgents.length > 0 ? (
+                          {isThinkingCurrentWorkspace && workspaceAgents.length > 0 && (
                             <button
                               onClick={() => interruptAgent(workspaceAgents[0].id)}
                               className="md-icon-plain !h-7 !w-7 text-amber-400 hover:text-amber-300"
@@ -3824,19 +4204,24 @@ function App() {
                             >
                               <span className="material-symbols-rounded !text-[18px]">pause_circle</span>
                             </button>
-                          ) : (
-                            <button
-                              onClick={() => {
-                                void sendMessage();
-                              }}
-                              disabled={!inputMessage.trim()}
-                              className="md-icon-plain !h-7 !w-7 text-sky-300 disabled:cursor-not-allowed disabled:opacity-30"
-                              title="Send message"
-                              aria-label="Send message"
-                            >
-                              <span className="material-symbols-rounded !text-[18px]">send</span>
-                            </button>
                           )}
+                          <button
+                            onClick={() => {
+                              void sendMessage();
+                            }}
+                            disabled={!inputMessage.trim()}
+                            className={`md-icon-plain !h-7 !w-7 disabled:cursor-not-allowed disabled:opacity-30 ${
+                              isThinkingCurrentWorkspace
+                                ? "text-sky-400/70 hover:text-sky-300"
+                                : "text-sky-300"
+                            }`}
+                            title={isThinkingCurrentWorkspace ? "Queue message (sent after current run)" : "Send message"}
+                            aria-label={isThinkingCurrentWorkspace ? "Queue message" : "Send message"}
+                          >
+                            <span className="material-symbols-rounded !text-[18px]">
+                              {isThinkingCurrentWorkspace ? "queue" : "send"}
+                            </span>
+                          </button>
                         </div>
                     </div>
                   </div>
@@ -4459,6 +4844,23 @@ function App() {
                 </div>
               </div>
 
+              {currentWorkspace && (
+                <div className="border-t md-outline pt-3">
+                  <p className="md-text-dim">Notes</p>
+                  <p className="mb-2 text-[11px] md-text-muted">
+                    Workspace-specific notes. Saved on blur.
+                  </p>
+                  <textarea
+                    defaultValue={currentWorkspace.notes || ""}
+                    key={currentWorkspace.id}
+                    onBlur={(e) => void saveWorkspaceNotes(currentWorkspace.id, e.target.value)}
+                    rows={3}
+                    className="md-field"
+                    placeholder="Add notes about this workspace..."
+                  />
+                </div>
+              )}
+
               <div className="border-t md-outline pt-3">
                 <p className="md-text-dim">Environment overrides (app-wide)</p>
                 <p className="mb-2 text-[11px] md-text-muted">
@@ -5010,6 +5412,85 @@ function App() {
       )}
 
       {/* Keyboard Shortcuts Dialog (Conductor pattern: Cmd+/) */}
+      {showGroupSettings && (
+        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
+          <div className="md-dialog mx-4 w-full max-w-md">
+            <div className="border-b md-outline p-4">
+              <h3 className="text-lg font-semibold md-text-strong">Workspace Groups</h3>
+              <p className="mt-1 text-sm md-text-muted">
+                Customize sidebar columns. Drag workspaces between groups to change their status.
+              </p>
+            </div>
+            <div className="max-h-[60vh] overflow-y-auto p-4 space-y-3">
+              {workspaceGroupConfig.map((group, idx) => (
+                <div key={group.id} className="flex items-center gap-2 rounded border md-outline p-2">
+                  <input
+                    type="text"
+                    className="md-field flex-1 !py-1 text-sm"
+                    value={group.label}
+                    onChange={(e) => {
+                      const updated = [...workspaceGroupConfig];
+                      updated[idx] = { ...group, label: e.target.value };
+                      setWorkspaceGroupConfig(updated);
+                    }}
+                  />
+                  <select
+                    className="md-select !min-h-0 h-7 py-0 pl-2 pr-6 text-[11px]"
+                    value={group.statuses[0] || "idle"}
+                    onChange={(e) => {
+                      const updated = [...workspaceGroupConfig];
+                      updated[idx] = { ...group, statuses: [e.target.value as Workspace["status"]] };
+                      setWorkspaceGroupConfig(updated);
+                    }}
+                  >
+                    <option value="idle">Idle</option>
+                    <option value="running">Running</option>
+                    <option value="inReview">In Review</option>
+                    <option value="merged">Merged</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (workspaceGroupConfig.length <= 1) return;
+                      setWorkspaceGroupConfig((prev) => prev.filter((_, i) => i !== idx));
+                    }}
+                    className="md-icon-plain md-icon-plain-danger !h-7 !w-7"
+                    title="Remove group"
+                    disabled={workspaceGroupConfig.length <= 1}
+                  >
+                    <span className="material-symbols-rounded !text-[16px]">close</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center justify-between border-t md-outline p-4">
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const id = `custom-${Date.now()}`;
+                    setWorkspaceGroupConfig((prev) => [...prev, { id, label: "New group", statuses: ["idle"] }]);
+                  }}
+                  className="md-btn md-btn-tonal text-sm"
+                >
+                  Add group
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setWorkspaceGroupConfig(DEFAULT_WORKSPACE_GROUPS)}
+                  className="md-btn text-sm"
+                >
+                  Reset defaults
+                </button>
+              </div>
+              <button onClick={() => setShowGroupSettings(false)} className="md-btn md-btn-tonal">
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showKeyboardShortcuts && (
         <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
           <div className="md-dialog mx-4 w-full max-w-md">

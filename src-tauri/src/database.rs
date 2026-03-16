@@ -167,31 +167,37 @@ impl Database {
         let conn = self.conn.lock();
         let status_str = workspace_status_to_str(&ws.status);
         conn.execute(
-            "INSERT OR REPLACE INTO workspaces (id, repo_id, name, branch, worktree_path, status, last_activity, pr_url) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![ws.id, ws.repo_id, ws.name, ws.branch, ws.worktree_path, status_str, ws.last_activity, ws.pr_url],
+            "INSERT OR REPLACE INTO workspaces (id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![ws.id, ws.repo_id, ws.name, ws.branch, ws.worktree_path, status_str, ws.last_activity, ws.pr_url, ws.unread, ws.display_order, ws.pinned_at, ws.notes],
         )?;
         Ok(())
+    }
+
+    fn workspace_from_row(row: &rusqlite::Row) -> rusqlite::Result<Workspace> {
+        let status_str: String = row.get(5)?;
+        Ok(Workspace {
+            id: row.get(0)?,
+            repo_id: row.get(1)?,
+            name: row.get(2)?,
+            branch: row.get(3)?,
+            worktree_path: row.get(4)?,
+            status: workspace_status_from_str(&status_str),
+            last_activity: row.get(6)?,
+            pr_url: row.get(7)?,
+            unread: row.get(8)?,
+            display_order: row.get(9)?,
+            pinned_at: row.get(10)?,
+            notes: row.get(11)?,
+        })
     }
 
     pub fn get_workspaces_by_repo(&self, repo_id: &str) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url FROM workspaces WHERE repo_id = ?1 ORDER BY name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes FROM workspaces WHERE repo_id = ?1 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
         )?;
 
-        let workspaces = stmt.query_map(params![repo_id], |row| {
-            let status_str: String = row.get(5)?;
-            Ok(Workspace {
-                id: row.get(0)?,
-                repo_id: row.get(1)?,
-                name: row.get(2)?,
-                branch: row.get(3)?,
-                worktree_path: row.get(4)?,
-                status: workspace_status_from_str(&status_str),
-                last_activity: row.get(6)?,
-                pr_url: row.get(7)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
+        let workspaces = stmt.query_map(params![repo_id], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
 
         Ok(workspaces)
     }
@@ -199,22 +205,10 @@ impl Database {
     pub fn get_all_workspaces(&self) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url FROM workspaces ORDER BY name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes FROM workspaces ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
         )?;
 
-        let workspaces = stmt.query_map([], |row| {
-            let status_str: String = row.get(5)?;
-            Ok(Workspace {
-                id: row.get(0)?,
-                repo_id: row.get(1)?,
-                name: row.get(2)?,
-                branch: row.get(3)?,
-                worktree_path: row.get(4)?,
-                status: workspace_status_from_str(&status_str),
-                last_activity: row.get(6)?,
-                pr_url: row.get(7)?,
-            })
-        })?.collect::<Result<Vec<_>>>()?;
+        let workspaces = stmt.query_map([], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
 
         Ok(workspaces)
     }
@@ -245,6 +239,30 @@ impl Database {
             "UPDATE workspaces SET name = ?1 WHERE id = ?2",
             params![name, id],
         )?;
+        Ok(())
+    }
+
+    pub fn update_workspace_unread(&self, id: &str, unread: i32) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE workspaces SET unread = ?1 WHERE id = ?2", params![unread, id])?;
+        Ok(())
+    }
+
+    pub fn update_workspace_display_order(&self, id: &str, display_order: i32) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE workspaces SET display_order = ?1 WHERE id = ?2", params![display_order, id])?;
+        Ok(())
+    }
+
+    pub fn update_workspace_pinned(&self, id: &str, pinned_at: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE workspaces SET pinned_at = ?1 WHERE id = ?2", params![pinned_at, id])?;
+        Ok(())
+    }
+
+    pub fn update_workspace_notes(&self, id: &str, notes: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE workspaces SET notes = ?1 WHERE id = ?2", params![notes, id])?;
         Ok(())
     }
 
@@ -304,6 +322,18 @@ impl Database {
             "UPDATE sessions SET claude_session_id = NULL WHERE id = ?1",
             params![session_id],
         )?;
+        Ok(())
+    }
+
+    pub fn update_session_model(&self, session_id: &str, model: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE sessions SET model = ?1 WHERE id = ?2", params![model, session_id])?;
+        Ok(())
+    }
+
+    pub fn update_session_unread_count(&self, session_id: &str, unread_count: i32) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE sessions SET unread_count = ?1 WHERE id = ?2", params![unread_count, session_id])?;
         Ok(())
     }
 
