@@ -271,7 +271,8 @@ function App() {
       }
 
       // Cmd+\: Toggle left sidebar (Cmd+B is intercepted by macOS/WebKit as bold)
-      if (e.metaKey && e.key === "\\" && !e.shiftKey && !e.altKey) {
+      // Use e.code (physical key) instead of e.key — WebKit may remap e.key under Cmd.
+      if (e.metaKey && e.code === "Backslash" && !e.shiftKey && !e.altKey) {
         e.preventDefault();
         setIsLeftPanelOpen(prev => !prev);
       }
@@ -863,6 +864,10 @@ function App() {
     setDetectedChecks([]);
     setTerminalInput("");
     setAttachedFiles([]);
+    // Skip backend calls for optimistic workspaces that don't exist in the backend yet.
+    // The effect will re-fire when selectedWorkspace changes from tempId to the real ID.
+    const ws = workspaces.find((w) => w.id === selectedWorkspace);
+    if (!ws || ws.status === "initializing") return;
     loadWorkspaceFiles(selectedWorkspace, "");
   }, [selectedWorkspace]);
 
