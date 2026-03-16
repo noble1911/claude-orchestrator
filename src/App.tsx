@@ -61,6 +61,8 @@ import {
   WORKSPACE_GROUPS_STORAGE_KEY,
   WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY,
   DEFAULT_WORKSPACE_GROUPS,
+  LEFT_PANEL_OPEN_STORAGE_KEY,
+  RIGHT_PANEL_OPEN_STORAGE_KEY,
 } from "./constants";
 import {
   compactActivityLines,
@@ -190,8 +192,14 @@ function App() {
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null);
   const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   const [attachedFiles, setAttachedFiles] = useState<string[]>([]);
-  const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(true);
-  const [isRightPanelOpen, setIsRightPanelOpen] = useState(false);
+  const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(() => {
+    const stored = localStorage.getItem(LEFT_PANEL_OPEN_STORAGE_KEY);
+    return stored !== null ? stored === "true" : true;
+  });
+  const [isRightPanelOpen, setIsRightPanelOpen] = useState(() => {
+    const stored = localStorage.getItem(RIGHT_PANEL_OPEN_STORAGE_KEY);
+    return stored !== null ? stored === "true" : true;
+  });
   const [autoStartingWorkspaceId, setAutoStartingWorkspaceId] = useState<string | null>(null);
   const [expandedActivityIdsByWorkspace, setExpandedActivityIdsByWorkspace] = useState<Record<string, string[]>>({});
   const [credentialErrorWorkspaces, setCredentialErrorWorkspaces] = useState<Set<string>>(new Set());
@@ -272,11 +280,16 @@ function App() {
         return;
       }
 
-      // Cmd+\: Toggle left sidebar (Cmd+B is intercepted by macOS/WebKit as bold)
-      // Use e.code (physical key) instead of e.key — WebKit may remap e.key under Cmd.
-      if (e.metaKey && e.code === "Backslash" && !e.shiftKey && !e.altKey) {
+      // Cmd+[: Toggle left sidebar
+      if (e.metaKey && e.code === "BracketLeft" && !e.shiftKey && !e.altKey) {
         e.preventDefault();
         setIsLeftPanelOpen(prev => !prev);
+      }
+
+      // Cmd+]: Toggle right sidebar
+      if (e.metaKey && e.code === "BracketRight" && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        setIsRightPanelOpen(prev => !prev);
       }
 
       // Cmd+/: Show keyboard shortcuts
@@ -741,6 +754,14 @@ function App() {
       console.error("Failed to persist Claude mode:", err);
     }
   }, [defaultClaudeMode]);
+
+  useEffect(() => {
+    localStorage.setItem(LEFT_PANEL_OPEN_STORAGE_KEY, String(isLeftPanelOpen));
+  }, [isLeftPanelOpen]);
+
+  useEffect(() => {
+    localStorage.setItem(RIGHT_PANEL_OPEN_STORAGE_KEY, String(isRightPanelOpen));
+  }, [isRightPanelOpen]);
 
   useEffect(() => {
     try {
@@ -3388,10 +3409,10 @@ function App() {
       />
 
       <aside
-        className={`md-surface-container fixed inset-y-0 right-0 z-40 flex w-[360px] max-w-[92vw] flex-col transition-transform duration-200 lg:static lg:z-auto lg:max-w-none lg:translate-x-0 ${
-          isRightPanelOpen ? "translate-x-0" : "translate-x-full"
+        className={`md-surface-container fixed inset-y-0 right-0 z-40 flex w-[360px] max-w-[92vw] flex-col transition-all duration-200 lg:static lg:z-auto lg:max-w-none ${
+          isRightPanelOpen ? "translate-x-0" : "translate-x-full lg:translate-x-0 lg:w-0 lg:min-w-0 lg:overflow-hidden lg:border-l-0"
         }`}
-        style={{ width: `${rightPanelWidth}px` }}
+        style={isRightPanelOpen ? { width: `${rightPanelWidth}px` } : undefined}
       >
         <div className="flex h-14 items-center border-b md-outline md-px-4">
           <div className="md-segmented text-xs">
@@ -4664,8 +4685,12 @@ function App() {
 
             <div className="p-4 space-y-3">
               <div className="flex items-center justify-between py-2 border-b md-outline">
-                <span className="md-text-secondary">Toggle sidebar</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘\</kbd>
+                <span className="md-text-secondary">Toggle left sidebar</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘[</kbd>
+              </div>
+              <div className="flex items-center justify-between py-2 border-b md-outline">
+                <span className="md-text-secondary">Toggle right sidebar</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘]</kbd>
               </div>
               <div className="flex items-center justify-between py-2 border-b md-outline">
                 <span className="md-text-secondary">Show shortcuts</span>
