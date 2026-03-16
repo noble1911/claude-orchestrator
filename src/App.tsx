@@ -109,6 +109,7 @@ import MarkdownMessage from "./components/MarkdownMessage";
 import QuestionCard from "./components/QuestionCard";
 import SortableWorkspaceItem from "./components/SortableWorkspaceItem";
 import GroupDropZone from "./components/GroupDropZone";
+import SortableGroupItem from "./components/SortableGroupItem";
 
 
 function App() {
@@ -2577,6 +2578,36 @@ function App() {
     [workspaces, workspaceGroupConfig, workspaceGroupOverrides],
   );
 
+  // Keyboard shortcuts that depend on workspaceGroups (visual order) and repositories
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (!e.metaKey || e.shiftKey || e.altKey) return;
+
+      // Cmd+ArrowUp/Down: Navigate workspaces in sidebar order
+      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+        const flat = workspaceGroups.flatMap((g) => g.items);
+        const idx = flat.findIndex((w) => w.id === selectedWorkspace);
+        if (e.key === "ArrowUp" && idx > 0) {
+          handleSelectWorkspace(flat[idx - 1].id);
+        } else if (e.key === "ArrowDown" && idx !== -1 && idx < flat.length - 1) {
+          handleSelectWorkspace(flat[idx + 1].id);
+        }
+        return;
+      }
+
+      // Cmd+1-9: Switch repository by position
+      if (/^[1-9]$/.test(e.key)) {
+        e.preventDefault();
+        const repo = repositories[parseInt(e.key, 10) - 1];
+        if (repo) handleSelectRepository(repo.id);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [workspaceGroups, selectedWorkspace, repositories]);
+
   const currentRepo = repositories.find(r => r.id === selectedRepo);
   const currentWorkspace = workspaces.find(w => w.id === selectedWorkspace);
   const workspaceAgents = agents.filter(a => a.workspaceId === selectedWorkspace);
@@ -4613,73 +4644,35 @@ function App() {
               </p>
             </div>
             <div className="max-h-[60vh] overflow-y-auto p-4 space-y-3">
-              {workspaceGroupConfig.map((group, idx) => (
-                <div key={group.id} className="rounded border md-outline p-3 space-y-2">
-                  <input
-                    type="text"
-                    className="md-field w-full text-sm"
-                    value={group.label}
-                    placeholder="Group name"
-                    onChange={(e) => {
-                      const updated = [...workspaceGroupConfig];
-                      updated[idx] = { ...group, label: e.target.value };
-                      setWorkspaceGroupConfig(updated);
-                    }}
-                  />
-                  <div className="flex items-center gap-2">
-                    <label className="text-[11px] md-text-muted">Status</label>
-                    <select
-                      className="md-select !min-h-0 h-7 flex-1 py-0 pl-2 pr-6 text-[11px]"
-                      value={group.statuses[0] || ""}
-                      onChange={(e) => {
-                        const updated = [...workspaceGroupConfig];
-                        updated[idx] = {
-                          ...group,
-                          statuses: e.target.value ? [e.target.value as Workspace["status"]] : [],
-                        };
-                        setWorkspaceGroupConfig(updated);
-                      }}
-                    >
-                      {(() => {
-                        const usedStatuses = new Set(
-                          workspaceGroupConfig
-                            .filter((_, i) => i !== idx)
-                            .flatMap((g) => g.statuses),
-                        );
-                        return (
-                          <>
-                            <option value="">None</option>
-                            <option value="idle" disabled={usedStatuses.has("idle")}>
-                              Idle{usedStatuses.has("idle") ? " (used)" : ""}
-                            </option>
-                            <option value="running" disabled={usedStatuses.has("running")}>
-                              Running{usedStatuses.has("running") ? " (used)" : ""}
-                            </option>
-                            <option value="inReview" disabled={usedStatuses.has("inReview")}>
-                              In Review{usedStatuses.has("inReview") ? " (used)" : ""}
-                            </option>
-                            <option value="merged" disabled={usedStatuses.has("merged")}>
-                              Merged{usedStatuses.has("merged") ? " (used)" : ""}
-                            </option>
-                          </>
-                        );
-                      })()}
-                    </select>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (workspaceGroupConfig.length <= 1) return;
-                        setWorkspaceGroupConfig((prev) => prev.filter((_, i) => i !== idx));
-                      }}
-                      className="md-icon-plain md-icon-plain-danger !h-7 !w-7"
-                      title="Remove group"
-                      disabled={workspaceGroupConfig.length <= 1}
-                    >
-                      <span className="material-symbols-rounded !text-[16px]">close</span>
-                    </button>
-                  </div>
-                </div>
-              ))}
+              <DndContext
+                sensors={dndSensors}
+                collisionDetection={closestCenter}
+                onDragEnd={(e) => {
+                  const { active, over } = e;
+                  if (over && active.id !== over.id) {
+                    setWorkspaceGroupConfig((prev) => {
+                      const oldIdx = prev.findIndex((g) => g.id === active.id);
+                      const newIdx = prev.findIndex((g) => g.id === over.id);
+                      return arrayMove(prev, oldIdx, newIdx);
+                    });
+                  }
+                }}
+              >
+                <SortableContext
+                  items={workspaceGroupConfig.map((g) => g.id)}
+                  strategy={verticalListSortingStrategy}
+                >
+                  {workspaceGroupConfig.map((group, idx) => (
+                    <SortableGroupItem
+                      key={group.id}
+                      group={group}
+                      idx={idx}
+                      workspaceGroupConfig={workspaceGroupConfig}
+                      setWorkspaceGroupConfig={setWorkspaceGroupConfig}
+                    />
+                  ))}
+                </SortableContext>
+              </DndContext>
             </div>
             <div className="flex items-center justify-between border-t md-outline p-4">
               <div className="flex gap-2">
@@ -4735,6 +4728,18 @@ function App() {
               <div className="flex items-center justify-between py-2 border-b md-outline">
                 <span className="md-text-secondary">Close dialog</span>
                 <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">Esc</kbd>
+              </div>
+              <div className="flex items-center justify-between py-2 border-b md-outline">
+                <span className="md-text-secondary">Previous workspace</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘↑</kbd>
+              </div>
+              <div className="flex items-center justify-between py-2 border-b md-outline">
+                <span className="md-text-secondary">Next workspace</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘↓</kbd>
+              </div>
+              <div className="flex items-center justify-between py-2">
+                <span className="md-text-secondary">Switch to repository 1–9</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘1–9</kbd>
               </div>
             </div>
 
