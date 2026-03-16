@@ -190,7 +190,7 @@ function App() {
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null);
   const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   const [attachedFiles, setAttachedFiles] = useState<string[]>([]);
-  const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(false);
+  const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(true);
   const [isRightPanelOpen, setIsRightPanelOpen] = useState(false);
   const [autoStartingWorkspaceId, setAutoStartingWorkspaceId] = useState<string | null>(null);
   const [expandedActivityIdsByWorkspace, setExpandedActivityIdsByWorkspace] = useState<Record<string, string[]>>({});
@@ -2813,8 +2813,8 @@ function App() {
       )}
 
       <aside
-        className={`md-surface-container fixed inset-y-0 left-0 z-40 flex w-[280px] flex-col border-r md-outline backdrop-blur transition-transform duration-200 lg:static lg:z-auto lg:translate-x-0 ${
-          isLeftPanelOpen ? "translate-x-0" : "-translate-x-full"
+        className={`md-surface-container fixed inset-y-0 left-0 z-40 flex w-[280px] flex-col border-r md-outline backdrop-blur transition-transform duration-200 ${
+          isLeftPanelOpen ? "translate-x-0 lg:static lg:z-auto" : "-translate-x-full"
         }`}
         style={{ width: `${leftPanelWidth}px` }}
       >
