@@ -52,6 +52,8 @@ export interface ServerStatus {
   port: number;
   connectedClients: number;
   connectUrl: string;
+  webUrl: string;
+  pairingCode?: string | null;
 }
 
 export interface AppStatus {
