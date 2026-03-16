@@ -3449,7 +3449,7 @@ async fn create_pull_request(
     Ok(pr_url)
 }
 
-fn lookup_branch_pr_state(repo_path: &str, branch: &str) -> Option<(String, String)> {
+fn lookup_branch_pr_state(repo_path: &str, branch: &str, shell_path: &str) -> Option<(String, String)> {
     let output = Command::new("gh")
         .args([
             "pr",
@@ -3464,6 +3464,7 @@ fn lookup_branch_pr_state(repo_path: &str, branch: &str) -> Option<(String, Stri
             "1",
         ])
         .current_dir(repo_path)
+        .env("PATH", shell_path)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -3490,10 +3491,11 @@ fn lookup_branch_pr_state(repo_path: &str, branch: &str) -> Option<(String, Stri
     Some((url, state))
 }
 
-fn lookup_pr_state_by_url(repo_path: &str, pr_url: &str) -> Option<(String, String)> {
+fn lookup_pr_state_by_url(repo_path: &str, pr_url: &str, shell_path: &str) -> Option<(String, String)> {
     let output = Command::new("gh")
         .args(["pr", "view", pr_url, "--json", "url,state"])
         .current_dir(repo_path)
+        .env("PATH", shell_path)
         .output()
         .ok()?;
     if !output.status.success() {
@@ -3575,12 +3577,21 @@ async fn sync_pr_statuses(
             .collect()
     };
 
+    // Resolve the user's shell PATH once so `gh` can be found even when
+    // the app is launched as a GUI (macOS Finder / launchd) where the
+    // default PATH is minimal and won't include Homebrew etc.
+    let shell_env = load_cli_shell_env();
+    let shell_path = shell_env
+        .get("PATH")
+        .cloned()
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+
     let mut merged_ids = Vec::new();
     for (ws_id, repo_path, branch, current_status, current_pr_url) in to_check {
-        let discovered = lookup_branch_pr_state(&repo_path, &branch).or_else(|| {
+        let discovered = lookup_branch_pr_state(&repo_path, &branch, &shell_path).or_else(|| {
             current_pr_url
                 .as_deref()
-                .and_then(|url| lookup_pr_state_by_url(&repo_path, url))
+                .and_then(|url| lookup_pr_state_by_url(&repo_path, url, &shell_path))
         });
         let Some((pr_url, state_str)) = discovered else {
             continue;
