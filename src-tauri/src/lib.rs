@@ -450,18 +450,31 @@ fn run_script_in_workspace(
     Ok((stdout, stderr, exit_code))
 }
 
-fn create_worktree(repo_path: &str, worktree_path: &str, branch: &str) -> Result<(), String> {
+fn create_worktree(repo_path: &str, worktree_path: &str, branch: &str, default_branch: &str) -> Result<(), String> {
+    // Fetch latest from origin so the worktree starts from the remote HEAD
+    // rather than the (potentially stale) local main branch.
+    let fetch = Command::new("git")
+        .args(["fetch", "origin", default_branch])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("Failed to fetch origin: {}", e))?;
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr);
+        return Err(format!("Git fetch failed: {}", stderr));
+    }
+
+    let start_point = format!("origin/{}", default_branch);
     let output = Command::new("git")
-        .args(["worktree", "add", "-b", branch, worktree_path])
+        .args(["worktree", "add", "-b", branch, worktree_path, &start_point])
         .current_dir(repo_path)
         .output()
         .map_err(|e| format!("Failed to create worktree: {}", e))?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Git worktree failed: {}", stderr));
     }
-    
+
     Ok(())
 }
 
@@ -841,8 +854,8 @@ async fn create_workspace(
     let worktree_path = worktrees_dir.join(&name);
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
     
-    create_worktree(&repo.path, &worktree_path_str, &branch)?;
-    
+    create_worktree(&repo.path, &worktree_path_str, &branch, &repo.default_branch)?;
+
     let workspace = Workspace {
         id: Uuid::new_v4().to_string(),
         repo_id,
@@ -4486,7 +4499,7 @@ async fn handle_ws_commands(
                 }
                 let worktree_path = worktrees_dir.join(trimmed);
                 let worktree_path_str = worktree_path.to_string_lossy().to_string();
-                if let Err(err) = create_worktree(&repo.path, &worktree_path_str, &branch) {
+                if let Err(err) = create_worktree(&repo.path, &worktree_path_str, &branch, &repo.default_branch) {
                     let response = WsResponse::Error {
                         message: format!("Failed to create workspace: {}", err),
                     };
