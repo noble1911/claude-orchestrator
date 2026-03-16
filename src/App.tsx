@@ -3292,6 +3292,14 @@ function App() {
                       style={{ resize: "vertical" }}
                       className="w-full overflow-y-auto rounded-lg border md-outline bg-black/10 px-2 py-1 text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted min-h-[96px] max-h-[45vh]"
                     />
+                    <div className="flex items-center justify-end px-1">
+                      <button
+                        onClick={() => setShowKeyboardShortcuts(true)}
+                        className="text-[10px] md-text-muted hover:md-text-secondary transition-colors"
+                      >
+                        ⌘/ for shortcuts
+                      </button>
+                    </div>
 
                     {attachedFiles.length > 0 && (
                       <div className="flex flex-wrap gap-2 border-t md-outline pt-2">
