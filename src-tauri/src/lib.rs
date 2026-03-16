@@ -15,10 +15,12 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 mod database;
+mod http_server;
 mod process_manager;
 mod websocket_server;
 
 use database::Database;
+use http_server::HttpServer;
 use websocket_server::{
     ChangeInfo, CheckInfo, FileEntryInfo, MessageInfo, RepositoryInfo, ServerCommand, WebSocketServer,
     WorkspaceInfo, WsResponse,
@@ -26,6 +28,7 @@ use websocket_server::{
 
 static CLAUDE_HELP_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 const REMOTE_SERVER_PORT: u16 = 3001;
+const HTTP_SERVER_PORT: u16 = 3002;
 
 // Types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +130,8 @@ pub struct ServerStatus {
     pub port: u16,
     pub connected_clients: usize,
     pub connect_url: String,
+    pub web_url: String,
+    pub pairing_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,8 +248,10 @@ pub struct AppState {
     /// Tracks child process PIDs per agent so we can send SIGINT to interrupt.
     child_pids: RwLock<HashMap<String, u32>>,
     ws_server: Option<Arc<WebSocketServer>>,
+    http_server: Option<Arc<HttpServer>>,
     ws_server_running: RwLock<bool>,
     ws_connected_clients: RwLock<usize>,
+    pairing_code: Arc<RwLock<Option<String>>>,
 }
 
 impl AppState {
@@ -257,8 +264,10 @@ impl AppState {
             agents: RwLock::new(HashMap::new()),
             child_pids: RwLock::new(HashMap::new()),
             ws_server: None,
+            http_server: None,
             ws_server_running: RwLock::new(false),
             ws_connected_clients: RwLock::new(0),
+            pairing_code: Arc::new(RwLock::new(None)),
         };
         
         // Load persisted data
@@ -286,6 +295,10 @@ impl AppState {
     
     fn set_ws_server(&mut self, server: Arc<WebSocketServer>) {
         self.ws_server = Some(server);
+    }
+
+    fn set_http_server(&mut self, server: Arc<HttpServer>) {
+        self.http_server = Some(server);
     }
 }
 
@@ -535,13 +548,25 @@ fn detect_remote_connect_host() -> String {
 fn build_server_status(state: &AppState) -> ServerStatus {
     let running = *state.ws_server_running.read();
     let connected_clients = *state.ws_connected_clients.read();
+    let pairing_code = state.pairing_code.read().clone();
     let host = detect_remote_connect_host();
     ServerStatus {
         running,
         port: REMOTE_SERVER_PORT,
         connected_clients,
         connect_url: format!("ws://{}:{}", host, REMOTE_SERVER_PORT),
+        web_url: format!("http://{}:{}", host, HTTP_SERVER_PORT),
+        pairing_code,
     }
+}
+
+fn generate_pairing_code_string() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    format!("{:06}", seed % 1_000_000)
 }
 
 // Tauri Commands
@@ -578,9 +603,20 @@ async fn start_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerSt
         .clone()
         .ok_or_else(|| "Remote server is not initialized.".to_string())?;
 
+    // Generate a pairing code when starting the server
+    let code = generate_pairing_code_string();
+    *state.pairing_code.write() = Some(code);
+
     server.start().await?;
     *state.ws_server_running.write() = true;
     *state.ws_connected_clients.write() = server.client_count();
+
+    // Start HTTP server for web client
+    if let Some(http) = &state.http_server {
+        if let Err(e) = http.start().await {
+            tracing::warn!("Failed to start HTTP server: {}", e);
+        }
+    }
 
     Ok(build_server_status(state.inner().as_ref()))
 }
@@ -595,7 +631,20 @@ async fn stop_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerSta
     server.stop();
     *state.ws_server_running.write() = false;
     *state.ws_connected_clients.write() = 0;
+    *state.pairing_code.write() = None;
 
+    // Stop HTTP server
+    if let Some(http) = &state.http_server {
+        http.stop();
+    }
+
+    Ok(build_server_status(state.inner().as_ref()))
+}
+
+#[tauri::command]
+async fn regenerate_pairing_code(state: State<'_, Arc<AppState>>) -> Result<ServerStatus, String> {
+    let code = generate_pairing_code_string();
+    *state.pairing_code.write() = Some(code);
     Ok(build_server_status(state.inner().as_ref()))
 }
 
@@ -5814,7 +5863,7 @@ async fn handle_ws_commands(
                         .find(|a| a.workspace_id == workspace_id)
                         .map(|a| a.id.clone())
                 };
-                
+
                 if let Some(agent_id) = agent_id {
                     let (workspace_id, session_id) = {
                         let mut agents = state.agents.write();
@@ -5824,12 +5873,12 @@ async fn handle_ws_commands(
                             (None, None)
                         }
                     };
-                    
+
                     if let Some(sid) = session_id {
                         let now = chrono::Utc::now().to_rfc3339();
                         let _ = state.db.end_session(&sid, &now);
                     }
-                    
+
                     if let Some(ws_id) = workspace_id {
                         let next_status = {
                             let mut workspaces = state.workspaces.write();
@@ -5844,12 +5893,195 @@ async fn handle_ws_commands(
                         if let Some(status) = next_status {
                             let _ = state.db.update_workspace_status(&ws_id, &status, None);
                         }
-                        
+
                         let response = WsResponse::AgentStopped { workspace_id: ws_id };
                         let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                     }
                 } else {
                     let response = WsResponse::Error { message: "No agent found for workspace".to_string() };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                }
+            }
+
+            ServerCommand::InterruptAgent { workspace_id, response_tx } => {
+                let agent_id = {
+                    let agents = state.agents.read();
+                    agents.values()
+                        .find(|a| a.workspace_id == workspace_id)
+                        .map(|a| a.id.clone())
+                };
+                if let Some(agent_id) = agent_id {
+                    let pid = state.child_pids.read().get(&agent_id).copied();
+                    if let Some(pid) = pid {
+                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT); }
+                        let response = WsResponse::AgentInterrupted { workspace_id };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    } else {
+                        let response = WsResponse::Error { message: "No running process found for agent".to_string() };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    }
+                } else {
+                    let response = WsResponse::Error { message: "No agent found for workspace".to_string() };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                }
+            }
+
+            ServerCommand::SetWorkspaceStatus { workspace_id, status, response_tx } => {
+                let new_status = match status.as_str() {
+                    "idle" => WorkspaceStatus::Idle,
+                    "running" => WorkspaceStatus::Running,
+                    "inReview" => WorkspaceStatus::InReview,
+                    "merged" => WorkspaceStatus::Merged,
+                    _ => {
+                        let response = WsResponse::Error { message: format!("Unknown status: {}", status) };
+                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        continue;
+                    }
+                };
+                let workspace_info = {
+                    let mut workspaces = state.workspaces.write();
+                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
+                        workspace.status = new_status.clone();
+                        workspace.last_activity = Some(chrono::Utc::now().to_rfc3339());
+                        let has_agent = state.agents.read().values().any(|a| a.workspace_id == workspace_id);
+                        Some(to_workspace_info(workspace, has_agent))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(info) = workspace_info {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let _ = state.db.update_workspace_status(&workspace_id, &new_status, Some(&now));
+                    let response = WsResponse::WorkspaceUpdated { workspace: info.clone() };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                    // Broadcast to other clients
+                    if let Some(ws_server) = &state.ws_server {
+                        ws_server.broadcast_all(&WsResponse::WorkspaceUpdated { workspace: info });
+                    }
+                } else {
+                    let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                }
+            }
+
+            ServerCommand::ToggleWorkspacePin { workspace_id, response_tx } => {
+                let workspace_info = {
+                    let mut workspaces = state.workspaces.write();
+                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
+                        if workspace.pinned_at.is_some() {
+                            workspace.pinned_at = None;
+                        } else {
+                            workspace.pinned_at = Some(chrono::Utc::now().to_rfc3339());
+                        }
+                        let has_agent = state.agents.read().values().any(|a| a.workspace_id == workspace_id);
+                        Some(to_workspace_info(workspace, has_agent))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(info) = workspace_info {
+                    let _ = state.db.update_workspace_pinned(&workspace_id, info.pinned_at.as_deref());
+                    let response = WsResponse::WorkspaceUpdated { workspace: info };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                } else {
+                    let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                }
+            }
+
+            ServerCommand::UpdateWorkspaceNotes { workspace_id, notes, response_tx } => {
+                let notes_opt = if notes.trim().is_empty() { None } else { Some(notes.as_str()) };
+                {
+                    let mut workspaces = state.workspaces.write();
+                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
+                        workspace.notes = notes_opt.map(String::from);
+                    }
+                }
+                let _ = state.db.update_workspace_notes(&workspace_id, notes_opt);
+                let workspace_info = {
+                    let workspaces = state.workspaces.read();
+                    workspaces.get(&workspace_id).map(|ws| {
+                        let has_agent = state.agents.read().values().any(|a| a.workspace_id == workspace_id);
+                        to_workspace_info(ws, has_agent)
+                    })
+                };
+                if let Some(info) = workspace_info {
+                    let response = WsResponse::WorkspaceUpdated { workspace: info };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                }
+            }
+
+            ServerCommand::UpdateWorkspaceOrder { workspace_id, display_order, response_tx } => {
+                {
+                    let mut workspaces = state.workspaces.write();
+                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
+                        workspace.display_order = display_order;
+                    }
+                }
+                let _ = state.db.update_workspace_display_order(&workspace_id, display_order);
+                let workspace_info = {
+                    let workspaces = state.workspaces.read();
+                    workspaces.get(&workspace_id).map(|ws| {
+                        let has_agent = state.agents.read().values().any(|a| a.workspace_id == workspace_id);
+                        to_workspace_info(ws, has_agent)
+                    })
+                };
+                if let Some(info) = workspace_info {
+                    let response = WsResponse::WorkspaceUpdated { workspace: info };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                }
+            }
+
+            ServerCommand::ReadChangeDiff { workspace_id, file_path, response_tx } => {
+                let workspace_root = {
+                    let workspaces = state.workspaces.read();
+                    workspaces.get(&workspace_id).map(|ws| ws.worktree_path.clone())
+                };
+                if let Some(root) = workspace_root {
+                    let output = Command::new("git")
+                        .args(["diff", "HEAD", "--", &file_path])
+                        .current_dir(&root)
+                        .output();
+                    let diff = match output {
+                        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+                        Err(e) => format!("Failed to get diff: {}", e),
+                    };
+                    let response = WsResponse::ChangeDiff { workspace_id, file_path, diff };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                } else {
+                    let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                }
+            }
+
+            ServerCommand::RunTerminalCommand { workspace_id, command, response_tx } => {
+                let workspace_root = {
+                    let workspaces = state.workspaces.read();
+                    workspaces.get(&workspace_id).map(|ws| ws.worktree_path.clone())
+                };
+                if let Some(root) = workspace_root {
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+                    let output = Command::new(shell)
+                        .args(["-lc", &command])
+                        .current_dir(&root)
+                        .output();
+                    match output {
+                        Ok(o) => {
+                            let response = WsResponse::TerminalOutput {
+                                workspace_id,
+                                stdout: String::from_utf8_lossy(&o.stdout).to_string(),
+                                stderr: String::from_utf8_lossy(&o.stderr).to_string(),
+                                exit_code: o.status.code(),
+                            };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        }
+                        Err(e) => {
+                            let response = WsResponse::Error { message: format!("Failed to execute: {}", e) };
+                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        }
+                    }
+                } else {
+                    let response = WsResponse::Error { message: "Workspace not found".to_string() };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 }
             }
@@ -5880,8 +6112,14 @@ pub fn run() {
     let (ws_cmd_tx, ws_cmd_rx) = mpsc::unbounded_channel::<ServerCommand>();
     
     // Create WebSocket server
-    let ws_server = Arc::new(WebSocketServer::new(REMOTE_SERVER_PORT, ws_cmd_tx));
+    let pairing_code = app_state.pairing_code.clone();
+    let ws_server = Arc::new(WebSocketServer::new(REMOTE_SERVER_PORT, ws_cmd_tx, pairing_code));
     app_state.set_ws_server(ws_server.clone());
+
+    // Create HTTP server for web client
+    let web_dist_path = app_data_dir.join("web-dist");
+    let http_server = Arc::new(HttpServer::new(HTTP_SERVER_PORT, web_dist_path));
+    app_state.set_http_server(http_server);
     
     let app_state = Arc::new(app_state);
     let app_state_for_ws = app_state.clone();
@@ -5925,6 +6163,7 @@ pub fn run() {
             get_app_status,
             start_remote_server,
             stop_remote_server,
+            regenerate_pairing_code,
             check_for_app_update,
             install_app_update,
             add_repository,

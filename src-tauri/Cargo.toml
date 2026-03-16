@@ -28,6 +28,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
 
+# HTTP server for web client
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower = "0.5"
+
 # Database
 rusqlite = { version = "0.34", features = ["bundled"] }
 

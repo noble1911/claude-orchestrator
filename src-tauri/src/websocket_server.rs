@@ -16,6 +16,8 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 pub struct WebSocketServer {
     clients: Arc<RwLock<HashMap<String, ClientHandle>>>,
     subscriptions: Arc<RwLock<HashMap<String, HashSet<String>>>>, // workspace_id -> client_ids
+    authenticated_clients: Arc<RwLock<HashSet<String>>>,
+    pairing_code: Arc<RwLock<Option<String>>>,
     port: u16,
     message_tx: mpsc::UnboundedSender<ServerCommand>,
     accept_task: Arc<RwLock<Option<JoinHandle<()>>>>,
@@ -30,6 +32,7 @@ struct ClientHandle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsMessage {
+    Authenticate { pairing_code: String },
     Connect { client_name: String },
     ListRepositories,
     AddRepository { path: String },
@@ -54,6 +57,13 @@ pub enum WsMessage {
     },
     StartAgent { workspace_id: String },
     StopAgent { workspace_id: String },
+    InterruptAgent { workspace_id: String },
+    SetWorkspaceStatus { workspace_id: String, status: String },
+    ToggleWorkspacePin { workspace_id: String },
+    UpdateWorkspaceNotes { workspace_id: String, notes: String },
+    UpdateWorkspaceOrder { workspace_id: String, display_order: i32 },
+    ReadChangeDiff { workspace_id: String, file_path: String },
+    RunTerminalCommand { workspace_id: String, command: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +141,29 @@ pub enum WsResponse {
     },
     AgentStopped {
         workspace_id: String,
+    },
+    AgentInterrupted {
+        workspace_id: String,
+    },
+    Authenticated {
+        client_id: String,
+    },
+    AuthenticationFailed {
+        reason: String,
+    },
+    WorkspaceUpdated {
+        workspace: WorkspaceInfo,
+    },
+    ChangeDiff {
+        workspace_id: String,
+        file_path: String,
+        diff: String,
+    },
+    TerminalOutput {
+        workspace_id: String,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
     },
     Error {
         message: String,
@@ -217,14 +250,23 @@ pub enum ServerCommand {
     ReadFile { workspace_id: String, relative_path: String, max_bytes: Option<usize>, response_tx: mpsc::UnboundedSender<String> },
     ListChanges { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
     RunChecks { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
+    InterruptAgent { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
+    SetWorkspaceStatus { workspace_id: String, status: String, response_tx: mpsc::UnboundedSender<String> },
+    ToggleWorkspacePin { workspace_id: String, response_tx: mpsc::UnboundedSender<String> },
+    UpdateWorkspaceNotes { workspace_id: String, notes: String, response_tx: mpsc::UnboundedSender<String> },
+    UpdateWorkspaceOrder { workspace_id: String, display_order: i32, response_tx: mpsc::UnboundedSender<String> },
+    ReadChangeDiff { workspace_id: String, file_path: String, response_tx: mpsc::UnboundedSender<String> },
+    RunTerminalCommand { workspace_id: String, command: String, response_tx: mpsc::UnboundedSender<String> },
     ClientCountChanged { connected_clients: usize },
 }
 
 impl WebSocketServer {
-    pub fn new(port: u16, message_tx: mpsc::UnboundedSender<ServerCommand>) -> Self {
+    pub fn new(port: u16, message_tx: mpsc::UnboundedSender<ServerCommand>, pairing_code: Arc<RwLock<Option<String>>>) -> Self {
         Self {
             clients: Arc::new(RwLock::new(HashMap::new())),
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            authenticated_clients: Arc::new(RwLock::new(HashSet::new())),
+            pairing_code,
             port,
             message_tx,
             accept_task: Arc::new(RwLock::new(None)),
@@ -248,6 +290,8 @@ impl WebSocketServer {
 
         let clients = self.clients.clone();
         let subscriptions = self.subscriptions.clone();
+        let authenticated_clients = self.authenticated_clients.clone();
+        let pairing_code = self.pairing_code.clone();
         let message_tx = self.message_tx.clone();
         let connection_tasks = self.connection_tasks.clone();
 
@@ -255,8 +299,10 @@ impl WebSocketServer {
             while let Ok((stream, addr)) = listener.accept().await {
                 let clients = clients.clone();
                 let subscriptions = subscriptions.clone();
+                let authenticated_clients = authenticated_clients.clone();
+                let pairing_code = pairing_code.clone();
                 let message_tx = message_tx.clone();
-                let handle = tokio::spawn(handle_connection(stream, addr, clients, subscriptions, message_tx));
+                let handle = tokio::spawn(handle_connection(stream, addr, clients, subscriptions, authenticated_clients, pairing_code, message_tx));
                 let mut tasks = connection_tasks.write();
                 tasks.retain(|task| !task.is_finished());
                 tasks.push(handle);
@@ -279,6 +325,7 @@ impl WebSocketServer {
 
         self.subscriptions.write().clear();
         self.clients.write().clear();
+        self.authenticated_clients.write().clear();
         let _ = self
             .message_tx
             .send(ServerCommand::ClientCountChanged { connected_clients: 0 });
@@ -317,6 +364,8 @@ async fn handle_connection(
     addr: SocketAddr,
     clients: Arc<RwLock<HashMap<String, ClientHandle>>>,
     subscriptions: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    authenticated_clients: Arc<RwLock<HashSet<String>>>,
+    pairing_code: Arc<RwLock<Option<String>>>,
     message_tx: mpsc::UnboundedSender<ServerCommand>,
 ) {
     let ws_stream = match accept_async(stream).await {
@@ -359,6 +408,7 @@ async fn handle_connection(
             "files".to_string(),
             "changes".to_string(),
             "checks".to_string(),
+            "authentication".to_string(),
         ],
     };
     let _ = ws_sender
@@ -374,6 +424,9 @@ async fn handle_connection(
         }
     });
 
+    // Check if authentication is required (pairing code is set)
+    let requires_auth = pairing_code.read().is_some();
+
     // Handle incoming messages
     let client_id_clone = client_id.clone();
     while let Some(msg) = ws_receiver.next().await {
@@ -381,12 +434,47 @@ async fn handle_connection(
             Ok(Message::Text(text)) => {
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     tracing::debug!("Received from {}: {:?}", client_id_clone, ws_msg);
-                    
+
+                    // Authentication gate: if pairing code is set, require auth first
+                    if requires_auth && !authenticated_clients.read().contains(&client_id_clone) {
+                        match ws_msg {
+                            WsMessage::Authenticate { pairing_code: code } => {
+                                let expected = pairing_code.read().clone();
+                                if expected.as_deref() == Some(&code) {
+                                    authenticated_clients.write().insert(client_id_clone.clone());
+                                    tracing::info!("Client {} authenticated successfully", client_id_clone);
+                                    let response = WsResponse::Authenticated { client_id: client_id_clone.clone() };
+                                    let _ = tx.send(serde_json::to_string(&response).unwrap());
+                                } else {
+                                    tracing::warn!("Client {} failed authentication", client_id_clone);
+                                    let response = WsResponse::AuthenticationFailed {
+                                        reason: "Invalid pairing code".to_string(),
+                                    };
+                                    let _ = tx.send(serde_json::to_string(&response).unwrap());
+                                }
+                                continue;
+                            }
+                            _ => {
+                                let response = WsResponse::AuthenticationFailed {
+                                    reason: "Authentication required. Send an authenticate message with your pairing code.".to_string(),
+                                };
+                                let _ = tx.send(serde_json::to_string(&response).unwrap());
+                                continue;
+                            }
+                        }
+                    }
+
                     match ws_msg {
+                        WsMessage::Authenticate { .. } => {
+                            // Already authenticated or no auth required
+                            let response = WsResponse::Authenticated { client_id: client_id_clone.clone() };
+                            let _ = tx.send(serde_json::to_string(&response).unwrap());
+                        }
+
                         WsMessage::Connect { client_name } => {
                             tracing::info!("Client {} identified as: {}", client_id_clone, client_name);
                         }
-                        
+
                         WsMessage::ListRepositories => {
                             let (response_tx, mut response_rx) = mpsc::unbounded_channel();
                             if message_tx.send(ServerCommand::ListRepositories { response_tx }).is_ok() {
@@ -523,7 +611,7 @@ async fn handle_connection(
                                 }
                             }
                         }
-                        
+
                         WsMessage::Subscribe { workspace_id } => {
                             {
                                 let mut subs = subscriptions.write();
@@ -534,7 +622,7 @@ async fn handle_connection(
                             let response = WsResponse::Subscribed { workspace_id };
                             let _ = tx.send(serde_json::to_string(&response).unwrap());
                         }
-                        
+
                         WsMessage::Unsubscribe { workspace_id } => {
                             {
                                 let mut subs = subscriptions.write();
@@ -545,7 +633,7 @@ async fn handle_connection(
                             let response = WsResponse::Unsubscribed { workspace_id };
                             let _ = tx.send(serde_json::to_string(&response).unwrap());
                         }
-                        
+
                         WsMessage::SendMessage {
                             workspace_id,
                             message,
@@ -554,13 +642,13 @@ async fn handle_connection(
                             effort,
                         } => {
                             let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-                            if message_tx.send(ServerCommand::SendMessage { 
-                                workspace_id, 
+                            if message_tx.send(ServerCommand::SendMessage {
+                                workspace_id,
                                 message,
                                 permission_mode,
                                 model,
                                 effort,
-                                response_tx 
+                                response_tx
                             }).is_ok() {
                                 // Response will come via broadcast
                                 while let Some(response) = response_rx.recv().await {
@@ -568,24 +656,113 @@ async fn handle_connection(
                                 }
                             }
                         }
-                        
+
                         WsMessage::StartAgent { workspace_id } => {
                             let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-                            if message_tx.send(ServerCommand::StartAgent { 
+                            if message_tx.send(ServerCommand::StartAgent {
                                 workspace_id,
-                                response_tx 
+                                response_tx
                             }).is_ok() {
                                 if let Some(response) = response_rx.recv().await {
                                     let _ = tx.send(response);
                                 }
                             }
                         }
-                        
+
                         WsMessage::StopAgent { workspace_id } => {
                             let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-                            if message_tx.send(ServerCommand::StopAgent { 
+                            if message_tx.send(ServerCommand::StopAgent {
                                 workspace_id,
-                                response_tx 
+                                response_tx
+                            }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::InterruptAgent { workspace_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::InterruptAgent {
+                                workspace_id,
+                                response_tx,
+                            }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::SetWorkspaceStatus { workspace_id, status } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::SetWorkspaceStatus {
+                                workspace_id,
+                                status,
+                                response_tx,
+                            }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::ToggleWorkspacePin { workspace_id } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::ToggleWorkspacePin {
+                                workspace_id,
+                                response_tx,
+                            }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::UpdateWorkspaceNotes { workspace_id, notes } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::UpdateWorkspaceNotes {
+                                workspace_id,
+                                notes,
+                                response_tx,
+                            }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::UpdateWorkspaceOrder { workspace_id, display_order } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::UpdateWorkspaceOrder {
+                                workspace_id,
+                                display_order,
+                                response_tx,
+                            }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::ReadChangeDiff { workspace_id, file_path } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::ReadChangeDiff {
+                                workspace_id,
+                                file_path,
+                                response_tx,
+                            }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::RunTerminalCommand { workspace_id, command } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::RunTerminalCommand {
+                                workspace_id,
+                                command,
+                                response_tx,
                             }).is_ok() {
                                 if let Some(response) = response_rx.recv().await {
                                     let _ = tx.send(response);
@@ -611,17 +788,18 @@ async fn handle_connection(
             clients.remove(&client_id);
         }
     }
-    
-    // Remove client
+
+    // Remove client and authenticated status
     {
         let mut clients = clients.write();
         clients.remove(&client_id);
     }
+    authenticated_clients.write().remove(&client_id);
     {
         let connected_clients = clients.read().len();
         let _ = message_tx.send(ServerCommand::ClientCountChanged { connected_clients });
     }
-    
+
     send_task.abort();
     tracing::info!("Client {} disconnected", client_id);
 }

@@ -1,0 +1,205 @@
+@import url("https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,400,0..1,0");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+
+    --md-type-title-small: 500 0.95rem/1.35 -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", sans-serif;
+    --md-type-label-large: 500 0.82rem/1.2 -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", sans-serif;
+    --md-type-label-medium: 500 0.75rem/1.2 -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", sans-serif;
+    --md-type-body-small: 400 0.78rem/1.42 -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", sans-serif;
+
+    /* Default dark theme */
+    --md-sys-color-primary: #4ade80;
+    --md-sys-color-on-primary: #052e16;
+    --md-sys-color-surface: #18181b;
+    --md-sys-color-surface-container: #1f1f23;
+    --md-sys-color-surface-container-high: #27272a;
+    --md-sys-color-outline: #3f3f46;
+    --md-sys-color-on-surface: #e4e4e7;
+    --md-sys-color-on-surface-variant: #a1a1aa;
+    --md-sys-color-tertiary-container: #1e293b;
+    --md-sys-color-on-tertiary-container: #93c5fd;
+  }
+
+  * {
+    border-color: rgb(63 63 70 / 0.65);
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--md-sys-color-surface);
+    color: var(--md-sys-color-on-surface);
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
+  }
+}
+
+@layer components {
+  .md-surface { background: var(--md-sys-color-surface); }
+  .md-surface-container { background: var(--md-sys-color-surface-container); }
+  .md-surface-container-high { background: var(--md-sys-color-surface-container-high); }
+
+  .md-outline { border-color: color-mix(in srgb, var(--md-sys-color-outline) 60%, transparent); }
+  .md-outline-strong { border-color: color-mix(in srgb, var(--md-sys-color-outline) 85%, transparent); }
+
+  .md-text-strong { color: color-mix(in srgb, var(--md-sys-color-on-surface) 98%, transparent); }
+  .md-text-primary { color: color-mix(in srgb, var(--md-sys-color-on-surface) 90%, transparent); }
+  .md-text-secondary { color: color-mix(in srgb, var(--md-sys-color-on-surface) 80%, transparent); }
+  .md-text-muted { color: color-mix(in srgb, var(--md-sys-color-on-surface-variant) 90%, transparent); }
+  .md-text-dim { color: color-mix(in srgb, var(--md-sys-color-on-surface-variant) 74%, transparent); }
+  .md-text-soft { color: color-mix(in srgb, var(--md-sys-color-on-surface-variant) 62%, transparent); }
+  .md-text-faint { color: color-mix(in srgb, var(--md-sys-color-on-surface-variant) 50%, transparent); }
+
+  .md-title-small { font: var(--md-type-title-small); color: var(--md-sys-color-on-surface); }
+  .md-label-large { font: var(--md-type-label-large); color: var(--md-sys-color-on-surface-variant); letter-spacing: 0.01em; }
+  .md-label-medium { font: var(--md-type-label-medium); color: var(--md-sys-color-on-surface-variant); letter-spacing: 0.05em; text-transform: uppercase; }
+  .md-body-small { font: var(--md-type-body-small); color: color-mix(in srgb, var(--md-sys-color-on-surface) 88%, transparent); }
+
+  .md-card {
+    border-radius: 14px;
+    border: 1px solid color-mix(in srgb, var(--md-sys-color-outline) 55%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-surface-container) 92%, black 8%);
+  }
+
+  .md-chip {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--md-sys-color-outline) 70%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-surface-container-high) 78%, transparent);
+    color: var(--md-sys-color-on-surface-variant);
+    min-height: 24px;
+    padding: 2px 10px;
+    font: var(--md-type-label-medium);
+  }
+
+  .md-field {
+    width: 100%;
+    min-height: 42px;
+    border-radius: 12px;
+    border: 1px solid color-mix(in srgb, var(--md-sys-color-outline) 75%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-surface-container-high) 88%, black 12%);
+    color: var(--md-sys-color-on-surface);
+    padding: 8px 12px;
+    font: var(--md-type-body-small);
+    outline: none;
+    transition: border-color 140ms ease, box-shadow 140ms ease;
+  }
+
+  .md-field:focus {
+    border-color: color-mix(in srgb, var(--md-sys-color-primary) 70%, var(--md-sys-color-outline));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--md-sys-color-primary) 38%, transparent);
+  }
+
+  .md-field::placeholder {
+    color: color-mix(in srgb, var(--md-sys-color-on-surface-variant) 68%, transparent);
+  }
+
+  .md-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: 36px;
+    border-radius: 999px;
+    padding: 0 14px;
+    font: var(--md-type-label-large);
+    border: 1px solid color-mix(in srgb, var(--md-sys-color-outline) 60%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-surface-container-high) 84%, black 16%);
+    color: var(--md-sys-color-on-surface);
+    cursor: pointer;
+    transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
+  }
+
+  .md-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .md-btn:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--md-sys-color-primary) 48%, var(--md-sys-color-outline));
+    background: color-mix(in srgb, var(--md-sys-color-surface-container-high) 92%, black 8%);
+  }
+
+  .md-btn-tonal {
+    background: color-mix(in srgb, var(--md-sys-color-primary) 18%, var(--md-sys-color-surface-container));
+    border-color: color-mix(in srgb, var(--md-sys-color-primary) 45%, transparent);
+  }
+
+  .md-status-running { background: #34d399; }
+  .md-status-idle { background: color-mix(in srgb, var(--md-sys-color-outline) 85%, transparent); }
+  .md-status-inReview { background: #fbbf24; }
+  .md-status-merged { background: #a78bfa; }
+
+  .md-list-item {
+    border-radius: 12px;
+    border: 1px solid transparent;
+    background: transparent;
+    transition: background-color 120ms ease, border-color 120ms ease;
+  }
+
+  .md-list-item:hover {
+    border-color: color-mix(in srgb, var(--md-sys-color-outline) 40%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-surface-container-high) 64%, transparent);
+  }
+
+  .md-list-item-active {
+    border-color: color-mix(in srgb, var(--md-sys-color-primary) 50%, var(--md-sys-color-outline));
+    background: color-mix(in srgb, var(--md-sys-color-primary) 14%, var(--md-sys-color-surface-container-high));
+  }
+
+  .md-tab-strip {
+    border-bottom: 1px solid color-mix(in srgb, var(--md-sys-color-outline) 60%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-surface-container) 94%, black 6%);
+  }
+
+  .md-tab {
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+    color: color-mix(in srgb, var(--md-sys-color-on-surface) 72%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-surface-container-high) 72%, transparent);
+    font: var(--md-type-label-large);
+    cursor: pointer;
+    padding: 6px 14px;
+  }
+
+  .md-tab-active {
+    color: var(--md-sys-color-on-surface);
+    border-color: color-mix(in srgb, var(--md-sys-color-outline) 55%, transparent);
+    background: var(--md-sys-color-surface);
+  }
+
+  .md-icon-btn {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    min-height: 34px;
+  }
+
+  .material-symbols-rounded {
+    font-family: "Material Symbols Rounded";
+    font-weight: normal;
+    font-style: normal;
+    font-size: 18px;
+    line-height: 1;
+    letter-spacing: normal;
+    text-transform: none;
+    display: inline-block;
+    white-space: nowrap;
+    word-wrap: normal;
+    direction: ltr;
+    font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+    -webkit-font-smoothing: antialiased;
+  }
+}

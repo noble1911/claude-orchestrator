@@ -10,7 +10,9 @@
     "tauri": "tauri",
     "manual-release": "bash ./scripts/manual-release.sh",
     "build-app": "tauri build --bundles app && mkdir -p builds && rm -rf \"builds/Claude Orchestrator.app\" && cp -R \"src-tauri/target/release/bundle/macos/Claude Orchestrator.app\" \"builds/Claude Orchestrator.app\" && echo \"App copied to builds/Claude Orchestrator.app\"",
-    "build-dmg": "npm run build-app && rm -f \"builds/Claude Orchestrator.dmg\" && hdiutil create -volname \"Claude Orchestrator\" -srcfolder \"builds/Claude Orchestrator.app\" -ov -format UDZO \"builds/Claude Orchestrator.dmg\" && echo \"DMG created at builds/Claude Orchestrator.dmg\""
+    "build-dmg": "npm run build-app && rm -f \"builds/Claude Orchestrator.dmg\" && hdiutil create -volname \"Claude Orchestrator\" -srcfolder \"builds/Claude Orchestrator.app\" -ov -format UDZO \"builds/Claude Orchestrator.dmg\" && echo \"DMG created at builds/Claude Orchestrator.dmg\"",
+    "build:web": "cd web && npm run build",
+    "dev:web": "cd web && npm run dev"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
