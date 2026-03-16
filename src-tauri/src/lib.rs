@@ -84,6 +84,10 @@ pub struct Workspace {
     pub status: WorkspaceStatus,
     pub last_activity: Option<String>,
     pub pr_url: Option<String>,
+    pub unread: i32,
+    pub display_order: i32,
+    pub pinned_at: Option<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +323,8 @@ fn to_workspace_info(workspace: &Workspace, has_agent: bool) -> WorkspaceInfo {
         branch: workspace.branch.clone(),
         status: workspace_status_to_ws(&workspace.status),
         has_agent,
+        pinned_at: workspace.pinned_at.clone(),
+        notes: workspace.notes.clone(),
     }
 }
 
@@ -846,15 +852,19 @@ async fn create_workspace(
         status: WorkspaceStatus::Idle,
         last_activity: None,
         pr_url: None,
+        unread: 0,
+        display_order: 0,
+        pinned_at: None,
+        notes: None,
     };
-    
+
     // Save to database
     state.db.insert_workspace(&workspace)
         .map_err(|e| format!("Failed to save workspace: {}", e))?;
-    
+
     let mut workspaces = state.workspaces.write();
     workspaces.insert(workspace.id.clone(), workspace.clone());
-    
+
     Ok(workspace)
 }
 
@@ -915,6 +925,101 @@ async fn rename_workspace(
         .update_workspace_name(&workspace_id, trimmed)
         .map_err(|e| format!("Failed to rename workspace: {}", e))?;
 
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn update_workspace_unread(
+    workspace_id: String,
+    unread: i32,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    {
+        let mut workspaces = state.workspaces.write();
+        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        workspace.unread = unread;
+    }
+    state.db.update_workspace_unread(&workspace_id, unread)
+        .map_err(|e| format!("Failed to update unread: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn update_workspace_display_order(
+    workspace_id: String,
+    display_order: i32,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    {
+        let mut workspaces = state.workspaces.write();
+        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        workspace.display_order = display_order;
+    }
+    state.db.update_workspace_display_order(&workspace_id, display_order)
+        .map_err(|e| format!("Failed to update display order: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn toggle_workspace_pinned(
+    workspace_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Workspace, String> {
+    let updated = {
+        let mut workspaces = state.workspaces.write();
+        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        if workspace.pinned_at.is_some() {
+            workspace.pinned_at = None;
+        } else {
+            workspace.pinned_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        workspace.clone()
+    };
+    state.db.update_workspace_pinned(&workspace_id, updated.pinned_at.as_deref())
+        .map_err(|e| format!("Failed to toggle pin: {}", e))?;
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn update_workspace_notes(
+    workspace_id: String,
+    notes: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let notes_opt = if notes.trim().is_empty() { None } else { Some(notes.as_str()) };
+    {
+        let mut workspaces = state.workspaces.write();
+        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        workspace.notes = notes_opt.map(String::from);
+    }
+    state.db.update_workspace_notes(&workspace_id, notes_opt)
+        .map_err(|e| format!("Failed to update notes: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_workspace_status(
+    workspace_id: String,
+    status: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Workspace, String> {
+    let new_status = match status.as_str() {
+        "idle" => WorkspaceStatus::Idle,
+        "running" => WorkspaceStatus::Running,
+        "inReview" => WorkspaceStatus::InReview,
+        "merged" => WorkspaceStatus::Merged,
+        _ => return Err(format!("Unknown status: {}", status)),
+    };
+    let updated = {
+        let mut workspaces = state.workspaces.write();
+        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        workspace.status = new_status;
+        workspace.last_activity = Some(chrono::Utc::now().to_rfc3339());
+        workspace.clone()
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    state.db.update_workspace_status(&workspace_id, &updated.status, Some(&now))
+        .map_err(|e| format!("Failed to update status: {}", e))?;
     Ok(updated)
 }
 
@@ -2462,7 +2567,12 @@ async fn send_message_to_agent(
     let _ = app_state
         .db
         .insert_message(&session_id, &agent_id, "user", &message, false, &now);
-    
+
+    // Persist model selection to session
+    if let Some(ref m) = model {
+        let _ = app_state.db.update_session_model(&session_id, Some(m));
+    }
+
     // Get WebSocket server for broadcasting
     let ws_server = app_state.ws_server.clone();
     
@@ -4393,6 +4503,10 @@ async fn handle_ws_commands(
                     status: WorkspaceStatus::Idle,
                     last_activity: None,
                     pr_url: None,
+                    unread: 0,
+                    display_order: 0,
+                    pinned_at: None,
+                    notes: None,
                 };
                 if let Err(err) = state.db.insert_workspace(&workspace) {
                     let response = WsResponse::Error {
@@ -5798,6 +5912,11 @@ pub fn run() {
             create_workspace,
             remove_workspace,
             rename_workspace,
+            update_workspace_unread,
+            update_workspace_display_order,
+            toggle_workspace_pinned,
+            update_workspace_notes,
+            set_workspace_status,
             list_agents,
             start_agent,
             stop_agent,

@@ -145,6 +145,8 @@ pub struct WorkspaceInfo {
     pub branch: String,
     pub status: String,
     pub has_agent: bool,
+    pub pinned_at: Option<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
