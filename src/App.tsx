@@ -1122,7 +1122,14 @@ function App() {
   async function loadWorkspaces(repoId: string) {
     try {
       const ws = await invoke<Workspace[]>("list_workspaces", { repoId });
-      setWorkspaces(ws);
+      setWorkspaces((prev) => {
+        // Preserve optimistic workspaces (status=initializing) that haven't been committed to DB yet.
+        // Without this, background loadWorkspaces calls (e.g. PR sync) wipe the optimistic entry
+        // before create_workspace returns, causing the workspace to disappear from the UI.
+        const dbIds = new Set(ws.map((w) => w.id));
+        const optimistic = prev.filter((w) => w.status === "initializing" && !dbIds.has(w.id));
+        return optimistic.length > 0 ? [...ws, ...optimistic] : ws;
+      });
       // Initialize unread counts from persisted data
       const unreadInit: Record<string, number> = {};
       for (const w of ws) {
