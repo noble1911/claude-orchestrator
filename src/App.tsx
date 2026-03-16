@@ -1327,7 +1327,7 @@ function App() {
     setNewWorkspaceName("");
     setShowCreateForm(false);
     setSelectedWorkspace(tempId);
-    setIsLeftPanelOpen(false);
+    if (window.innerWidth < 1024) setIsLeftPanelOpen(false);
 
     try {
       // Backend creates actual workspace (git worktree add, etc.)
@@ -1962,7 +1962,8 @@ function App() {
 
   function handleSelectWorkspace(workspaceId: string) {
     setSelectedWorkspace(workspaceId);
-    setIsLeftPanelOpen(false);
+    // Close the sidebar overlay on mobile; leave it open on desktop
+    if (window.innerWidth < 1024) setIsLeftPanelOpen(false);
     void ensureAgentForWorkspace(workspaceId);
     // Load orchestrator.json config for the workspace
     void loadOrchestratorConfig(workspaceId);
