@@ -1101,11 +1101,13 @@ async fn start_agent(
     let agent_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
     
-    // Always start a fresh Claude session for each launched agent.
-    // Reusing persisted session IDs can fail with:
-    // "No conversation found with session ID ..."
-    // and can incorrectly route auth mode (e.g. requiring /login).
-    let claude_session_id: Option<String> = None;
+    // Try to resume the most recent Claude session for this workspace so that
+    // conversations survive app restarts.  Falls back to a fresh session if
+    // no prior session exists.
+    let claude_session_id: Option<String> = state
+        .db
+        .get_latest_claude_session_id(&workspace_id)
+        .unwrap_or(None);
     
     // Create session in database
     let now = chrono::Utc::now().to_rfc3339();
