@@ -22,6 +22,7 @@ import {
   PointerSensor,
   useSensor,
   useSensors,
+  useDroppable,
   type DragStartEvent,
   type DragEndEvent,
   type DragOverEvent,
@@ -948,6 +949,20 @@ function QuestionCard({ message, rowId, isAnswered, onAnswer }: QuestionCardProp
   );
 }
 
+function GroupDropZone({ groupKey }: { groupKey: string }) {
+  const { setNodeRef, isOver } = useDroppable({ id: `group:${groupKey}` });
+  return (
+    <div
+      ref={setNodeRef}
+      className={`rounded border border-dashed px-3 py-2 text-center text-[10px] transition-colors ${
+        isOver ? "border-sky-500/60 bg-sky-500/10 md-text-secondary" : "border-white/10 md-text-dim"
+      }`}
+    >
+      Drop here
+    </div>
+  );
+}
+
 interface SortableWorkspaceItemProps {
   workspace: Workspace;
   isSelected: boolean;
@@ -1177,7 +1192,7 @@ function App() {
   const thinkingSinceByWorkspaceRef = useRef<Record<string, number | null>>({});
   const pendingUnreadByWorkspaceRef = useRef<Record<string, boolean>>({});
   const detectedPrUrlByWorkspaceRef = useRef<Record<string, string>>({});
-  const sendMessageRef = useRef<(rawMessage?: string, visibleOverride?: string) => Promise<boolean>>(async () => false);
+  const sendMessageRef = useRef<(rawMessage?: string, visibleOverride?: string, targetWorkspaceId?: string) => Promise<boolean>>(async () => false);
   const [queuedMessagesByWorkspace, setQueuedMessagesByWorkspace] = useState<Record<string, QueuedMessage[]>>({});
   const queuedMessagesByWorkspaceRef = useRef<Record<string, QueuedMessage[]>>({});
   useEffect(() => { queuedMessagesByWorkspaceRef.current = queuedMessagesByWorkspace; }, [queuedMessagesByWorkspace]);
@@ -1223,8 +1238,8 @@ function App() {
         return;
       }
 
-      // Cmd+B: Toggle left sidebar
-      if (e.metaKey && e.key === "b" && !e.shiftKey && !e.altKey) {
+      // Cmd+\: Toggle left sidebar (Cmd+B is intercepted by macOS/WebKit as bold)
+      if (e.metaKey && e.key === "\\" && !e.shiftKey && !e.altKey) {
         e.preventDefault();
         setIsLeftPanelOpen(prev => !prev);
       }
@@ -1365,7 +1380,7 @@ function App() {
         }));
         // Small delay to let the agent settle before sending the next message
         setTimeout(() => {
-          void sendMessageRef.current(next.text, next.visible);
+          void sendMessageRef.current(next.text, next.visible, workspaceId);
         }, 300);
       }
 
@@ -1508,30 +1523,11 @@ function App() {
       }
       return changed ? next : prev;
     });
-    setSelectedModelByWorkspace((prev) => {
-      let changed = false;
-      const next: Record<string, string> = {};
-      for (const [workspaceId, model] of Object.entries(prev)) {
-        if (validWorkspaceIds.has(workspaceId)) {
-          next[workspaceId] = model;
-        } else {
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
-    setClaudeModeByWorkspace((prev) => {
-      let changed = false;
-      const next: Record<string, ClaudeMode> = {};
-      for (const [workspaceId, mode] of Object.entries(prev)) {
-        if (validWorkspaceIds.has(workspaceId)) {
-          next[workspaceId] = mode;
-        } else {
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
+    // Note: selectedModelByWorkspace and claudeModeByWorkspace are intentionally
+    // NOT cleaned up here. They are user preferences keyed by workspace UUID —
+    // stale entries are harmless and cleaning them here causes selections to be
+    // lost when switching repos (loadWorkspaces replaces the list with only the
+    // current repo's workspaces, purging other repo entries).
   }, [workspaces]);
 
   useEffect(() => {
@@ -1855,7 +1851,7 @@ function App() {
   useEffect(() => {
     if (!selectedWorkspace) return;
     void ensureAgentForWorkspace(selectedWorkspace);
-  }, [selectedWorkspace]);
+  }, [selectedWorkspace, workspaces]);
 
   useEffect(() => {
     if (!selectedWorkspace) return;
@@ -2242,6 +2238,20 @@ function App() {
       setWorkspaces(prev => prev.map(w => w.id === tempId ? workspace : w));
       setSelectedWorkspace(workspace.id);
 
+      // Migrate per-workspace settings from temp ID to real ID
+      setSelectedModelByWorkspace((prev) => {
+        if (!(tempId in prev)) return prev;
+        const next = { ...prev, [workspace.id]: prev[tempId] };
+        delete next[tempId];
+        return next;
+      });
+      setClaudeModeByWorkspace((prev) => {
+        if (!(tempId in prev)) return prev;
+        const next = { ...prev, [workspace.id]: prev[tempId] };
+        delete next[tempId];
+        return next;
+      });
+
       // Handle auto-run prompts with real workspace ID
       if (autoRunPrompts.length > 0) {
         setPendingAutoPromptsByWorkspace((prev) => ({
@@ -2273,6 +2283,18 @@ function App() {
         return next;
       });
       setPendingAutoPromptsByWorkspace((prev) => {
+        const next = { ...prev };
+        delete next[workspaceId];
+        return next;
+      });
+      setSelectedModelByWorkspace((prev) => {
+        if (!(workspaceId in prev)) return prev;
+        const next = { ...prev };
+        delete next[workspaceId];
+        return next;
+      });
+      setClaudeModeByWorkspace((prev) => {
+        if (!(workspaceId in prev)) return prev;
         const next = { ...prev };
         delete next[workspaceId];
         return next;
@@ -2332,6 +2354,9 @@ function App() {
   }
 
   async function ensureAgentForWorkspace(workspaceId: string) {
+    const workspace = workspaces.find((w) => w.id === workspaceId);
+    if (!workspace || workspace.status === "initializing") return;
+
     const hasRunningAgent = agents.some(
       (agent) => agent.workspaceId === workspaceId && (agent.status === "running" || agent.status === "starting"),
     );
@@ -2665,16 +2690,17 @@ function App() {
     });
   }
 
-  async function sendMessage(rawMessage?: string, visibleOverride?: string): Promise<boolean> {
+  async function sendMessage(rawMessage?: string, visibleOverride?: string, targetWorkspaceId?: string): Promise<boolean> {
+    const effectiveWorkspaceId = targetWorkspaceId ?? selectedWorkspace;
     const composedInput = (rawMessage ?? inputMessage).trim();
     if (!composedInput) return false;
-    if (selectedWorkspace) {
-      dismissCredentialError(selectedWorkspace);
+    if (effectiveWorkspaceId) {
+      dismissCredentialError(effectiveWorkspaceId);
     }
-    const workspaceThinkingSince = selectedWorkspace
-      ? (thinkingSinceByWorkspace[selectedWorkspace] ?? null)
+    const workspaceThinkingSince = effectiveWorkspaceId
+      ? (thinkingSinceByWorkspace[effectiveWorkspaceId] ?? null)
       : null;
-    if (workspaceThinkingSince !== null && selectedWorkspace) {
+    if (workspaceThinkingSince !== null && effectiveWorkspaceId) {
       // Queue the message instead of dropping it
       const queued: QueuedMessage = {
         id: crypto.randomUUID(),
@@ -2684,23 +2710,23 @@ function App() {
       };
       setQueuedMessagesByWorkspace((prev) => ({
         ...prev,
-        [selectedWorkspace]: [...(prev[selectedWorkspace] || []), queued],
+        [effectiveWorkspaceId]: [...(prev[effectiveWorkspaceId] || []), queued],
       }));
       if (!rawMessage) {
-        setInputMessageByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: "" }));
+        setInputMessageByWorkspace((prev) => ({ ...prev, [effectiveWorkspaceId]: "" }));
       }
       return true;
     }
-    
-    const workspaceAgents = agents.filter(a => a.workspaceId === selectedWorkspace);
+
+    const workspaceAgents = agents.filter(a => a.workspaceId === effectiveWorkspaceId);
     if (workspaceAgents.length === 0) {
       setError("No active agent in this workspace");
-      if (selectedWorkspace) {
-        setThinkingSinceByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: null }));
+      if (effectiveWorkspaceId) {
+        setThinkingSinceByWorkspace((prev) => ({ ...prev, [effectiveWorkspaceId]: null }));
       }
       return false;
     }
-    
+
     const agent = workspaceAgents[0];
     let messageToSend = composedInput;
     let visibleMessage = visibleOverride ?? composedInput;
@@ -2723,7 +2749,7 @@ function App() {
       }
     }
 
-    const workspace = workspaces.find((item) => item.id === selectedWorkspace);
+    const workspace = workspaces.find((item) => item.id === effectiveWorkspaceId);
     if (!workspace) {
       setError("Workspace not found");
       return false;
@@ -2776,26 +2802,28 @@ function App() {
     }]);
     
     try {
-      if (selectedWorkspace) {
-        setThinkingSinceByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: Date.now() }));
+      if (effectiveWorkspaceId) {
+        setThinkingSinceByWorkspace((prev) => ({ ...prev, [effectiveWorkspaceId]: Date.now() }));
       }
-      await invoke("send_message_to_agent", { 
-        agentId: agent.id, 
+      await invoke("send_message_to_agent", {
+        agentId: agent.id,
         message: messageToSend,
         envOverrides: parseEnvOverrides(envOverridesText),
         permissionMode: claudeMode === "plan" ? "plan" : "bypassPermissions",
         model: selectedModel,
         effort: thinkingMode === "off" ? null : thinkingMode,
       });
-      if (!rawMessage && selectedWorkspace) {
-        setInputMessageByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: "" }));
+      if (!rawMessage && effectiveWorkspaceId) {
+        setInputMessageByWorkspace((prev) => ({ ...prev, [effectiveWorkspaceId]: "" }));
       }
-      setAttachedFiles([]);
+      if (!targetWorkspaceId) {
+        setAttachedFiles([]);
+      }
     } catch (err) {
       console.error("Failed to send message:", err);
       setError(String(err));
-      if (selectedWorkspace) {
-        setThinkingSinceByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: null }));
+      if (effectiveWorkspaceId) {
+        setThinkingSinceByWorkspace((prev) => ({ ...prev, [effectiveWorkspaceId]: null }));
       }
       return false;
     }
@@ -3822,12 +3850,7 @@ function App() {
                       />
                     ))}
                     {group.items.length === 0 && (
-                      <div
-                        id={`group:${group.key}`}
-                        className="rounded border border-dashed border-white/10 px-3 py-2 text-center text-[10px] md-text-dim"
-                      >
-                        Drop here
-                      </div>
+                      <GroupDropZone groupKey={group.key} />
                     )}
                   </div>
                 </div>
@@ -5423,43 +5446,47 @@ function App() {
             </div>
             <div className="max-h-[60vh] overflow-y-auto p-4 space-y-3">
               {workspaceGroupConfig.map((group, idx) => (
-                <div key={group.id} className="flex items-center gap-2 rounded border md-outline p-2">
+                <div key={group.id} className="rounded border md-outline p-3 space-y-2">
                   <input
                     type="text"
-                    className="md-field flex-1 !py-1 text-sm"
+                    className="md-field w-full text-sm"
                     value={group.label}
+                    placeholder="Group name"
                     onChange={(e) => {
                       const updated = [...workspaceGroupConfig];
                       updated[idx] = { ...group, label: e.target.value };
                       setWorkspaceGroupConfig(updated);
                     }}
                   />
-                  <select
-                    className="md-select !min-h-0 h-7 py-0 pl-2 pr-6 text-[11px]"
-                    value={group.statuses[0] || "idle"}
-                    onChange={(e) => {
-                      const updated = [...workspaceGroupConfig];
-                      updated[idx] = { ...group, statuses: [e.target.value as Workspace["status"]] };
-                      setWorkspaceGroupConfig(updated);
-                    }}
-                  >
-                    <option value="idle">Idle</option>
-                    <option value="running">Running</option>
-                    <option value="inReview">In Review</option>
-                    <option value="merged">Merged</option>
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (workspaceGroupConfig.length <= 1) return;
-                      setWorkspaceGroupConfig((prev) => prev.filter((_, i) => i !== idx));
-                    }}
-                    className="md-icon-plain md-icon-plain-danger !h-7 !w-7"
-                    title="Remove group"
-                    disabled={workspaceGroupConfig.length <= 1}
-                  >
-                    <span className="material-symbols-rounded !text-[16px]">close</span>
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <label className="text-[11px] md-text-muted">Status</label>
+                    <select
+                      className="md-select !min-h-0 h-7 flex-1 py-0 pl-2 pr-6 text-[11px]"
+                      value={group.statuses[0] || "idle"}
+                      onChange={(e) => {
+                        const updated = [...workspaceGroupConfig];
+                        updated[idx] = { ...group, statuses: [e.target.value as Workspace["status"]] };
+                        setWorkspaceGroupConfig(updated);
+                      }}
+                    >
+                      <option value="idle">Idle</option>
+                      <option value="running">Running</option>
+                      <option value="inReview">In Review</option>
+                      <option value="merged">Merged</option>
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (workspaceGroupConfig.length <= 1) return;
+                        setWorkspaceGroupConfig((prev) => prev.filter((_, i) => i !== idx));
+                      }}
+                      className="md-icon-plain md-icon-plain-danger !h-7 !w-7"
+                      title="Remove group"
+                      disabled={workspaceGroupConfig.length <= 1}
+                    >
+                      <span className="material-symbols-rounded !text-[16px]">close</span>
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
@@ -5504,7 +5531,7 @@ function App() {
             <div className="p-4 space-y-3">
               <div className="flex items-center justify-between py-2 border-b md-outline">
                 <span className="md-text-secondary">Toggle sidebar</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘B</kbd>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘\</kbd>
               </div>
               <div className="flex items-center justify-between py-2 border-b md-outline">
                 <span className="md-text-secondary">Show shortcuts</span>
