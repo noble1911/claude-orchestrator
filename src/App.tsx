@@ -661,6 +661,20 @@ function App() {
     };
   }, [isResizingLeft, isResizingRight, isResizingTerminal]);
 
+  // Auto-close sidebar overlays when the window shrinks below the lg breakpoint
+  // so they don't appear as floating panels over the main content.
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const handler = (e: MediaQueryListEvent) => {
+      if (!e.matches) {
+        setIsLeftPanelOpen(false);
+        setIsRightPanelOpen(false);
+      }
+    };
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
   useEffect(() => {
     try {
       const raw = localStorage.getItem(PROMPT_SHORTCUTS_STORAGE_KEY);
