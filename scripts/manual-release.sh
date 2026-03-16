@@ -14,9 +14,6 @@ Options:
   --target <target>        all | desktop | mobile (default: all)
   --repo <owner/name>      Primary repo for release uploads
                            (default: noble1911/claude-orchestrator)
-  --public-repo <owner/name>
-                           Public mirror repo for release uploads
-                           (default: noble1911/claude-orchestrator-releases)
   --no-upload              Build/package artifacts only; skip gh upload
   --create-releases        Create missing GitHub releases before upload
   --skip-install           Skip npm install steps (assume dependencies are already installed)
@@ -64,7 +61,6 @@ decode_base64() {
 TAG=""
 TARGET="all"
 PRIMARY_REPO="noble1911/claude-orchestrator"
-PUBLIC_REPO="noble1911/claude-orchestrator-releases"
 UPLOAD="true"
 CREATE_RELEASES="false"
 INSTALL_DEPS="true"
@@ -88,11 +84,6 @@ while [ $# -gt 0 ]; do
     --repo)
       [ $# -ge 2 ] || fail "--repo requires a value"
       PRIMARY_REPO="$2"
-      shift 2
-      ;;
-    --public-repo)
-      [ $# -ge 2 ] || fail "--public-repo requires a value"
-      PUBLIC_REPO="$2"
       shift 2
       ;;
     --no-upload)
@@ -383,7 +374,7 @@ build_desktop() {
         target_arch="x86_64"
       fi
       target_base="darwin-${target_arch}"
-      release_url_base="https://github.com/${PUBLIC_REPO}/releases/download/${TAG}"
+      release_url_base="https://github.com/${PRIMARY_REPO}/releases/download/${TAG}"
       updater_sig_content="$(cat "release-assets/$updater_sig_file")"
       updater_download_url="${release_url_base}/${updater_file}"
       update_pub_date="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -508,9 +499,7 @@ main() {
   if [ "$UPLOAD" = "true" ]; then
     gh auth status >/dev/null 2>&1 || fail "gh is not authenticated. Run: gh auth login"
     ensure_release_exists "$PRIMARY_REPO"
-    ensure_release_exists "$PUBLIC_REPO"
     upload_files "$PRIMARY_REPO" "${ALL_FILES[@]}"
-    upload_files "$PUBLIC_REPO" "${ALL_FILES[@]}"
     log "Upload complete."
   else
     log "Upload skipped (--no-upload)."
