@@ -661,14 +661,26 @@ function App() {
     };
   }, [isResizingLeft, isResizingRight, isResizingTerminal]);
 
-  // Auto-close sidebar overlays when the window shrinks below the lg breakpoint
-  // so they don't appear as floating panels over the main content.
+  // Track whether we're below the lg breakpoint so persistence effects
+  // can skip saving responsive closes to localStorage.
+  const isBelowLg = useRef(!window.matchMedia("(min-width: 1024px)").matches);
+
+  // Auto-close sidebars when the window shrinks below lg, and restore the
+  // user's persisted preference when it grows back above lg.
   useEffect(() => {
     const mq = window.matchMedia("(min-width: 1024px)");
     const handler = (e: MediaQueryListEvent) => {
       if (!e.matches) {
+        isBelowLg.current = true;
         setIsLeftPanelOpen(false);
         setIsRightPanelOpen(false);
+      } else {
+        isBelowLg.current = false;
+        // Restore persisted preference
+        const left = localStorage.getItem(LEFT_PANEL_OPEN_STORAGE_KEY);
+        const right = localStorage.getItem(RIGHT_PANEL_OPEN_STORAGE_KEY);
+        setIsLeftPanelOpen(left !== "false");
+        setIsRightPanelOpen(right !== "false");
       }
     };
     mq.addEventListener("change", handler);
@@ -770,11 +782,12 @@ function App() {
   }, [defaultClaudeMode]);
 
   useEffect(() => {
-    localStorage.setItem(LEFT_PANEL_OPEN_STORAGE_KEY, String(isLeftPanelOpen));
+    // Don't persist responsive closes — only save user-initiated toggles
+    if (!isBelowLg.current) localStorage.setItem(LEFT_PANEL_OPEN_STORAGE_KEY, String(isLeftPanelOpen));
   }, [isLeftPanelOpen]);
 
   useEffect(() => {
-    localStorage.setItem(RIGHT_PANEL_OPEN_STORAGE_KEY, String(isRightPanelOpen));
+    if (!isBelowLg.current) localStorage.setItem(RIGHT_PANEL_OPEN_STORAGE_KEY, String(isRightPanelOpen));
   }, [isRightPanelOpen]);
 
   useEffect(() => {
