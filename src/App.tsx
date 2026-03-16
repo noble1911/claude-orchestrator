@@ -2813,10 +2813,10 @@ function App() {
       )}
 
       <aside
-        className={`md-surface-container fixed inset-y-0 left-0 z-40 flex w-[280px] flex-col border-r md-outline backdrop-blur transition-transform duration-200 ${
-          isLeftPanelOpen ? "translate-x-0 lg:static lg:z-auto" : "-translate-x-full"
+        className={`md-surface-container fixed inset-y-0 left-0 z-40 flex flex-col border-r md-outline backdrop-blur transition-all duration-200 lg:static lg:z-auto ${
+          isLeftPanelOpen ? "w-[280px] translate-x-0" : "-translate-x-full lg:translate-x-0 lg:w-0 lg:min-w-0 lg:overflow-hidden lg:border-r-0"
         }`}
-        style={{ width: `${leftPanelWidth}px` }}
+        style={isLeftPanelOpen ? { width: `${leftPanelWidth}px` } : undefined}
       >
         <div className="flex h-14 items-center border-b md-outline md-px-5">
           <div className="flex items-center justify-between">
