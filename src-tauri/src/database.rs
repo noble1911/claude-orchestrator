@@ -307,6 +307,21 @@ impl Database {
         }
     }
 
+    /// Return the claude_session_id from the most recent session for a workspace
+    /// that actually has one (i.e. Claude responded at least once).
+    pub fn get_latest_claude_session_id(&self, workspace_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT claude_session_id FROM sessions WHERE workspace_id = ?1 AND claude_session_id IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+        )?;
+        let result = stmt.query_row(params![workspace_id], |row| row.get::<_, String>(0));
+        match result {
+            Ok(sid) => Ok(Some(sid)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn update_session_claude_id(&self, session_id: &str, claude_session_id: &str) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
