@@ -2439,13 +2439,18 @@ function App() {
   };
 
   const workspaceGroups = useMemo(
-    () =>
-      workspaceGroupConfig.map((group) => ({
-        key: group.id,
-        label: group.label,
-        statuses: group.statuses,
-        items: workspaces.filter((ws) => group.statuses.includes(ws.status)),
-      })),
+    () => {
+      const claimed = new Set<string>();
+      return workspaceGroupConfig.map((group) => {
+        const items = workspaces.filter((ws) => {
+          if (claimed.has(ws.id)) return false;
+          if (!group.statuses.includes(ws.status)) return false;
+          claimed.add(ws.id);
+          return true;
+        });
+        return { key: group.id, label: group.label, statuses: group.statuses, items };
+      });
+    },
     [workspaces, workspaceGroupConfig],
   );
 
@@ -4494,17 +4499,40 @@ function App() {
                     <label className="text-[11px] md-text-muted">Status</label>
                     <select
                       className="md-select !min-h-0 h-7 flex-1 py-0 pl-2 pr-6 text-[11px]"
-                      value={group.statuses[0] || "idle"}
+                      value={group.statuses[0] || ""}
                       onChange={(e) => {
                         const updated = [...workspaceGroupConfig];
-                        updated[idx] = { ...group, statuses: [e.target.value as Workspace["status"]] };
+                        updated[idx] = {
+                          ...group,
+                          statuses: e.target.value ? [e.target.value as Workspace["status"]] : [],
+                        };
                         setWorkspaceGroupConfig(updated);
                       }}
                     >
-                      <option value="idle">Idle</option>
-                      <option value="running">Running</option>
-                      <option value="inReview">In Review</option>
-                      <option value="merged">Merged</option>
+                      {(() => {
+                        const usedStatuses = new Set(
+                          workspaceGroupConfig
+                            .filter((_, i) => i !== idx)
+                            .flatMap((g) => g.statuses),
+                        );
+                        return (
+                          <>
+                            <option value="">None</option>
+                            <option value="idle" disabled={usedStatuses.has("idle")}>
+                              Idle{usedStatuses.has("idle") ? " (used)" : ""}
+                            </option>
+                            <option value="running" disabled={usedStatuses.has("running")}>
+                              Running{usedStatuses.has("running") ? " (used)" : ""}
+                            </option>
+                            <option value="inReview" disabled={usedStatuses.has("inReview")}>
+                              In Review{usedStatuses.has("inReview") ? " (used)" : ""}
+                            </option>
+                            <option value="merged" disabled={usedStatuses.has("merged")}>
+                              Merged{usedStatuses.has("merged") ? " (used)" : ""}
+                            </option>
+                          </>
+                        );
+                      })()}
                     </select>
                     <button
                       type="button"
@@ -4528,7 +4556,7 @@ function App() {
                   type="button"
                   onClick={() => {
                     const id = `custom-${Date.now()}`;
-                    setWorkspaceGroupConfig((prev) => [...prev, { id, label: "New group", statuses: ["idle"] }]);
+                    setWorkspaceGroupConfig((prev) => [...prev, { id, label: "New group", statuses: [] }]);
                   }}
                   className="md-btn md-btn-tonal text-sm"
                 >
