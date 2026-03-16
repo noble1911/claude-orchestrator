@@ -116,9 +116,9 @@ Requirements:
 - macOS for desktop `.app/.dmg` builds
 - Android toolchain for APK builds
 
-The script syncs app versions from the tag, builds artifacts, uploads to both
-`noble1911/claude-orchestrator` and `noble1911/claude-orchestrator-releases`,
-then restores version files unless `--keep-version-files` is passed.
+The script syncs app versions from the tag, builds artifacts, uploads to
+`noble1911/claude-orchestrator`, then restores version files unless
+`--keep-version-files` is passed.
 
 ## Mobile App
 

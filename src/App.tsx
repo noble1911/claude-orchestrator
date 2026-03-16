@@ -59,6 +59,7 @@ import {
   DEFAULT_REPOSITORY_STORAGE_KEY,
   BEDROCK_ENV_KEY,
   WORKSPACE_GROUPS_STORAGE_KEY,
+  WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY,
   DEFAULT_WORKSPACE_GROUPS,
 } from "./constants";
 import {
@@ -183,6 +184,7 @@ function App() {
   const [selectedModelByWorkspace, setSelectedModelByWorkspace] = useState<Record<string, string>>({});
   const [thinkingMode, setThinkingMode] = useState<"off" | "low" | "medium" | "high">("off");
   const [workspaceGroupConfig, setWorkspaceGroupConfig] = useState<WorkspaceGroup[]>(DEFAULT_WORKSPACE_GROUPS);
+  const [workspaceGroupOverrides, setWorkspaceGroupOverrides] = useState<Record<string, string>>({});
   const [showGroupSettings, setShowGroupSettings] = useState(false);
   const [dragActiveId, setDragActiveId] = useState<string | null>(null);
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null);
@@ -828,6 +830,30 @@ function App() {
     }
   }, [workspaceGroupConfig]);
 
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Record<string, string>;
+        if (parsed && typeof parsed === "object") setWorkspaceGroupOverrides(parsed);
+      }
+    } catch (err) {
+      console.error("Failed to load workspace group overrides:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      if (Object.keys(workspaceGroupOverrides).length > 0) {
+        localStorage.setItem(WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY, JSON.stringify(workspaceGroupOverrides));
+      } else {
+        localStorage.removeItem(WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY);
+      }
+    } catch (err) {
+      console.error("Failed to persist workspace group overrides:", err);
+    }
+  }, [workspaceGroupOverrides]);
+
   // useLayoutEffect prevents a visual flash when switching workspaces:
   // it clears stale state synchronously before the browser paints,
   // so the user never sees the previous workspace's data under the new name.
@@ -1075,17 +1101,28 @@ function App() {
     if (!targetGroup || !sourceGroup) return;
 
     if (sourceGroup.key !== targetGroup.key) {
-      // Cross-group move: change workspace status
+      // Cross-group move
       const groupDef = workspaceGroupConfig.find((g) => g.id === targetGroup!.key);
       if (!groupDef) return;
       const newStatus = statusForGroup(groupDef);
-      if (!newStatus) return;
       try {
-        const updated = await invoke<Workspace>("set_workspace_status", {
-          workspaceId: activeId,
-          status: newStatus,
-        });
-        setWorkspaces((prev) => prev.map((w) => (w.id === updated.id ? updated : w)));
+        if (newStatus) {
+          // Target has a status: change workspace status and clear any override
+          const updated = await invoke<Workspace>("set_workspace_status", {
+            workspaceId: activeId,
+            status: newStatus,
+          });
+          setWorkspaces((prev) => prev.map((w) => (w.id === updated.id ? updated : w)));
+          setWorkspaceGroupOverrides((prev) => {
+            if (!prev[activeId]) return prev;
+            const next = { ...prev };
+            delete next[activeId];
+            return next;
+          });
+        } else {
+          // Target is status-free: keep current status, set group override
+          setWorkspaceGroupOverrides((prev) => ({ ...prev, [activeId]: groupDef.id }));
+        }
       } catch (err) {
         console.error("Failed to move workspace:", err);
       }
@@ -1338,6 +1375,12 @@ function App() {
         return next;
       });
       setClaudeModeByWorkspace((prev) => {
+        if (!(workspaceId in prev)) return prev;
+        const next = { ...prev };
+        delete next[workspaceId];
+        return next;
+      });
+      setWorkspaceGroupOverrides((prev) => {
         if (!(workspaceId in prev)) return prev;
         const next = { ...prev };
         delete next[workspaceId];
@@ -2453,17 +2496,36 @@ function App() {
   const workspaceGroups = useMemo(
     () => {
       const claimed = new Set<string>();
-      return workspaceGroupConfig.map((group) => {
+      // Pass 1: assign workspaces with overrides or matching statuses
+      const groups = workspaceGroupConfig.map((group) => {
         const items = workspaces.filter((ws) => {
           if (claimed.has(ws.id)) return false;
+          // If workspace has an explicit group override, respect it
+          const override = workspaceGroupOverrides[ws.id];
+          if (override) {
+            if (override !== group.id) return false;
+            claimed.add(ws.id);
+            return true;
+          }
+          // Status-free groups only contain overridden workspaces (filled in pass 1)
+          if (group.statuses.length === 0) return false;
           if (!group.statuses.includes(ws.status)) return false;
           claimed.add(ws.id);
           return true;
         });
         return { key: group.id, label: group.label, statuses: group.statuses, items };
       });
+      // Pass 2: put unclaimed workspaces into the first status-free group (catch-all)
+      const unclaimed = workspaces.filter((ws) => !claimed.has(ws.id));
+      if (unclaimed.length > 0) {
+        const catchAll = groups.find((g) => g.statuses.length === 0);
+        if (catchAll) {
+          catchAll.items = [...catchAll.items, ...unclaimed];
+        }
+      }
+      return groups;
     },
-    [workspaces, workspaceGroupConfig],
+    [workspaces, workspaceGroupConfig, workspaceGroupOverrides],
   );
 
   const currentRepo = repositories.find(r => r.id === selectedRepo);

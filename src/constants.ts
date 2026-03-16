@@ -38,6 +38,7 @@ export const THINKING_MODE_STORAGE_KEY = "claude_orchestrator_thinking_mode";
 export const DEFAULT_REPOSITORY_STORAGE_KEY = "claude_orchestrator_default_repository";
 export const BEDROCK_ENV_KEY = "CLAUDE_CODE_USE_BEDROCK";
 export const WORKSPACE_GROUPS_STORAGE_KEY = "claude_orchestrator_workspace_groups";
+export const WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY = "claude_orchestrator_workspace_group_overrides";
 
 export const DEFAULT_WORKSPACE_GROUPS: WorkspaceGroup[] = [
   { id: "in-progress", label: "In progress", statuses: ["running"] },
