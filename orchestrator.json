@@ -1,0 +1,4 @@
+{
+  "setupScript": "npm install",
+  "runScript": "npm run tauri dev"
+}

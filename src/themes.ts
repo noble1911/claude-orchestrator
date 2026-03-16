@@ -40,6 +40,25 @@ export const THEME_COLOR_FIELDS: Array<{ key: ThemeColorTokenKey; label: string 
 ];
 
 const BUILTIN_THEMES: ThemeMap = {
+  darkv2: {
+    id: "darkv2",
+    label: "Dark v2",
+    description: "Deep charcoal with green accents and native macOS feel.",
+    rootText: "#e4e4e7",
+    rootBackground: "#18181b",
+    colors: {
+      "--md-sys-color-primary": "#4ade80",
+      "--md-sys-color-on-primary": "#052e16",
+      "--md-sys-color-surface": "#18181b",
+      "--md-sys-color-surface-container": "#1f1f23",
+      "--md-sys-color-surface-container-high": "#27272a",
+      "--md-sys-color-outline": "#3f3f46",
+      "--md-sys-color-on-surface": "#e4e4e7",
+      "--md-sys-color-on-surface-variant": "#a1a1aa",
+      "--md-sys-color-tertiary-container": "#1e293b",
+      "--md-sys-color-on-tertiary-container": "#93c5fd",
+    },
+  },
   dark: {
     id: "dark",
     label: "Dark",
@@ -177,7 +196,7 @@ const BUILTIN_THEMES: ThemeMap = {
 
 export type BuiltInThemeId = keyof typeof BUILTIN_THEMES;
 
-export const DEFAULT_THEME_ID: BuiltInThemeId = "dark";
+export const DEFAULT_THEME_ID: BuiltInThemeId = "darkv2";
 
 export function getBuiltinThemes(): ThemeMap {
   return { ...BUILTIN_THEMES };
