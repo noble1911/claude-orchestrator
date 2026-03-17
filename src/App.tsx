@@ -241,6 +241,8 @@ function App() {
   useEffect(() => { queuedMessagesByWorkspaceRef.current = queuedMessagesByWorkspace; }, [queuedMessagesByWorkspace]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
+  const chatTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const lastWorkspaceByRepoRef = useRef<Record<string, string>>({});
   const terminalInputRef = useRef<HTMLInputElement>(null);
   const bedrockEnabled = useMemo(
     () => isTruthyEnvValue(parseEnvOverrides(envOverridesText)[BEDROCK_ENV_KEY]),
@@ -297,6 +299,12 @@ function App() {
       if (e.metaKey && e.key === "/" && !e.shiftKey && !e.altKey) {
         e.preventDefault();
         setShowKeyboardShortcuts(true);
+      }
+
+      // Cmd+Plus: Open create workspace form
+      if (e.metaKey && e.key === "=" && !e.altKey) {
+        e.preventDefault();
+        openCreateWorkspaceForm();
       }
 
       // Escape: Close any open dialog/form
@@ -1265,9 +1273,21 @@ function App() {
 
   function handleSelectRepository(repoId: string) {
     if (repoId === selectedRepo) return;
+    // Save current workspace for the repo we're leaving
+    if (selectedRepo && selectedWorkspace) {
+      lastWorkspaceByRepoRef.current[selectedRepo] = selectedWorkspace;
+    }
     setSelectedRepo(repoId);
-    setSelectedWorkspace(null);
     setMessages([]);
+    // Restore the last selected workspace for this repo, or pick the first available
+    const remembered = lastWorkspaceByRepoRef.current[repoId];
+    const repoWorkspaces = workspaces.filter((w) => w.repoId === repoId);
+    const target = repoWorkspaces.find((w) => w.id === remembered) || repoWorkspaces[0];
+    if (target) {
+      handleSelectWorkspace(target.id);
+    } else {
+      setSelectedWorkspace(null);
+    }
   }
 
   function setDefaultRepository(repoId: string) {
@@ -1990,6 +2010,8 @@ function App() {
 
   function handleSelectWorkspace(workspaceId: string) {
     setSelectedWorkspace(workspaceId);
+    // Remember this workspace for the current repo so we can restore it later
+    if (selectedRepo) lastWorkspaceByRepoRef.current[selectedRepo] = workspaceId;
     // Close the sidebar overlay on mobile; leave it open on desktop
     if (window.innerWidth < 1024) setIsLeftPanelOpen(false);
     void ensureAgentForWorkspace(workspaceId);
@@ -2587,12 +2609,17 @@ function App() {
       if (e.key === "ArrowUp" || e.key === "ArrowDown") {
         e.preventDefault();
         const flat = workspaceGroups.flatMap((g) => g.items);
+        if (flat.length === 0) return;
         const idx = flat.findIndex((w) => w.id === selectedWorkspace);
-        if (e.key === "ArrowUp" && idx > 0) {
+        if (idx === -1) {
+          // Nothing selected — jump to first workspace
+          handleSelectWorkspace(flat[0].id);
+        } else if (e.key === "ArrowUp" && idx > 0) {
           handleSelectWorkspace(flat[idx - 1].id);
-        } else if (e.key === "ArrowDown" && idx !== -1 && idx < flat.length - 1) {
+        } else if (e.key === "ArrowDown" && idx < flat.length - 1) {
           handleSelectWorkspace(flat[idx + 1].id);
         }
+        setTimeout(() => chatTextareaRef.current?.focus(), 0);
         return;
       }
 
@@ -3322,6 +3349,7 @@ function App() {
                 <div className="border-t md-outline md-surface-container-high md-px-3 md-py-2">
                   <div className="rounded-2xl border md-outline md-surface-container md-px-3 md-py-2">
                     <textarea
+                      ref={chatTextareaRef}
                       value={inputMessage}
                       onChange={(e) => setWorkspaceInputDraft(e.target.value)}
                       onKeyDown={(e) => {
@@ -4737,9 +4765,13 @@ function App() {
                 <span className="md-text-secondary">Next workspace</span>
                 <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘↓</kbd>
               </div>
-              <div className="flex items-center justify-between py-2">
+              <div className="flex items-center justify-between py-2 border-b md-outline">
                 <span className="md-text-secondary">Switch to repository 1–9</span>
                 <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘1–9</kbd>
+              </div>
+              <div className="flex items-center justify-between py-2">
+                <span className="md-text-secondary">New workspace</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘+</kbd>
               </div>
             </div>
 
