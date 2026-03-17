@@ -31,6 +31,8 @@ export function useWebSocket(wsUrl: string, pairingCode: string) {
   const setFileContent = useFileStore((s) => s.setFileContent);
   const setChanges = useFileStore((s) => s.setChanges);
   const setChecks = useFileStore((s) => s.setChecks);
+  const setDiff = useFileStore((s) => s.setDiff);
+  const setTerminalOutput = useFileStore((s) => s.setTerminalOutput);
 
   const handleMessage = useCallback(
     (response: WsResponse) => {
@@ -125,6 +127,14 @@ export function useWebSocket(wsUrl: string, pairingCode: string) {
           setChecks(response.checks);
           break;
 
+        case "change_diff":
+          setDiff(response.file_path, response.diff);
+          break;
+
+        case "terminal_output":
+          setTerminalOutput(response.stdout, response.stderr, response.exit_code);
+          break;
+
         case "error":
           setError(response.message);
           break;
@@ -134,7 +144,7 @@ export function useWebSocket(wsUrl: string, pairingCode: string) {
       setConnState, setClientId, setError,
       setRepositories, setWorkspaces, updateWorkspace, addWorkspace, removeWorkspace,
       setMessages, upsertMessage, setRunning, addSubscription, removeSubscription,
-      setFiles, setFileContent, setChanges, setChecks,
+      setFiles, setFileContent, setChanges, setChecks, setDiff, setTerminalOutput,
     ]
   );
 
