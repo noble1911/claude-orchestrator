@@ -26,6 +26,9 @@ type WorkspaceInfo = {
   branch: string;
   status: string;
   has_agent: boolean;
+  pinned_at?: string | null;
+  notes?: string | null;
+  pr_url?: string | null;
 };
 
 type RepositoryInfo = {
@@ -89,8 +92,19 @@ type CheckInfo = {
   skipped: boolean;
 };
 
+type TerminalEntry = {
+  id: string;
+  command: string;
+  stdout: string;
+  stderr: string;
+  exit_code?: number | null;
+  running: boolean;
+};
+
 type WsResponse =
-  | { type: "connected" }
+  | { type: "connected"; server_name?: string; features?: string[] }
+  | { type: "authenticated"; client_id: string }
+  | { type: "authentication_failed"; reason: string }
   | { type: "repository_list"; repositories: RepositoryInfo[] }
   | { type: "repository_added"; repository: RepositoryInfo }
   | { type: "repository_removed"; repo_id: string }
@@ -98,13 +112,21 @@ type WsResponse =
   | { type: "workspace_created"; workspace: WorkspaceInfo }
   | { type: "workspace_renamed"; workspace: WorkspaceInfo }
   | { type: "workspace_removed"; workspace_id: string }
+  | { type: "workspace_updated"; workspace: WorkspaceInfo }
   | { type: "message_history"; workspace_id: string; messages: MessageInfo[] }
   | { type: "files_list"; workspace_id: string; relative_path: string; entries: FileEntryInfo[] }
   | { type: "file_content"; workspace_id: string; path: string; content: string }
   | { type: "changes_list"; workspace_id: string; changes: ChangeInfo[] }
   | { type: "checks_result"; workspace_id: string; checks: CheckInfo[] }
+  | { type: "change_diff"; workspace_id: string; file_path: string; diff: string }
+  | { type: "terminal_output"; workspace_id: string; stdout: string; stderr: string; exit_code?: number | null }
+  | { type: "subscribed"; workspace_id: string }
+  | { type: "unsubscribed"; workspace_id: string }
   | { type: "agent_started"; workspace_id: string; agent_id: string }
   | { type: "agent_message"; workspace_id: string; role?: string; content: string; is_error: boolean; timestamp: string }
+  | { type: "agent_run_state"; workspace_id: string; agent_id: string; running: boolean; timestamp: string }
+  | { type: "agent_stopped"; workspace_id: string }
+  | { type: "agent_interrupted"; workspace_id: string }
   | { type: "error"; message: string }
   | { type: string; [key: string]: any };
 
@@ -138,6 +160,17 @@ const MARKDOWN_IT = MarkdownIt({
   typographer: false,
 });
 const URL_PATTERN = /(?:https?:\/\/|www\.)[^\s<>"'`]+/gi;
+
+function statusColor(status: string): string {
+  switch (status) {
+    case "running": return "#34d399";
+    case "idle": return "#71717a";
+    case "inReview": return "#fbbf24";
+    case "merged": return "#a78bfa";
+    case "initializing": return "#fbbf24";
+    default: return "#71717a";
+  }
+}
 
 function normalizeExternalUrl(raw?: string | null): string | null {
   if (!raw) return null;
@@ -493,7 +526,7 @@ function App() {
   const [rightOpen, setRightOpen] = useState(false);
   const [renderLeftOverlay, setRenderLeftOverlay] = useState(false);
   const [renderRightOverlay, setRenderRightOverlay] = useState(false);
-  const [rightTab, setRightTab] = useState<"prompts" | "all_files" | "changes" | "checks">("prompts");
+  const [rightTab, setRightTab] = useState<"prompts" | "all_files" | "changes" | "checks" | "terminal">("prompts");
   const [statusText, setStatusText] = useState("");
   const [showAddRepoForm, setShowAddRepoForm] = useState(false);
   const [newRepoPath, setNewRepoPath] = useState("");
@@ -515,6 +548,16 @@ function App() {
   const [checksRunning, setChecksRunning] = useState(false);
   const [filesLoading, setFilesLoading] = useState(false);
   const [changesLoading, setChangesLoading] = useState(false);
+  const [runningByWorkspace, setRunningByWorkspace] = useState<Record<string, boolean>>({});
+  const [queuedMessages, setQueuedMessages] = useState<string[]>([]);
+  const [diffContent, setDiffContent] = useState<string | null>(null);
+  const [diffFilePath, setDiffFilePath] = useState<string | null>(null);
+  const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>([]);
+  const [terminalRunning, setTerminalRunning] = useState(false);
+  const [terminalInput, setTerminalInput] = useState("");
+  const [editingNotes, setEditingNotes] = useState(false);
+  const [notesValue, setNotesValue] = useState("");
+  const [workspaceSearch, setWorkspaceSearch] = useState("");
   const [expandedActivityIdsByWorkspace, setExpandedActivityIdsByWorkspace] = useState<Record<string, string[]>>({});
   const [answeredQuestionTimestampsByWorkspace, setAnsweredQuestionTimestampsByWorkspace] =
     useState<Record<string, string[]>>({});
@@ -529,17 +572,25 @@ function App() {
     () => repositories.find((repo) => repo.id === selectedRepoId) || null,
     [repositories, selectedRepoId],
   );
+  const filteredWorkspaces = useMemo(() => {
+    if (!workspaceSearch) return workspaces;
+    const q = workspaceSearch.toLowerCase();
+    return workspaces.filter(
+      (ws) => ws.name.toLowerCase().includes(q) || ws.branch.toLowerCase().includes(q),
+    );
+  }, [workspaces, workspaceSearch]);
   const workspaceGroups = useMemo(
     () => [
-      { key: "running", label: "In progress", items: workspaces.filter((ws) => ws.status === "running") },
-      { key: "inReview", label: "In review", items: workspaces.filter((ws) => ws.status === "inReview") },
-      { key: "idle", label: "Ready", items: workspaces.filter((ws) => ws.status === "idle") },
-      { key: "merged", label: "Done", items: workspaces.filter((ws) => ws.status === "merged") },
+      { key: "running", label: "In progress", items: filteredWorkspaces.filter((ws) => ws.status === "running") },
+      { key: "inReview", label: "In review", items: filteredWorkspaces.filter((ws) => ws.status === "inReview") },
+      { key: "idle", label: "Ready", items: filteredWorkspaces.filter((ws) => ws.status === "idle" || ws.status === "initializing") },
+      { key: "merged", label: "Done", items: filteredWorkspaces.filter((ws) => ws.status === "merged") },
     ],
-    [workspaces],
+    [filteredWorkspaces],
   );
 
   const currentMessages = selectedWorkspaceId ? messagesByWorkspace[selectedWorkspaceId] || [] : [];
+  const isRunning = selectedWorkspaceId ? (runningByWorkspace[selectedWorkspaceId] ?? false) : false;
   const topInset = Platform.OS === "android" ? StatusBar.currentHeight || 0 : 0;
   const drawerSlideDistance = useMemo(
     () => Math.min(420, Math.round(Dimensions.get("window").width * 0.84)),
@@ -714,6 +765,34 @@ function App() {
     });
   }, [rightOpen, rightDrawerAnim, renderRightOverlay]);
 
+  // Drain one queued message when agent becomes idle
+  useEffect(() => {
+    if (!isRunning && queuedMessages.length > 0 && selectedWorkspaceId) {
+      const [next, ...rest] = queuedMessages;
+      setQueuedMessages(rest);
+      sendJson({
+        type: "send_message",
+        workspace_id: selectedWorkspaceId,
+        message: next,
+        permission_mode: claudeMode === "plan" ? "plan" : "bypassPermissions",
+        model: selectedModel,
+        effort: thinkingMode === "off" ? undefined : thinkingMode,
+      });
+    }
+  }, [isRunning, selectedWorkspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Clear queue and terminal when switching workspaces
+  useEffect(() => {
+    setQueuedMessages([]);
+    setDiffContent(null);
+    setDiffFilePath(null);
+    setTerminalHistory([]);
+    setTerminalRunning(false);
+    setTerminalInput("");
+    setEditingNotes(false);
+    setNotesValue(selectedWorkspace?.notes ?? "");
+  }, [selectedWorkspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   function sendJson(payload: Record<string, any>) {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -792,6 +871,13 @@ function App() {
         return;
       }
 
+      if (parsed.type === "workspace_updated") {
+        setWorkspaces((prev) =>
+          prev.map((ws) => (ws.id === parsed.workspace.id ? parsed.workspace : ws)),
+        );
+        return;
+      }
+
       if (parsed.type === "workspace_created" || parsed.type === "workspace_renamed" || parsed.type === "workspace_removed") {
         if (selectedRepoId) {
           sendJson({ type: "list_workspaces", repo_id: selectedRepoId });
@@ -855,8 +941,49 @@ function App() {
       }
 
       if (parsed.type === "agent_started") {
+        setRunningByWorkspace((prev) => ({ ...prev, [parsed.workspace_id]: true }));
+        if (parsed.workspace_id === selectedWorkspaceId) {
+          setStatusText(`Agent running: ${parsed.agent_id.slice(0, 8)}`);
+        }
+        return;
+      }
+
+      if (parsed.type === "agent_run_state") {
+        setRunningByWorkspace((prev) => ({ ...prev, [parsed.workspace_id]: parsed.running }));
+        return;
+      }
+
+      if (parsed.type === "agent_stopped" || parsed.type === "agent_interrupted") {
+        setRunningByWorkspace((prev) => ({ ...prev, [parsed.workspace_id]: false }));
+        return;
+      }
+
+      if (parsed.type === "change_diff") {
         if (parsed.workspace_id !== selectedWorkspaceId) return;
-        setStatusText(`Agent running: ${parsed.agent_id.slice(0, 8)}`);
+        setDiffFilePath(parsed.file_path);
+        setDiffContent(parsed.diff);
+        setLoadingChangedFilePath(null);
+        return;
+      }
+
+      if (parsed.type === "terminal_output") {
+        if (parsed.workspace_id !== selectedWorkspaceId) return;
+        setTerminalHistory((prev) => {
+          if (prev.length === 0) return prev;
+          const updated = [...prev];
+          const last = { ...updated[updated.length - 1] };
+          last.stdout += parsed.stdout || "";
+          last.stderr += parsed.stderr || "";
+          if (parsed.exit_code != null) {
+            last.exit_code = parsed.exit_code;
+            last.running = false;
+          }
+          updated[updated.length - 1] = last;
+          return updated;
+        });
+        if (parsed.exit_code != null) {
+          setTerminalRunning(false);
+        }
         return;
       }
 
@@ -968,6 +1095,13 @@ function App() {
     const messageText = (rawMessage ?? input).trim();
     if (!messageText) return;
 
+    // Queue if agent is running and this is from the input box (not a shortcut/action)
+    if (isRunning && !rawMessage) {
+      setQueuedMessages((prev) => [...prev, messageText]);
+      setInput("");
+      return;
+    }
+
     const localUser: MessageInfo = {
       agent_id: "user",
       role: "user",
@@ -994,16 +1128,18 @@ function App() {
     }
   }
 
-  function openRightDrawer(tab: "prompts" | "all_files" | "changes" | "checks") {
+  function openRightDrawer(tab: "prompts" | "all_files" | "changes" | "checks" | "terminal") {
     setRightTab(tab);
     setRightOpen(true);
     if (!selectedWorkspaceId) return;
-    if (tab === "prompts") {
+    if (tab === "prompts" || tab === "terminal") {
       return;
     }
     if (tab === "all_files") {
       refreshFiles(selectedWorkspaceId, filesPath || "");
     } else if (tab === "changes") {
+      setDiffContent(null);
+      setDiffFilePath(null);
       refreshChanges(selectedWorkspaceId);
     }
   }
@@ -1113,6 +1249,45 @@ function App() {
     });
   }
 
+  function stopAgent() {
+    if (!selectedWorkspaceId) return;
+    sendJson({ type: "interrupt_agent", workspace_id: selectedWorkspaceId });
+  }
+
+  function viewDiff(filePath: string) {
+    if (!selectedWorkspaceId) return;
+    setDiffFilePath(filePath);
+    setDiffContent(null);
+    setLoadingChangedFilePath(filePath);
+    sendJson({ type: "read_change_diff", workspace_id: selectedWorkspaceId, file_path: filePath });
+  }
+
+  function runTerminalCommand() {
+    const cmd = terminalInput.trim();
+    if (!cmd || terminalRunning || !selectedWorkspaceId) return;
+    const entry: TerminalEntry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      command: cmd,
+      stdout: "",
+      stderr: "",
+      running: true,
+    };
+    setTerminalHistory((prev) => [...prev, entry]);
+    setTerminalRunning(true);
+    sendJson({ type: "run_terminal_command", workspace_id: selectedWorkspaceId, command: cmd });
+    setTerminalInput("");
+  }
+
+  function saveNotes() {
+    if (!selectedWorkspaceId) return;
+    sendJson({ type: "update_workspace_notes", workspace_id: selectedWorkspaceId, notes: notesValue });
+    setEditingNotes(false);
+  }
+
+  function removeQueuedMessage(idx: number) {
+    setQueuedMessages((prev) => prev.filter((_, i) => i !== idx));
+  }
+
   return (
     <SafeAreaView style={[styles.safe, { paddingTop: topInset }]}>
       <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
@@ -1121,7 +1296,10 @@ function App() {
         <TouchableOpacity style={styles.smallButton} onPress={() => setLeftOpen(true)}>
           <Text style={styles.smallButtonText}>Menu</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>{selectedWorkspace?.name || "Select Workspace"}</Text>
+        <View style={styles.headerCenter}>
+          <View style={[styles.statusDot, { backgroundColor: isRunning ? "#34d399" : "#71717a" }]} />
+          <Text style={styles.headerTitle} numberOfLines={1}>{selectedWorkspace?.name || "Select Workspace"}</Text>
+        </View>
         <TouchableOpacity style={styles.smallButton} onPress={() => openRightDrawer("prompts")}>
           <Text style={styles.smallButtonText}>Tools</Text>
         </TouchableOpacity>
@@ -1157,11 +1335,20 @@ function App() {
           renderItem={({ item: row, index }) => {
             if (row.kind === "activity") {
               const isLatest = index === chatRows.length - 1;
+              const isLatestRunningActivity = isRunning && isLatest;
               const expanded = isLatest || isActivityExpanded(row.id);
               return (
                 <View style={styles.activityCard}>
                   <TouchableOpacity style={styles.activityHeader} onPress={() => toggleActivityGroup(row.id)}>
-                    <Text style={styles.activityTitle}>Agent activity ({row.group.messages.length} events)</Text>
+                    <View style={styles.activityTitleRow}>
+                      <Text style={styles.activityTitle}>Agent activity ({row.group.messages.length} events)</Text>
+                      {isLatestRunningActivity && (
+                        <View style={styles.runningBadge}>
+                          <View style={styles.runningBadgeDot} />
+                          <Text style={styles.runningBadgeText}>RUNNING</Text>
+                        </View>
+                      )}
+                    </View>
                     <Text style={styles.activityChevron}>{expanded ? "▼" : "▶"}</Text>
                   </TouchableOpacity>
                   {expanded && (
@@ -1202,13 +1389,31 @@ function App() {
               );
             }
 
+            if (item.is_error) {
+              const isCredentialError = role === "credential_error";
+              return (
+                <View
+                  style={[
+                    styles.errorCard,
+                    isCredentialError ? styles.credentialErrorCard : null,
+                  ]}
+                >
+                  <Text style={[styles.errorLabel, isCredentialError ? styles.credentialErrorLabel : null]}>
+                    {isCredentialError ? "CREDENTIAL ERROR" : "ERROR"}
+                  </Text>
+                  <Text style={[styles.errorContent, isCredentialError ? styles.credentialErrorContent : null]}>
+                    {item.content}
+                  </Text>
+                </View>
+              );
+            }
+
             return (
               <View style={[styles.messageRow, isUser ? styles.messageRowUser : styles.messageRowAi]}>
                 <View
                   style={[
                     styles.messageBubble,
                     isUser ? styles.userBubble : styles.aiBubble,
-                    item.is_error ? styles.errorBubble : null,
                   ]}
                 >
                   <MarkdownText content={item.content} />
@@ -1219,6 +1424,22 @@ function App() {
         />
 
         <View style={styles.composerCard}>
+          {/* Queued messages */}
+          {queuedMessages.length > 0 && (
+            <View style={styles.queueSection}>
+              <Text style={styles.queueLabel}>QUEUED ({queuedMessages.length})</Text>
+              {queuedMessages.map((msg, idx) => (
+                <View key={`q-${idx}`} style={styles.queueItem}>
+                  <Text style={styles.queueIndex}>#{idx + 1}</Text>
+                  <Text style={styles.queueText} numberOfLines={2}>{msg}</Text>
+                  <TouchableOpacity onPress={() => removeQueuedMessage(idx)} style={styles.queueRemove}>
+                    <Text style={styles.queueRemoveText}>✕</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </View>
+          )}
+
           <View style={styles.inputRow}>
             <TextInput
               value={input}
@@ -1228,14 +1449,26 @@ function App() {
               placeholderTextColor="#7a7a7a"
               multiline
             />
-            <TouchableOpacity
-              style={[styles.sendButton, !input.trim() ? styles.sendButtonDisabled : null]}
-              onPress={() => sendMessage()}
-            >
-              <Text style={styles.sendButtonText}>➤</Text>
-            </TouchableOpacity>
+            <View style={styles.sendButtonGroup}>
+              {isRunning && (
+                <TouchableOpacity style={styles.stopButton} onPress={stopAgent}>
+                  <Text style={styles.stopButtonText}>■</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                style={[styles.sendButton, !input.trim() ? styles.sendButtonDisabled : null]}
+                onPress={() => sendMessage()}
+              >
+                <Text style={styles.sendButtonText}>{isRunning ? "⏳" : "➤"}</Text>
+              </TouchableOpacity>
+            </View>
           </View>
           <View style={styles.composerMetaRow}>
+            {isRunning && (
+              <View style={[styles.metaChip, styles.metaChipRunning]}>
+                <Text style={[styles.metaChipText, { color: "#34d399" }]}>● Running</Text>
+              </View>
+            )}
             <TouchableOpacity style={styles.metaChip} onPress={cycleModel}>
               <Text style={styles.metaChipText}>Model {selectedModelLabel}</Text>
             </TouchableOpacity>
@@ -1347,6 +1580,22 @@ function App() {
                 <Text style={styles.drawerCaption}>
                   {selectedRepository ? selectedRepository.name : "Select a repository"}
                 </Text>
+                <View style={styles.searchRow}>
+                  <TextInput
+                    value={workspaceSearch}
+                    onChangeText={setWorkspaceSearch}
+                    placeholder="Filter workspaces..."
+                    placeholderTextColor="#7a726c"
+                    style={styles.searchInput}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                  />
+                  {workspaceSearch ? (
+                    <TouchableOpacity style={styles.searchClear} onPress={() => setWorkspaceSearch("")}>
+                      <Text style={styles.searchClearText}>✕</Text>
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
                 {showAddWorkspaceForm && selectedRepoId ? (
                   <View style={styles.inlineForm}>
                     <TextInput
@@ -1404,13 +1653,22 @@ function App() {
                             </View>
                           ) : (
                             <>
+                              <View style={[styles.wsStatusDot, { backgroundColor: runningByWorkspace[ws.id] ? "#34d399" : statusColor(ws.status) }]} />
                               <TouchableOpacity style={styles.wsMainButton} onPress={() => selectWorkspace(ws.id)}>
                                 <Text style={styles.wsName} numberOfLines={1}>
                                   {ws.name}
                                 </Text>
-                                <Text style={styles.wsMeta} numberOfLines={1}>
-                                  {ws.branch}
-                                </Text>
+                                <View style={styles.wsMetaRow}>
+                                  <Text style={styles.wsMeta} numberOfLines={1}>
+                                    {ws.branch}
+                                  </Text>
+                                  {ws.pr_url ? (
+                                    <TouchableOpacity onPress={() => Linking.openURL(ws.pr_url!).catch(() => {})}>
+                                      <Text style={styles.wsPrBadge}>PR</Text>
+                                    </TouchableOpacity>
+                                  ) : null}
+                                  {ws.pinned_at ? <Text style={styles.wsPinIcon}>📌</Text> : null}
+                                </View>
                               </TouchableOpacity>
                               <TouchableOpacity style={styles.iconButton} onPress={() => beginRenameWorkspace(ws)}>
                                 <Text style={styles.iconButtonText}>✎</Text>
@@ -1446,10 +1704,57 @@ function App() {
               { paddingTop: topInset + 12, transform: [{ translateX: rightDrawerTranslateX }] },
             ]}
           >
+            {/* Workspace info header */}
+            {selectedWorkspace && (
+              <View style={styles.drawerWorkspaceHeader}>
+                <View style={styles.drawerWorkspaceInfo}>
+                  <Text style={styles.drawerWorkspaceStatus}>{selectedWorkspace.status === "running" ? "Running" : selectedWorkspace.status === "idle" ? "Idle" : selectedWorkspace.status === "inReview" ? "In Review" : selectedWorkspace.status === "merged" ? "Merged" : selectedWorkspace.status}</Text>
+                  <Text style={styles.drawerWorkspaceBranch} numberOfLines={1}>{selectedWorkspace.branch}</Text>
+                </View>
+                {selectedWorkspace.pr_url && (
+                  <TouchableOpacity style={styles.prBadge} onPress={() => Linking.openURL(selectedWorkspace.pr_url!).catch(() => {})}>
+                    <Text style={styles.prBadgeText}>🔗 Pull Request</Text>
+                  </TouchableOpacity>
+                )}
+                {/* Notes */}
+                <View style={styles.notesSection}>
+                  {editingNotes ? (
+                    <View style={styles.notesEditContainer}>
+                      <TextInput
+                        value={notesValue}
+                        onChangeText={setNotesValue}
+                        style={styles.notesInput}
+                        multiline
+                        placeholder="Workspace notes..."
+                        placeholderTextColor="#7a726c"
+                        autoFocus
+                      />
+                      <View style={styles.notesActions}>
+                        <TouchableOpacity onPress={() => { setNotesValue(selectedWorkspace.notes ?? ""); setEditingNotes(false); }}>
+                          <Text style={styles.notesCancelText}>Cancel</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity onPress={saveNotes}>
+                          <Text style={styles.notesSaveText}>Save</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  ) : (
+                    <TouchableOpacity onPress={() => { setNotesValue(selectedWorkspace.notes ?? ""); setEditingNotes(true); }}>
+                      <Text style={selectedWorkspace.notes ? styles.notesText : styles.notesPlaceholder} numberOfLines={2}>
+                        {selectedWorkspace.notes || "Add notes..."}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+              </View>
+            )}
+
             <View style={styles.tabRow}>
-              {(["prompts", "all_files", "changes", "checks"] as const).map((tab) => (
+              {(["prompts", "all_files", "changes", "checks", "terminal"] as const).map((tab) => (
                 <TouchableOpacity key={tab} style={[styles.tabButton, rightTab === tab && styles.tabButtonActive]} onPress={() => openRightDrawer(tab)}>
-                  <Text style={[styles.tabText, rightTab === tab && styles.tabTextActive]}>{tab.replace("_", " ")}</Text>
+                  <Text style={[styles.tabText, rightTab === tab && styles.tabTextActive]}>
+                    {tab === "all_files" ? "files" : tab === "terminal" ? "term" : tab}
+                  </Text>
                 </TouchableOpacity>
               ))}
             </View>
@@ -1561,46 +1866,71 @@ function App() {
               )}
               {rightTab === "changes" && (
                 <>
-                  <View style={styles.drawerActions}>
-                    <TouchableOpacity style={styles.secondaryButton} onPress={() => selectedWorkspaceId && refreshChanges(selectedWorkspaceId)}>
-                      <Text style={styles.secondaryButtonText}>Refresh</Text>
-                    </TouchableOpacity>
-                  </View>
-                  <Text style={styles.pathText}>Changed files ({changes.length})</Text>
-                  {changesLoading ? <Text style={styles.drawerText}>Loading changes...</Text> : null}
-                  <ScrollView style={styles.changesList}>
-                    {changes.length === 0 ? <Text style={styles.drawerText}>No local changes.</Text> : null}
-                    {sortedChanges.map((c, idx) => {
-                      const isSelected = selectedFilePath === c.path;
-                      return (
-                        <View key={`${c.path}-${idx}`}>
-                          <TouchableOpacity
-                            style={[styles.changeItem, isSelected ? styles.changeItemActive : null]}
-                            onPress={() => openChangedFile(c)}
-                          >
-                            <Text style={styles.changePath} numberOfLines={1}>
-                              {c.path}
-                            </Text>
-                            <Text style={styles.changeStatus}>{c.status}</Text>
-                          </TouchableOpacity>
-                          {c.old_path ? (
-                            <Text style={styles.changeOldPath} numberOfLines={1}>
-                              from: {c.old_path}
-                            </Text>
-                          ) : null}
-                        </View>
-                      );
-                    })}
-                  </ScrollView>
-                  {loadingChangedFilePath ? (
-                    <Text style={styles.drawerText}>Loading {loadingChangedFilePath}...</Text>
-                  ) : null}
-                  {!!selectedFilePath && rightTab === "changes" && (
+                  {diffContent !== null && diffFilePath ? (
                     <>
-                      <Text style={styles.fileTitle}>{selectedFilePath}</Text>
-                      <ScrollView style={styles.fileContentBox}>
-                        <Text style={styles.fileContentText}>{selectedFileContent}</Text>
+                      <View style={styles.drawerActions}>
+                        <TouchableOpacity style={styles.secondaryButton} onPress={() => { setDiffContent(null); setDiffFilePath(null); }}>
+                          <Text style={styles.secondaryButtonText}>← Back</Text>
+                        </TouchableOpacity>
+                      </View>
+                      <Text style={styles.fileTitle}>{diffFilePath}</Text>
+                      <ScrollView style={styles.diffBox}>
+                        {diffContent.split("\n").map((line, i) => {
+                          let color = "#c7beb7";
+                          if (line.startsWith("+") && !line.startsWith("+++")) color = "#4ade80";
+                          else if (line.startsWith("-") && !line.startsWith("---")) color = "#f87171";
+                          else if (line.startsWith("@@")) color = "#22d3ee";
+                          else if (line.startsWith("diff") || line.startsWith("index")) color = "#6d645e";
+                          return (
+                            <Text key={i} style={[styles.diffLine, { color }]}>
+                              {line || " "}
+                            </Text>
+                          );
+                        })}
                       </ScrollView>
+                    </>
+                  ) : (
+                    <>
+                      <View style={styles.drawerActions}>
+                        <TouchableOpacity style={styles.secondaryButton} onPress={() => selectedWorkspaceId && refreshChanges(selectedWorkspaceId)}>
+                          <Text style={styles.secondaryButtonText}>Refresh</Text>
+                        </TouchableOpacity>
+                      </View>
+                      <Text style={styles.pathText}>Changed files ({changes.length})</Text>
+                      {changesLoading ? <Text style={styles.drawerText}>Loading changes...</Text> : null}
+                      <ScrollView style={styles.changesList}>
+                        {changes.length === 0 ? <Text style={styles.drawerText}>No local changes.</Text> : null}
+                        {sortedChanges.map((c, idx) => {
+                          const statusBadgeColor =
+                            c.status === "M" ? "#facc15" :
+                            c.status === "A" || c.status === "??" ? "#4ade80" :
+                            c.status === "D" ? "#f87171" : "#8d847d";
+                          return (
+                            <View key={`${c.path}-${idx}`}>
+                              <TouchableOpacity
+                                style={styles.changeItem}
+                                onPress={() => viewDiff(c.path)}
+                              >
+                                <Text style={[styles.changeStatusBadge, { color: statusBadgeColor }]}>
+                                  {c.status.padEnd(2)}
+                                </Text>
+                                <Text style={styles.changePath} numberOfLines={1}>
+                                  {c.path}
+                                </Text>
+                                <Text style={styles.changeChevron}>▶</Text>
+                              </TouchableOpacity>
+                              {c.old_path ? (
+                                <Text style={styles.changeOldPath} numberOfLines={1}>
+                                  from: {c.old_path}
+                                </Text>
+                              ) : null}
+                            </View>
+                          );
+                        })}
+                      </ScrollView>
+                      {loadingChangedFilePath ? (
+                        <Text style={styles.drawerText}>Loading {loadingChangedFilePath}...</Text>
+                      ) : null}
                     </>
                   )}
                 </>
@@ -1613,18 +1943,71 @@ function App() {
                     </TouchableOpacity>
                   </View>
                   <ScrollView>
-                    {checks.length === 0 ? <Text style={styles.drawerText}>No check results yet.</Text> : null}
+                    {checks.length === 0 ? <Text style={styles.drawerText}>Click "Run Checks" to start.</Text> : null}
                     {checks.map((check, idx) => (
                       <View key={`${check.name}-${idx}`} style={styles.checkItem}>
-                        <Text style={styles.checkTitle}>
-                          {check.success ? "PASS" : "FAIL"} · {check.name}
-                        </Text>
+                        <View style={styles.checkTitleRow}>
+                          <Text style={[styles.checkIcon, check.success ? styles.checkPass : styles.checkFail]}>
+                            {check.skipped ? "—" : check.success ? "✓" : "✕"}
+                          </Text>
+                          <Text style={styles.checkTitle}>{check.name}</Text>
+                          {check.duration_ms > 0 && (
+                            <Text style={styles.checkDuration}>{(check.duration_ms / 1000).toFixed(1)}s</Text>
+                          )}
+                        </View>
                         <Text style={styles.checkMeta}>{check.command}</Text>
-                        {check.stdout ? <Text style={styles.checkOutput}>{check.stdout.trim()}</Text> : null}
-                        {check.stderr ? <Text style={styles.checkOutputError}>{check.stderr.trim()}</Text> : null}
+                        {check.stdout ? (
+                          <Text style={styles.checkOutput}>{check.stdout.trim().slice(0, 2000)}</Text>
+                        ) : null}
+                        {check.stderr ? (
+                          <Text style={styles.checkOutputError}>{check.stderr.trim().slice(0, 2000)}</Text>
+                        ) : null}
                       </View>
                     ))}
                   </ScrollView>
+                </>
+              )}
+              {rightTab === "terminal" && (
+                <>
+                  <ScrollView style={styles.terminalOutput}>
+                    {terminalHistory.length === 0 ? (
+                      <Text style={styles.drawerText}>Run shell commands in workspace context.</Text>
+                    ) : null}
+                    {terminalHistory.map((entry) => (
+                      <View key={entry.id} style={styles.terminalEntry}>
+                        <View style={styles.terminalCommandRow}>
+                          <Text style={styles.terminalPrompt}>$</Text>
+                          <Text style={styles.terminalCommand}>{entry.command}</Text>
+                          {entry.running ? <View style={styles.terminalRunningDot} /> : null}
+                        </View>
+                        {entry.stdout ? <Text style={styles.terminalStdout}>{entry.stdout}</Text> : null}
+                        {entry.stderr ? <Text style={styles.terminalStderr}>{entry.stderr}</Text> : null}
+                        {entry.exit_code != null && entry.exit_code !== 0 && (
+                          <Text style={styles.terminalExitCode}>exit {entry.exit_code}</Text>
+                        )}
+                      </View>
+                    ))}
+                  </ScrollView>
+                  <View style={styles.terminalInputRow}>
+                    <Text style={styles.terminalInputPrompt}>$</Text>
+                    <TextInput
+                      value={terminalInput}
+                      onChangeText={setTerminalInput}
+                      style={styles.terminalInputField}
+                      placeholder="command..."
+                      placeholderTextColor="#6a625c"
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      editable={!terminalRunning}
+                      onSubmitEditing={runTerminalCommand}
+                      returnKeyType="go"
+                    />
+                    {terminalHistory.length > 0 && (
+                      <TouchableOpacity onPress={() => { setTerminalHistory([]); setTerminalRunning(false); }}>
+                        <Text style={styles.terminalClear}>Clear</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
                 </>
               )}
             </View>
@@ -1646,7 +2029,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
   },
-  headerTitle: { color: "#e6e0da", fontSize: 14, fontWeight: "600", maxWidth: "60%" },
+  headerCenter: { flexDirection: "row", alignItems: "center", gap: 8, flex: 1, justifyContent: "center", maxWidth: "60%" },
+  statusDot: { width: 10, height: 10, borderRadius: 5 },
+  headerTitle: { color: "#e6e0da", fontSize: 14, fontWeight: "600", flexShrink: 1 },
   smallButton: { paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1, borderColor: "#3a332f", borderRadius: 8 },
   smallButtonText: { color: "#d6d1cb", fontSize: 12 },
   connectRow: { flexDirection: "row", padding: 10, gap: 8, borderBottomWidth: 1, borderBottomColor: "#2b2623" },
@@ -1680,7 +2065,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 8,
   },
+  activityTitleRow: { flexDirection: "row", alignItems: "center", gap: 8, flex: 1 },
   activityTitle: { color: "#b9b0a8", fontSize: 12 },
+  runningBadge: { flexDirection: "row", alignItems: "center", gap: 4, borderWidth: 1, borderColor: "rgba(217,119,6,0.4)", backgroundColor: "rgba(120,53,15,0.3)", borderRadius: 999, paddingHorizontal: 6, paddingVertical: 2 },
+  runningBadgeDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#fbbf24" },
+  runningBadgeText: { color: "#fbbf24", fontSize: 9, fontWeight: "700", letterSpacing: 0.5 },
   activityChevron: { color: "#938a83", fontSize: 12 },
   activityBody: { paddingHorizontal: 10, paddingBottom: 8, gap: 4 },
   activityLineRow: { flexDirection: "row", alignItems: "flex-start", gap: 6 },
@@ -1694,7 +2083,12 @@ const styles = StyleSheet.create({
   messageBubble: { maxWidth: "82%", borderRadius: 14, paddingHorizontal: 12, paddingVertical: 10 },
   userBubble: { backgroundColor: "#1f3d57", borderWidth: 1, borderColor: "#2f5e86" },
   aiBubble: { backgroundColor: "#1c1815", borderWidth: 1, borderColor: "#39312b" },
-  errorBubble: { backgroundColor: "#4a1f1f", borderColor: "#7f2f2f" },
+  errorCard: { borderWidth: 1, borderColor: "rgba(225,29,72,0.4)", backgroundColor: "rgba(76,5,25,0.2)", borderRadius: 12, paddingHorizontal: 12, paddingVertical: 10 },
+  credentialErrorCard: { borderColor: "rgba(217,119,6,0.4)", backgroundColor: "rgba(120,53,15,0.25)" },
+  errorLabel: { color: "#fda4af", fontSize: 10, fontWeight: "700", letterSpacing: 0.5, marginBottom: 4 },
+  credentialErrorLabel: { color: "#fbbf24" },
+  errorContent: { color: "#fecdd3", fontSize: 13, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
+  credentialErrorContent: { color: "#fde68a" },
   questionCard: {
     borderWidth: 1,
     borderColor: "#3c332d",
@@ -1929,8 +2323,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 8,
   },
-  changeItemActive: { borderColor: "#5a4f47", backgroundColor: "#221d19" },
-  changeStatus: { color: "#dfc27d", fontSize: 11, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
   changePath: { color: "#ddd4cd", fontSize: 12, flex: 1 },
   changeOldPath: { color: "#8d847d", fontSize: 11, marginBottom: 6, marginLeft: 8 },
   checkItem: { marginBottom: 10, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: "#2b2623" },
@@ -2001,6 +2393,81 @@ const styles = StyleSheet.create({
   },
   actionIcon: { color: "#918880", fontSize: 15 },
   actionLabel: { color: "#ece8e4", fontSize: 13, fontWeight: "500" },
+
+  // Queue styles
+  queueSection: { marginBottom: 8, gap: 6 },
+  queueLabel: { color: "#6d645e", fontSize: 10, fontWeight: "700", letterSpacing: 0.8 },
+  queueItem: { flexDirection: "row", alignItems: "flex-start", gap: 8, borderWidth: 1, borderColor: "rgba(56,189,248,0.2)", backgroundColor: "rgba(8,47,73,0.2)", borderRadius: 8, borderStyle: "dashed", paddingHorizontal: 10, paddingVertical: 8 },
+  queueIndex: { color: "rgba(56,189,248,0.5)", fontSize: 10, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace", marginTop: 2 },
+  queueText: { flex: 1, color: "#beb4ac", fontSize: 12 },
+  queueRemove: { paddingLeft: 4 },
+  queueRemoveText: { color: "#6d645e", fontSize: 12 },
+
+  // Stop button
+  sendButtonGroup: { flexDirection: "column", alignItems: "center", gap: 4 },
+  stopButton: { width: 40, height: 28, borderRadius: 8, backgroundColor: "#7f2f2f", alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: "#a33" },
+  stopButtonText: { color: "#fca5a5", fontSize: 10, fontWeight: "700" },
+  metaChipRunning: { borderColor: "rgba(52,211,153,0.3)", backgroundColor: "rgba(6,78,59,0.2)" },
+
+  // Search
+  searchRow: { flexDirection: "row", alignItems: "center", marginBottom: 8, borderWidth: 1, borderColor: "#433a34", borderRadius: 8, backgroundColor: "#14110f", paddingHorizontal: 8 },
+  searchInput: { flex: 1, color: "#e8e1db", fontSize: 12, paddingVertical: 7 },
+  searchClear: { paddingLeft: 6 },
+  searchClearText: { color: "#6d645e", fontSize: 13 },
+
+  // Workspace status dot and meta
+  wsStatusDot: { width: 10, height: 10, borderRadius: 5, marginRight: 2 },
+  wsMetaRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 2 },
+  wsPrBadge: { color: "#c084fc", fontSize: 10, fontWeight: "600", borderWidth: 1, borderColor: "rgba(168,85,247,0.3)", backgroundColor: "rgba(107,33,168,0.15)", borderRadius: 4, paddingHorizontal: 4, paddingVertical: 1, overflow: "hidden" },
+  wsPinIcon: { fontSize: 10 },
+
+  // Drawer workspace header (right drawer)
+  drawerWorkspaceHeader: { paddingHorizontal: 10, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: "#2b2623", marginBottom: 8 },
+  drawerWorkspaceInfo: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  drawerWorkspaceStatus: { color: "#a79e96", fontSize: 11 },
+  drawerWorkspaceBranch: { color: "#6d645e", fontSize: 11, flex: 1, textAlign: "right", marginLeft: 8 },
+  prBadge: { marginTop: 6, alignSelf: "flex-start", borderWidth: 1, borderColor: "rgba(168,85,247,0.3)", backgroundColor: "rgba(107,33,168,0.1)", borderRadius: 999, paddingHorizontal: 8, paddingVertical: 3 },
+  prBadgeText: { color: "#c4b5fd", fontSize: 11 },
+
+  // Notes
+  notesSection: { marginTop: 6 },
+  notesEditContainer: { gap: 6 },
+  notesInput: { borderWidth: 1, borderColor: "#433a34", borderRadius: 8, backgroundColor: "#14110f", color: "#e8e1db", paddingHorizontal: 8, paddingVertical: 6, fontSize: 12, minHeight: 50, textAlignVertical: "top" },
+  notesActions: { flexDirection: "row", justifyContent: "flex-end", gap: 12 },
+  notesCancelText: { color: "#6d645e", fontSize: 11 },
+  notesSaveText: { color: "#38bdf8", fontSize: 11 },
+  notesText: { color: "#b8aea7", fontSize: 11 },
+  notesPlaceholder: { color: "#6d645e", fontSize: 11, fontStyle: "italic" },
+
+  // Diff viewer
+  diffBox: { maxHeight: 350, borderWidth: 1, borderColor: "#2f2925", borderRadius: 6, backgroundColor: "#0d0b0a", padding: 8 },
+  diffLine: { fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace", fontSize: 11, lineHeight: 16 },
+
+  // Change status badge (colored)
+  changeStatusBadge: { fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace", fontSize: 11, fontWeight: "700", width: 22 },
+  changeChevron: { color: "#6d645e", fontSize: 10 },
+
+  // Check enhancements
+  checkTitleRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  checkIcon: { fontSize: 14, fontWeight: "700" },
+  checkPass: { color: "#4ade80" },
+  checkFail: { color: "#f87171" },
+  checkDuration: { color: "#6d645e", fontSize: 10, marginLeft: "auto" },
+
+  // Terminal
+  terminalOutput: { flex: 1, padding: 8 },
+  terminalEntry: { marginBottom: 12 },
+  terminalCommandRow: { flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 4 },
+  terminalPrompt: { color: "rgba(56,189,248,0.5)", fontSize: 12, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
+  terminalCommand: { color: "#38bdf8", fontSize: 12, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace", flex: 1 },
+  terminalRunningDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#34d399" },
+  terminalStdout: { color: "rgba(134,239,172,0.8)", fontSize: 11, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
+  terminalStderr: { color: "rgba(252,165,165,0.8)", fontSize: 11, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
+  terminalExitCode: { color: "rgba(248,113,113,0.7)", fontSize: 10, marginTop: 2 },
+  terminalInputRow: { flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 1, borderTopColor: "#2b2623", paddingHorizontal: 8, paddingVertical: 8 },
+  terminalInputPrompt: { color: "rgba(56,189,248,0.4)", fontSize: 12, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace" },
+  terminalInputField: { flex: 1, color: "#38bdf8", fontSize: 12, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace", paddingVertical: 4 },
+  terminalClear: { color: "#6d645e", fontSize: 11 },
 });
 
 const markdownStyles = StyleSheet.create({
