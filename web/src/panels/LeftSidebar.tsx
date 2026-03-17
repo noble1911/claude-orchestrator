@@ -12,7 +12,12 @@ const WORKSPACE_GROUPS: WorkspaceGroup[] = [
   { id: "done", label: "Done", statuses: ["merged"] },
 ];
 
-function LeftSidebar() {
+interface LeftSidebarProps {
+  /** Called after a workspace is selected — used on mobile to navigate to chat view */
+  onSelectWorkspace?: () => void;
+}
+
+function LeftSidebar({ onSelectWorkspace }: LeftSidebarProps) {
   const repositories = useRepositoryStore((s) => s.repositories);
   const selectedRepoId = useRepositoryStore((s) => s.selectedRepoId);
   const setSelectedRepoId = useRepositoryStore((s) => s.setSelectedRepoId);
@@ -28,16 +33,16 @@ function LeftSidebar() {
 
   const handleSelectWorkspace = (wsId: string) => {
     setSelectedWorkspaceId(wsId);
-    // Subscribe for streaming and fetch messages
     wsClient?.send({ type: "subscribe", workspace_id: wsId });
     wsClient?.send({ type: "get_messages", workspace_id: wsId });
     wsClient?.send({ type: "list_files", workspace_id: wsId });
     wsClient?.send({ type: "list_changes", workspace_id: wsId });
+    onSelectWorkspace?.();
   };
 
   return (
     <div className="flex h-full flex-col md-surface-container">
-      {/* Repo selector */}
+      {/* Header — visible on mobile as page title */}
       <div className="border-b md-outline p-3">
         <select
           className="md-field text-sm"
@@ -67,13 +72,13 @@ function LeftSidebar() {
                   <button
                     key={ws.id}
                     type="button"
-                    className={`md-list-item flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
+                    className={`md-list-item flex w-full items-center gap-3 px-3 py-3 text-left text-sm ${
                       selectedWorkspaceId === ws.id ? "md-list-item-active" : ""
                     }`}
                     onClick={() => handleSelectWorkspace(ws.id)}
                   >
                     <span
-                      className="inline-block h-2 w-2 flex-shrink-0 rounded-full"
+                      className="inline-block h-2.5 w-2.5 flex-shrink-0 rounded-full"
                       style={{ backgroundColor: running[ws.id] ? "#34d399" : statusColor(ws.status) }}
                     />
                     <span className="truncate md-text-primary">{ws.name}</span>

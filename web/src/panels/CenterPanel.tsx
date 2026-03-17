@@ -4,7 +4,14 @@ import { useAgentStore } from "../stores/agents";
 import { useConnectionStore } from "../stores/connection";
 import MarkdownMessage from "../components/MarkdownMessage";
 
-function CenterPanel() {
+interface CenterPanelProps {
+  /** Mobile: navigate back to workspace list */
+  onBack?: () => void;
+  /** Mobile: open the tools (files/changes/checks) panel */
+  onOpenTools?: () => void;
+}
+
+function CenterPanel({ onBack, onOpenTools }: CenterPanelProps) {
   const selectedWorkspaceId = useWorkspaceStore((s) => s.selectedWorkspaceId);
   const workspaces = useWorkspaceStore((s) => s.workspaces);
   const messages = useAgentStore((s) => s.messages);
@@ -57,7 +64,6 @@ function CenterPanel() {
     const text = input.trim();
     setInput("");
 
-    // If agent is busy, queue instead of sending
     if (isRunning) {
       setQueuedMessages((prev) => [...prev, text]);
       return;
@@ -98,12 +104,34 @@ function CenterPanel() {
     <div className="flex h-full flex-col">
       {/* Header */}
       <div className="flex items-center gap-3 border-b md-outline px-4 py-3">
+        {onBack && (
+          <button
+            type="button"
+            onClick={onBack}
+            className="flex-shrink-0 -ml-1 p-1 rounded-lg hover:bg-white/5 transition-colors"
+            title="Back to workspaces"
+          >
+            <span className="material-symbols-rounded !text-[20px] md-text-muted">arrow_back</span>
+          </button>
+        )}
         <span
-          className="inline-block h-2.5 w-2.5 rounded-full"
+          className="inline-block h-2.5 w-2.5 flex-shrink-0 rounded-full"
           style={{ backgroundColor: isRunning ? "#34d399" : "#71717a" }}
         />
-        <h2 className="text-base font-medium md-text-strong">{workspace.name}</h2>
-        <span className="text-xs md-text-faint">{workspace.branch}</span>
+        <div className="min-w-0 flex-1">
+          <h2 className="text-base font-medium md-text-strong truncate">{workspace.name}</h2>
+          <span className="text-xs md-text-faint">{workspace.branch}</span>
+        </div>
+        {onOpenTools && (
+          <button
+            type="button"
+            onClick={onOpenTools}
+            className="flex-shrink-0 p-1 rounded-lg hover:bg-white/5 transition-colors"
+            title="Files & tools"
+          >
+            <span className="material-symbols-rounded !text-[20px] md-text-muted">folder_open</span>
+          </button>
+        )}
       </div>
 
       {/* Messages */}
@@ -149,7 +177,7 @@ function CenterPanel() {
       </div>
 
       {/* Input area */}
-      <div className="border-t md-outline px-4 py-3">
+      <div className="border-t md-outline px-4 py-3 pb-[calc(0.75rem+env(safe-area-inset-bottom,0px))]">
         {/* Queued messages */}
         {queuedMessages.length > 0 && (
           <div className="mb-2 space-y-1.5">
@@ -195,8 +223,8 @@ function CenterPanel() {
 
           {/* Toolbar */}
           <div className="flex items-center justify-between px-3 py-2 border-t border-[var(--md-sys-color-outline)]/30">
-            <span className="text-[10px] md-text-faint select-none">Shift+Enter for newline</span>
-            <div className="flex items-center gap-1">
+            <span className="text-[10px] md-text-faint select-none hidden sm:inline">Shift+Enter for newline</span>
+            <div className="flex items-center gap-1 ml-auto">
               {isRunning && (
                 <button
                   type="button"

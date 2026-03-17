@@ -6,7 +6,12 @@ import { statusLabel } from "../services/utils";
 
 type RightTab = "files" | "changes" | "checks";
 
-function RightPanel() {
+interface RightPanelProps {
+  /** Mobile: navigate back to chat view */
+  onBack?: () => void;
+}
+
+function RightPanel({ onBack }: RightPanelProps) {
   const [activeTab, setActiveTab] = useState<RightTab>("files");
   const selectedWorkspaceId = useWorkspaceStore((s) => s.selectedWorkspaceId);
   const wsClient = useConnectionStore((s) => s.wsClient);
@@ -48,10 +53,20 @@ function RightPanel() {
 
   return (
     <div className="flex h-full flex-col md-surface-container">
-      {/* Workspace info */}
+      {/* Header */}
       <div className="border-b md-outline px-3 py-2">
-        <div className="flex items-center justify-between">
-          <span className="text-xs md-text-muted">{statusLabel(workspace.status)}</span>
+        <div className="flex items-center gap-2">
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              className="flex-shrink-0 p-1 rounded-lg hover:bg-white/5 transition-colors"
+              title="Back to chat"
+            >
+              <span className="material-symbols-rounded !text-[20px] md-text-muted">arrow_back</span>
+            </button>
+          )}
+          <span className="text-xs md-text-muted flex-1">{statusLabel(workspace.status)}</span>
           <span className="text-xs md-text-faint">{workspace.branch}</span>
         </div>
       </div>
@@ -62,7 +77,7 @@ function RightPanel() {
           <button
             key={tab}
             type="button"
-            className={`flex-1 px-3 py-2 text-xs font-medium capitalize transition ${
+            className={`flex-1 px-3 py-3 text-xs font-medium capitalize transition ${
               activeTab === tab ? "md-text-strong border-b-2 border-[var(--md-sys-color-primary)]" : "md-text-muted hover:md-text-primary"
             }`}
             onClick={() => setActiveTab(tab)}
@@ -101,7 +116,7 @@ function RightPanel() {
                 {currentPath && (
                   <button
                     type="button"
-                    className="mb-1 flex items-center gap-1 px-2 py-1 text-xs md-text-muted hover:md-text-primary"
+                    className="mb-1 flex items-center gap-1 px-2 py-2 text-xs md-text-muted hover:md-text-primary"
                     onClick={() => {
                       const parent = currentPath.split("/").slice(0, -1).join("/");
                       navigateToDir(parent);
@@ -115,10 +130,10 @@ function RightPanel() {
                   <button
                     key={entry.path}
                     type="button"
-                    className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs hover:bg-white/5"
+                    className="flex w-full items-center gap-2 rounded-lg px-2 py-2.5 text-left text-sm hover:bg-white/5"
                     onClick={() => entry.is_dir ? navigateToDir(entry.path) : openFile(entry.path)}
                   >
-                    <span className="material-symbols-rounded !text-[16px] md-text-muted">
+                    <span className="material-symbols-rounded !text-[18px] md-text-muted">
                       {entry.is_dir ? "folder" : "description"}
                     </span>
                     <span className="truncate md-text-primary">{entry.name}</span>
@@ -135,13 +150,13 @@ function RightPanel() {
         {activeTab === "changes" && (
           <div className="p-2">
             <div className="mb-2 flex justify-end">
-              <button type="button" className="text-xs md-text-muted hover:md-text-primary" onClick={refreshChanges}>
-                <span className="material-symbols-rounded !text-[14px]">refresh</span>
+              <button type="button" className="p-1 rounded-lg text-xs md-text-muted hover:md-text-primary hover:bg-white/5" onClick={refreshChanges}>
+                <span className="material-symbols-rounded !text-[16px]">refresh</span>
               </button>
             </div>
             {changes.map((change) => (
-              <div key={change.path} className="flex items-center gap-2 px-2 py-1.5 text-xs">
-                <span className={`font-mono font-bold ${
+              <div key={change.path} className="flex items-center gap-2 px-2 py-2 text-sm">
+                <span className={`font-mono font-bold text-xs ${
                   change.status === "M" ? "text-yellow-400"
                   : change.status === "A" || change.status === "??" ? "text-green-400"
                   : change.status === "D" ? "text-red-400"

@@ -1,11 +1,47 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useMobile } from "../hooks/useMediaQuery";
+import { useWorkspaceStore } from "../stores/workspaces";
 import LeftSidebar from "../panels/LeftSidebar";
 import CenterPanel from "../panels/CenterPanel";
 import RightPanel from "../panels/RightPanel";
 
-function MainPage() {
-  const [showRight, setShowRight] = useState(true);
+type MobileView = "workspaces" | "chat" | "tools";
 
+function MainPage() {
+  const isMobile = useMobile();
+  const [showRight, setShowRight] = useState(true);
+  const [mobileView, setMobileView] = useState<MobileView>("workspaces");
+
+  const selectedWorkspaceId = useWorkspaceStore((s) => s.selectedWorkspaceId);
+
+  // When workspace is deselected, go back to workspace list on mobile
+  useEffect(() => {
+    if (isMobile && !selectedWorkspaceId) {
+      setMobileView("workspaces");
+    }
+  }, [isMobile, selectedWorkspaceId]);
+
+  // ── Mobile layout: stacked navigation ──
+  if (isMobile) {
+    return (
+      <div className="h-[100dvh] flex flex-col">
+        {mobileView === "workspaces" && (
+          <LeftSidebar onSelectWorkspace={() => setMobileView("chat")} />
+        )}
+        {mobileView === "chat" && (
+          <CenterPanel
+            onBack={() => setMobileView("workspaces")}
+            onOpenTools={() => setMobileView("tools")}
+          />
+        )}
+        {mobileView === "tools" && (
+          <RightPanel onBack={() => setMobileView("chat")} />
+        )}
+      </div>
+    );
+  }
+
+  // ── Desktop layout: 3-panel side-by-side ──
   return (
     <div className="flex h-screen">
       {/* Left sidebar */}
