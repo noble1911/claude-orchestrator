@@ -301,6 +301,12 @@ function App() {
         setShowKeyboardShortcuts(true);
       }
 
+      // Cmd+Plus: Open create workspace form
+      if (e.metaKey && e.key === "=" && !e.altKey) {
+        e.preventDefault();
+        openCreateWorkspaceForm();
+      }
+
       // Escape: Close any open dialog/form
       if (e.key === "Escape") {
         if (showGroupSettings) setShowGroupSettings(false);
@@ -4759,9 +4765,13 @@ function App() {
                 <span className="md-text-secondary">Next workspace</span>
                 <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘↓</kbd>
               </div>
-              <div className="flex items-center justify-between py-2">
+              <div className="flex items-center justify-between py-2 border-b md-outline">
                 <span className="md-text-secondary">Switch to repository 1–9</span>
                 <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘1–9</kbd>
+              </div>
+              <div className="flex items-center justify-between py-2">
+                <span className="md-text-secondary">New workspace</span>
+                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘+</kbd>
               </div>
             </div>
 
