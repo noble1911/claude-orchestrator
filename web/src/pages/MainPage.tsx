@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useMobile } from "../hooks/useMediaQuery";
+import { useSwipe } from "../hooks/useSwipe";
 import { useWorkspaceStore } from "../stores/workspaces";
 import LeftSidebar from "../panels/LeftSidebar";
 import CenterPanel from "../panels/CenterPanel";
@@ -11,6 +12,7 @@ function MainPage() {
   const isMobile = useMobile();
   const [showRight, setShowRight] = useState(true);
   const [mobileView, setMobileView] = useState<MobileView>("workspaces");
+  const mobileRef = useRef<HTMLDivElement>(null);
 
   const selectedWorkspaceId = useWorkspaceStore((s) => s.selectedWorkspaceId);
 
@@ -21,10 +23,23 @@ function MainPage() {
     }
   }, [isMobile, selectedWorkspaceId]);
 
-  // ── Mobile layout: stacked navigation ──
+  // Swipe navigation: right = back, left = forward
+  const handleSwipeRight = useCallback(() => {
+    if (mobileView === "chat") setMobileView("workspaces");
+    else if (mobileView === "tools") setMobileView("chat");
+  }, [mobileView]);
+
+  const handleSwipeLeft = useCallback(() => {
+    if (mobileView === "workspaces" && selectedWorkspaceId) setMobileView("chat");
+    else if (mobileView === "chat" && selectedWorkspaceId) setMobileView("tools");
+  }, [mobileView, selectedWorkspaceId]);
+
+  useSwipe(mobileRef, { onSwipeRight: handleSwipeRight, onSwipeLeft: handleSwipeLeft });
+
+  // ── Mobile layout: stacked navigation with swipe ──
   if (isMobile) {
     return (
-      <div className="h-[100dvh] flex flex-col">
+      <div ref={mobileRef} className="h-[100dvh] flex flex-col">
         {mobileView === "workspaces" && (
           <LeftSidebar onSelectWorkspace={() => setMobileView("chat")} />
         )}

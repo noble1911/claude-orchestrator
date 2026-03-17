@@ -1,0 +1,22 @@
+{
+  "name": "Claude Orchestrator",
+  "short_name": "Orchestrator",
+  "description": "Remote control for Claude CLI agents across isolated git worktrees",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#18181b",
+  "theme_color": "#18181b",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

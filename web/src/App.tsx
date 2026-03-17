@@ -22,6 +22,21 @@ function App() {
     return <MainPage />;
   }
 
+  // Show reconnecting banner if we had a connection (wsUrl set) but lost it
+  if (wsUrl && pairingCode && (connState === "connecting" || connState === "authenticating")) {
+    return (
+      <div className="h-[100dvh] flex flex-col">
+        <div className="flex items-center justify-center gap-2 bg-amber-500/15 border-b border-amber-500/30 px-4 py-2.5">
+          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" />
+          <span className="text-xs text-amber-300">Reconnecting...</span>
+        </div>
+        <div className="flex-1">
+          <MainPage />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <PairingPage
       onConnect={handleConnect}

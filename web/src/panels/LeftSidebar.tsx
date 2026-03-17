@@ -1,8 +1,9 @@
+import { useState } from "react";
 import { useRepositoryStore } from "../stores/repositories";
 import { useWorkspaceStore } from "../stores/workspaces";
 import { useAgentStore } from "../stores/agents";
 import { useConnectionStore } from "../stores/connection";
-import { statusColor } from "../services/utils";
+import { statusColor, openExternalHref } from "../services/utils";
 import type { WorkspaceGroup } from "../types";
 
 const WORKSPACE_GROUPS: WorkspaceGroup[] = [
@@ -13,11 +14,12 @@ const WORKSPACE_GROUPS: WorkspaceGroup[] = [
 ];
 
 interface LeftSidebarProps {
-  /** Called after a workspace is selected — used on mobile to navigate to chat view */
   onSelectWorkspace?: () => void;
 }
 
 function LeftSidebar({ onSelectWorkspace }: LeftSidebarProps) {
+  const [search, setSearch] = useState("");
+
   const repositories = useRepositoryStore((s) => s.repositories);
   const selectedRepoId = useRepositoryStore((s) => s.selectedRepoId);
   const setSelectedRepoId = useRepositoryStore((s) => s.setSelectedRepoId);
@@ -27,9 +29,14 @@ function LeftSidebar({ onSelectWorkspace }: LeftSidebarProps) {
   const running = useAgentStore((s) => s.running);
   const wsClient = useConnectionStore((s) => s.wsClient);
 
-  const filteredWorkspaces = selectedRepoId
-    ? workspaces.filter((w) => w.repo_id === selectedRepoId)
-    : workspaces;
+  const filteredWorkspaces = workspaces.filter((w) => {
+    if (selectedRepoId && w.repo_id !== selectedRepoId) return false;
+    if (search) {
+      const q = search.toLowerCase();
+      return w.name.toLowerCase().includes(q) || w.branch.toLowerCase().includes(q);
+    }
+    return true;
+  });
 
   const handleSelectWorkspace = (wsId: string) => {
     setSelectedWorkspaceId(wsId);
@@ -42,8 +49,8 @@ function LeftSidebar({ onSelectWorkspace }: LeftSidebarProps) {
 
   return (
     <div className="flex h-full flex-col md-surface-container">
-      {/* Header — visible on mobile as page title */}
-      <div className="border-b md-outline p-3">
+      {/* Repo selector */}
+      <div className="border-b md-outline p-3 space-y-2">
         <select
           className="md-field text-sm"
           value={selectedRepoId ?? ""}
@@ -54,6 +61,26 @@ function LeftSidebar({ onSelectWorkspace }: LeftSidebarProps) {
             <option key={r.id} value={r.id}>{r.name}</option>
           ))}
         </select>
+        {/* Search */}
+        <div className="relative">
+          <span className="absolute left-2.5 top-1/2 -translate-y-1/2 material-symbols-rounded !text-[16px] md-text-faint">search</span>
+          <input
+            type="text"
+            className="w-full rounded-lg border md-outline bg-black/20 pl-8 pr-2 py-2 text-xs md-text-primary outline-none placeholder:md-text-faint"
+            placeholder="Filter workspaces..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          {search && (
+            <button
+              type="button"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-white/10"
+              onClick={() => setSearch("")}
+            >
+              <span className="material-symbols-rounded !text-[14px] md-text-faint">close</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Workspace groups */}
@@ -81,9 +108,20 @@ function LeftSidebar({ onSelectWorkspace }: LeftSidebarProps) {
                       className="inline-block h-2.5 w-2.5 flex-shrink-0 rounded-full"
                       style={{ backgroundColor: running[ws.id] ? "#34d399" : statusColor(ws.status) }}
                     />
-                    <span className="truncate md-text-primary">{ws.name}</span>
+                    <div className="min-w-0 flex-1">
+                      <span className="block truncate md-text-primary">{ws.name}</span>
+                      {ws.pr_url && (
+                        <span
+                          className="inline-flex items-center gap-0.5 text-[10px] text-purple-400 mt-0.5"
+                          onClick={(e) => { e.stopPropagation(); openExternalHref(ws.pr_url); }}
+                        >
+                          <span className="material-symbols-rounded !text-[11px]">link</span>
+                          PR
+                        </span>
+                      )}
+                    </div>
                     {ws.pinned_at && (
-                      <span className="material-symbols-rounded !text-[14px] md-text-faint ml-auto">push_pin</span>
+                      <span className="material-symbols-rounded !text-[14px] md-text-faint ml-auto flex-shrink-0">push_pin</span>
                     )}
                   </button>
                 ))}
@@ -93,7 +131,9 @@ function LeftSidebar({ onSelectWorkspace }: LeftSidebarProps) {
         })}
 
         {filteredWorkspaces.length === 0 && (
-          <div className="p-4 text-center text-sm md-text-faint">No workspaces</div>
+          <div className="p-4 text-center text-sm md-text-faint">
+            {search ? "No matching workspaces" : "No workspaces"}
+          </div>
         )}
       </div>
     </div>

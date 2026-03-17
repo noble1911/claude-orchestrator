@@ -17,6 +17,7 @@ export interface WorkspaceInfo {
   has_agent: boolean;
   pinned_at?: string | null;
   notes?: string | null;
+  pr_url?: string | null;
 }
 
 export interface MessageInfo {
@@ -48,6 +49,15 @@ export interface CheckInfo {
   stderr: string;
   duration_ms: number;
   skipped: boolean;
+}
+
+export interface TerminalEntry {
+  id: string;
+  command: string;
+  stdout: string;
+  stderr: string;
+  exit_code?: number | null;
+  running: boolean;
 }
 
 // WebSocket response types
