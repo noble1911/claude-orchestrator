@@ -312,7 +312,11 @@ build_desktop() {
   if [ "$INSTALL_DEPS" = "true" ]; then
     log "Installing desktop dependencies"
     npm ci
+    npm ci --prefix web
   fi
+
+  log "Building web client"
+  npm run build:web
 
   log "Building desktop frontend"
   npm run build
