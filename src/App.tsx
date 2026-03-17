@@ -109,8 +109,19 @@ import MarkdownMessage from "./components/MarkdownMessage";
 import QuestionCard from "./components/QuestionCard";
 import SortableWorkspaceItem from "./components/SortableWorkspaceItem";
 import GroupDropZone from "./components/GroupDropZone";
+import ThinkingTimer from "./components/ThinkingTimer";
 import SortableGroupItem from "./components/SortableGroupItem";
 
+const getStatusColor = (status: string) => {
+  switch (status) {
+    case "initializing": return "bg-sky-400 animate-pulse";
+    case "running": return "bg-emerald-400";
+    case "inReview": return "bg-amber-400";
+    case "merged": return "bg-violet-400";
+    case "idle": return "bg-zinc-500";
+    default: return "bg-zinc-500";
+  }
+};
 
 function App() {
   const [repositories, setRepositories] = useState<Repository[]>([]);
@@ -206,7 +217,6 @@ function App() {
   const [credentialErrorWorkspaces, setCredentialErrorWorkspaces] = useState<Set<string>>(new Set());
   const [answeredQuestionTimestamps, setAnsweredQuestionTimestamps] = useState<Set<string>>(new Set());
   const [thinkingSinceByWorkspace, setThinkingSinceByWorkspace] = useState<Record<string, number | null>>({});
-  const [thinkingElapsedSec, setThinkingElapsedSec] = useState(0);
   const [showRenameForm, setShowRenameForm] = useState(false);
   const [renameWorkspaceId, setRenameWorkspaceId] = useState<string | null>(null);
   const [renameWorkspaceName, setRenameWorkspaceName] = useState("");
@@ -243,6 +253,7 @@ function App() {
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const chatTextareaRef = useRef<HTMLTextAreaElement>(null);
   const lastWorkspaceByRepoRef = useRef<Record<string, string>>({});
+  const pendingWorkspaceRestoreRef = useRef<string | null>(null);
   const terminalInputRef = useRef<HTMLInputElement>(null);
   const bedrockEnabled = useMemo(
     () => isTruthyEnvValue(parseEnvOverrides(envOverridesText)[BEDROCK_ENV_KEY]),
@@ -595,23 +606,6 @@ function App() {
         // Ignore unsupported platform badge operations.
       });
   }, [unreadByWorkspace]);
-
-  useEffect(() => {
-    if (!selectedWorkspace) {
-      setThinkingElapsedSec(0);
-      return;
-    }
-    const thinkingSince = thinkingSinceByWorkspace[selectedWorkspace] ?? null;
-    if (thinkingSince === null) {
-      setThinkingElapsedSec(0);
-      return;
-    }
-
-    const tick = () => setThinkingElapsedSec(Math.max(0, Math.floor((Date.now() - thinkingSince) / 1000)));
-    tick();
-    const id = window.setInterval(tick, 1000);
-    return () => window.clearInterval(id);
-  }, [selectedWorkspace, thinkingSinceByWorkspace]);
 
   useEffect(() => {
     const selection = window.getSelection();
@@ -1109,14 +1103,14 @@ function App() {
     invoke("update_workspace_unread", { workspaceId, unread: count }).catch(() => {});
   }
 
-  async function togglePin(workspaceId: string) {
+  const handleTogglePin = useCallback(async (workspaceId: string) => {
     try {
       const updated = await invoke<Workspace>("toggle_workspace_pinned", { workspaceId });
       setWorkspaces((prev) => prev.map((w) => (w.id === updated.id ? updated : w)));
     } catch (err) {
       console.error("Failed to toggle pin:", err);
     }
-  }
+  }, []);
 
   function handleDragStart(event: DragStartEvent) {
     setDragActiveId(event.active.id as string);
@@ -1235,6 +1229,15 @@ function App() {
         if (w.unread > 0) unreadInit[w.id] = w.unread;
       }
       setUnreadByWorkspace((prev) => ({ ...unreadInit, ...prev }));
+      // Restore the remembered workspace after switching repos
+      if (pendingWorkspaceRestoreRef.current === repoId) {
+        pendingWorkspaceRestoreRef.current = null;
+        const remembered = lastWorkspaceByRepoRef.current[repoId];
+        const target = ws.find((w) => w.id === remembered) || ws[0];
+        if (target) {
+          handleSelectWorkspace(target.id);
+        }
+      }
     } catch (err) {
       console.error("Failed to load workspaces:", err);
     }
@@ -1279,15 +1282,12 @@ function App() {
     }
     setSelectedRepo(repoId);
     setMessages([]);
-    // Restore the last selected workspace for this repo, or pick the first available
-    const remembered = lastWorkspaceByRepoRef.current[repoId];
-    const repoWorkspaces = workspaces.filter((w) => w.repoId === repoId);
-    const target = repoWorkspaces.find((w) => w.id === remembered) || repoWorkspaces[0];
-    if (target) {
-      handleSelectWorkspace(target.id);
-    } else {
-      setSelectedWorkspace(null);
-    }
+    // Clear workspaces immediately so the sidebar doesn't flash the old repo's items
+    setWorkspaces([]);
+    setSelectedWorkspace(null);
+    // The useEffect on selectedRepo will call loadWorkspaces, and then
+    // pendingWorkspaceRestoreRef will restore the remembered workspace
+    pendingWorkspaceRestoreRef.current = repoId;
   }
 
   function setDefaultRepository(repoId: string) {
@@ -1418,13 +1418,14 @@ function App() {
     }
   }
 
-  async function removeWorkspace(workspaceId: string) {
+  const removeWorkspaceImplRef = useRef<(workspaceId: string) => Promise<void>>(null!);
+  removeWorkspaceImplRef.current = async (workspaceId: string) => {
     try {
       const workspaceAgents = agents.filter(a => a.workspaceId === workspaceId);
       for (const agent of workspaceAgents) {
         await stopAgent(agent.id);
       }
-      
+
       await invoke("remove_workspace", { workspaceId });
       setWorkspaces(prev => prev.filter(w => w.id !== workspaceId));
       setThinkingSinceByWorkspace((prev) => {
@@ -1470,13 +1471,16 @@ function App() {
       console.error("Failed to remove workspace:", err);
       setError(String(err));
     }
-  }
+  };
+  const handleRemoveWorkspace = useCallback((workspaceId: string) => {
+    void removeWorkspaceImplRef.current(workspaceId);
+  }, []);
 
-  function openRenameWorkspaceForm(workspace: Workspace) {
+  const openRenameWorkspaceForm = useCallback((workspace: Workspace) => {
     setRenameWorkspaceId(workspace.id);
     setRenameWorkspaceName(workspace.name);
     setShowRenameForm(true);
-  }
+  }, []);
 
   async function renameWorkspace() {
     if (!renameWorkspaceId || !renameWorkspaceName.trim()) return;
@@ -2008,16 +2012,25 @@ function App() {
     setShowCreateForm(true);
   }
 
-  function handleSelectWorkspace(workspaceId: string) {
+  const selectedRepoRef = useRef(selectedRepo);
+  selectedRepoRef.current = selectedRepo;
+
+  const ensureAgentRef = useRef(ensureAgentForWorkspace);
+  ensureAgentRef.current = ensureAgentForWorkspace;
+
+  const loadConfigRef = useRef(loadOrchestratorConfig);
+  loadConfigRef.current = loadOrchestratorConfig;
+
+  const handleSelectWorkspace = useCallback((workspaceId: string) => {
     setSelectedWorkspace(workspaceId);
     // Remember this workspace for the current repo so we can restore it later
-    if (selectedRepo) lastWorkspaceByRepoRef.current[selectedRepo] = workspaceId;
+    if (selectedRepoRef.current) lastWorkspaceByRepoRef.current[selectedRepoRef.current] = workspaceId;
     // Close the sidebar overlay on mobile; leave it open on desktop
     if (window.innerWidth < 1024) setIsLeftPanelOpen(false);
-    void ensureAgentForWorkspace(workspaceId);
+    void ensureAgentRef.current(workspaceId);
     // Load orchestrator.json config for the workspace
-    void loadOrchestratorConfig(workspaceId);
-  }
+    void loadConfigRef.current(workspaceId);
+  }, []);
 
   async function loadOrchestratorConfig(workspaceId: string) {
     try {
@@ -2554,17 +2567,6 @@ function App() {
     });
   }
 
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case "initializing": return "bg-sky-400 animate-pulse";
-      case "running": return "bg-emerald-400";
-      case "inReview": return "bg-amber-400";
-      case "merged": return "bg-violet-400";
-      case "idle": return "bg-zinc-500";
-      default: return "bg-zinc-500";
-    }
-  };
-
   const workspaceGroups = useMemo(
     () => {
       const claimed = new Set<string>();
@@ -2585,7 +2587,7 @@ function App() {
           claimed.add(ws.id);
           return true;
         });
-        return { key: group.id, label: group.label, statuses: group.statuses, items };
+        return { key: group.id, label: group.label, statuses: group.statuses, items, itemIds: [...items.map((w) => w.id), `group:${group.id}`] };
       });
       // Pass 2: put unclaimed workspaces into the first status-free group (catch-all)
       const unclaimed = workspaces.filter((ws) => !claimed.has(ws.id));
@@ -2593,6 +2595,7 @@ function App() {
         const catchAll = groups.find((g) => g.statuses.length === 0);
         if (catchAll) {
           catchAll.items = [...catchAll.items, ...unclaimed];
+          catchAll.itemIds = [...catchAll.items.map((w) => w.id), `group:${catchAll.key}`];
         }
       }
       return groups;
@@ -2635,17 +2638,17 @@ function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [workspaceGroups, selectedWorkspace, repositories]);
 
-  const currentRepo = repositories.find(r => r.id === selectedRepo);
-  const currentWorkspace = workspaces.find(w => w.id === selectedWorkspace);
-  const workspaceAgents = agents.filter(a => a.workspaceId === selectedWorkspace);
+  const currentRepo = useMemo(() => repositories.find(r => r.id === selectedRepo), [repositories, selectedRepo]);
+  const currentWorkspace = useMemo(() => workspaces.find(w => w.id === selectedWorkspace), [workspaces, selectedWorkspace]);
+  const workspaceAgents = useMemo(() => agents.filter(a => a.workspaceId === selectedWorkspace), [agents, selectedWorkspace]);
   const isAutoStartingCurrentWorkspace = autoStartingWorkspaceId === selectedWorkspace;
   const currentThinkingSince = selectedWorkspace
     ? (thinkingSinceByWorkspace[selectedWorkspace] ?? null)
     : null;
   const isThinkingCurrentWorkspace = currentThinkingSince !== null;
-  const currentQueuedMessages = selectedWorkspace ? (queuedMessagesByWorkspace[selectedWorkspace] || []) : [];
-  const activeCenterTab = centerTabs.find((tab) => tab.id === activeCenterTabId) || centerTabs[0];
-  const workspaceMessages = selectedWorkspace ? messages : [];
+  const currentQueuedMessages = useMemo(() => selectedWorkspace ? (queuedMessagesByWorkspace[selectedWorkspace] || []) : [], [selectedWorkspace, queuedMessagesByWorkspace]);
+  const activeCenterTab = useMemo(() => centerTabs.find((tab) => tab.id === activeCenterTabId) || centerTabs[0], [centerTabs, activeCenterTabId]);
+  const workspaceMessages = useMemo(() => selectedWorkspace ? messages : [], [selectedWorkspace, messages]);
   const latestSystemMessage = useMemo(() => {
     for (let idx = workspaceMessages.length - 1; idx >= 0; idx -= 1) {
       const message = workspaceMessages[idx];
@@ -3040,7 +3043,7 @@ function App() {
             {workspaceGroups.map((group) => (
               <SortableContext
                 key={group.key}
-                items={[...group.items.map((w) => w.id), `group:${group.key}`]}
+                items={group.itemIds}
                 strategy={verticalListSortingStrategy}
               >
                 <div className="mb-3">
@@ -3061,9 +3064,9 @@ function App() {
                         isSelected={selectedWorkspace === workspace.id}
                         unreadCount={unreadByWorkspace[workspace.id] || 0}
                         onSelect={handleSelectWorkspace}
-                        onTogglePin={(id) => void togglePin(id)}
+                        onTogglePin={handleTogglePin}
                         onRename={openRenameWorkspaceForm}
-                        onRemove={(id) => void removeWorkspace(id)}
+                        onRemove={handleRemoveWorkspace}
                         getStatusColor={getStatusColor}
                       />
                     ))}
@@ -3279,16 +3282,11 @@ function App() {
                     </div>
                   )}
                   {activeCenterTab.type === "chat" && <div ref={messagesEndRef} />}
-                  {activeCenterTab.type === "chat" && isThinkingCurrentWorkspace && (
-                    <div className="md-px-1 md-py-2 text-xs md-text-muted">
-                      <span className="inline-flex items-center gap-2">
-                        <span className="h-2 w-2 animate-pulse rounded-full bg-amber-300" />
-                        Agent running... {thinkingElapsedSec}s
-                      </span>
-                      {latestSystemMessage && (
-                        <span className="ml-2 md-text-faint">Last step: {shortText(latestSystemMessage.content, 96)}</span>
-                      )}
-                    </div>
+                  {activeCenterTab.type === "chat" && isThinkingCurrentWorkspace && currentThinkingSince !== null && (
+                    <ThinkingTimer
+                      thinkingSince={currentThinkingSince}
+                      latestSystemMessage={latestSystemMessage ? shortText(latestSystemMessage.content, 96) : null}
+                    />
                     )}
                   {activeCenterTab.type === "chat" && currentQueuedMessages.length > 0 && (
                     <div className="mx-2 mb-2 space-y-1.5">
