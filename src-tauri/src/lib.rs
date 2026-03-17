@@ -6117,7 +6117,17 @@ pub fn run() {
     app_state.set_ws_server(ws_server.clone());
 
     // Create HTTP server for web client
-    let web_dist_path = app_data_dir.join("web-dist");
+    // In dev: resolve from CARGO_MANIFEST_DIR (src-tauri) -> ../web/dist
+    // In prod: resolve from macOS bundle -> Contents/Resources/web-dist/
+    let dev_web_dist = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../web/dist");
+    let web_dist_path = if dev_web_dist.exists() {
+        dev_web_dist
+    } else if let Ok(exe_path) = std::env::current_exe() {
+        // macOS .app bundle: Contents/MacOS/<binary> -> Contents/Resources/web-dist
+        exe_path.parent().unwrap_or(&exe_path).join("../Resources/web-dist")
+    } else {
+        app_data_dir.join("web-dist")
+    };
     let http_server = Arc::new(HttpServer::new(HTTP_SERVER_PORT, web_dist_path));
     app_state.set_http_server(http_server);
     

@@ -4275,8 +4275,40 @@ function App() {
                 </div>
               </div>
 
+              {serverStatus?.running && serverStatus.pairingCode && (
+                <div className="border-t md-outline pt-3">
+                  <p className="md-text-dim">Pairing code</p>
+                  <div className="mt-1 flex items-center gap-2">
+                    <p className="font-mono text-2xl tracking-[0.3em] text-emerald-300">
+                      {serverStatus.pairingCode}
+                    </p>
+                    <button
+                      onClick={async () => {
+                        try {
+                          const status = await invoke<ServerStatus>("regenerate_pairing_code");
+                          setServerStatus(status);
+                        } catch { /* ignore */ }
+                      }}
+                      className="md-icon-plain !h-6 !w-6 rounded-full border md-outline"
+                      title="Regenerate code"
+                    >
+                      <span className="material-symbols-rounded !text-[14px]">refresh</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {serverStatus?.running && (
+                <div className="border-t md-outline pt-3">
+                  <p className="md-text-dim">Web client URL</p>
+                  <p className="mt-1 break-all font-mono text-[11px] text-emerald-300">
+                    {serverStatus.webUrl}
+                  </p>
+                </div>
+              )}
+
               <div className="border-t md-outline pt-3">
-                <p className="md-text-dim">Connection URL</p>
+                <p className="md-text-dim">WebSocket URL</p>
                 <p className="mt-1 break-all font-mono text-[11px] md-text-strong">
                   {serverStatus?.connectUrl || "ws://localhost:3001"}
                 </p>
