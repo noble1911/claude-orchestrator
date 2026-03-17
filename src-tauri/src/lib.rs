@@ -6149,17 +6149,10 @@ pub fn run() {
             let startup_state = app_state_for_ws.clone();
             let command_state = app_state_for_ws.clone();
             
-            // Start WebSocket server and command handler in tokio runtime
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = ws_server_clone.start().await {
-                    tracing::error!("Failed to start WebSocket server: {}", e);
-                    *startup_state.ws_server_running.write() = false;
-                } else {
-                    *startup_state.ws_server_running.write() = true;
-                    *startup_state.ws_connected_clients.write() = ws_server_clone.client_count();
-                    tracing::info!("WebSocket server started on port {}", REMOTE_SERVER_PORT);
-                }
-            });
+            // WebSocket server is started manually by the user via start_remote_server command.
+            // Drop unused clones to avoid resource leaks.
+            drop(ws_server_clone);
+            drop(startup_state);
             
             // Start command handler
             tauri::async_runtime::spawn(async move {
