@@ -1,8 +1,9 @@
+import { memo } from "react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type { SortableWorkspaceItemProps } from "../types";
 
-function SortableWorkspaceItem({
+const SortableWorkspaceItem = memo(function SortableWorkspaceItem({
   workspace,
   isSelected,
   unreadCount,
@@ -102,6 +103,6 @@ function SortableWorkspaceItem({
       </div>
     </div>
   );
-}
+});
 
 export default SortableWorkspaceItem;
