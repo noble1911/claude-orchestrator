@@ -67,14 +67,16 @@ function LeftSidebar() {
                   <button
                     key={ws.id}
                     type="button"
-                    className={`md-list-item flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
+                    className={`md-list-item flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm ${
                       selectedWorkspaceId === ws.id ? "md-list-item-active" : ""
                     }`}
                     onClick={() => handleSelectWorkspace(ws.id)}
                   >
                     <span
-                      className="inline-block h-2 w-2 flex-shrink-0 rounded-full"
-                      style={{ backgroundColor: running[ws.id] ? "#34d399" : statusColor(ws.status) }}
+                      className={`inline-block h-2 w-2 flex-shrink-0 rounded-full transition-colors ${
+                        running[ws.id] ? "md-status-running" : ""
+                      }`}
+                      style={running[ws.id] ? undefined : { backgroundColor: statusColor(ws.status) }}
                     />
                     <span className="truncate md-text-primary">{ws.name}</span>
                     {ws.pinned_at && (

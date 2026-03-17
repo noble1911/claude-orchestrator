@@ -57,13 +57,12 @@ function CenterPanel() {
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
-      <div className="flex items-center gap-3 border-b md-outline px-4 py-3">
+      <div className="flex items-center gap-3 border-b md-outline px-4 py-3 md-surface-container">
         <span
-          className="inline-block h-2.5 w-2.5 rounded-full"
-          style={{ backgroundColor: isRunning ? "#34d399" : "#71717a" }}
+          className={`inline-block h-2.5 w-2.5 rounded-full transition-colors ${isRunning ? "md-status-running" : "md-status-idle"}`}
         />
-        <h2 className="text-base font-medium md-text-strong">{workspace.name}</h2>
-        <span className="text-xs md-text-faint">{workspace.branch}</span>
+        <h2 className="md-title-small">{workspace.name}</h2>
+        <span className="md-chip !text-[10px]">{workspace.branch}</span>
       </div>
 
       {/* Messages */}
@@ -88,7 +87,7 @@ function CenterPanel() {
                     ? "bg-[var(--md-sys-color-primary)]/15 border border-[var(--md-sys-color-primary)]/30"
                     : isError
                       ? "bg-red-500/10 border border-red-500/20"
-                      : "md-surface-container-high border md-outline"
+                      : "md-card"
                 }`}
               >
                 {isUser ? (

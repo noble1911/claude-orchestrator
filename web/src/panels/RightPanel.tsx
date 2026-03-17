@@ -62,14 +62,16 @@ function RightPanel() {
           <button
             key={tab}
             type="button"
-            className={`flex-1 px-3 py-2 text-xs font-medium capitalize transition ${
-              activeTab === tab ? "md-text-strong border-b-2 border-[var(--md-sys-color-primary)]" : "md-text-muted hover:md-text-primary"
+            className={`flex-1 px-3 py-2.5 text-xs font-medium capitalize transition ${
+              activeTab === tab
+                ? "md-text-strong border-b-2 border-[var(--md-sys-color-primary)]"
+                : "md-text-dim border-b-2 border-transparent hover:md-text-primary"
             }`}
             onClick={() => setActiveTab(tab)}
           >
             {tab}
             {tab === "changes" && changes.length > 0 && (
-              <span className="ml-1 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full bg-white/10 px-1 text-[10px]">
+              <span className="md-chip ml-1.5 !min-h-0 !px-1.5 !py-0 text-[10px]">
                 {changes.length}
               </span>
             )}
@@ -85,23 +87,25 @@ function RightPanel() {
               <div>
                 <button
                   type="button"
-                  className="mb-2 flex items-center gap-1 text-xs md-text-muted hover:md-text-primary"
+                  className="mb-2 flex items-center gap-1 rounded-md px-2 py-1 text-xs md-text-muted transition hover:md-text-primary hover:md-surface-subtle"
                   onClick={clearFileContent}
                 >
                   <span className="material-symbols-rounded !text-[14px]">arrow_back</span>
                   Back to files
                 </button>
-                <div className="text-xs md-text-faint mb-2 truncate">{fileContentPath}</div>
-                <pre className="overflow-auto rounded-lg border md-outline bg-black/30 p-3 text-xs font-mono md-text-primary max-h-[70vh]">
-                  {fileContent}
-                </pre>
+                <p className="mb-2 truncate px-2 text-xs md-text-faint">{fileContentPath}</p>
+                <div className="md-card overflow-hidden">
+                  <pre className="overflow-auto p-3 text-xs font-mono md-text-primary max-h-[70vh]">
+                    {fileContent}
+                  </pre>
+                </div>
               </div>
             ) : (
               <div>
                 {currentPath && (
                   <button
                     type="button"
-                    className="mb-1 flex items-center gap-1 px-2 py-1 text-xs md-text-muted hover:md-text-primary"
+                    className="mb-1 flex items-center gap-1 rounded-md px-2 py-1 text-xs md-text-muted transition hover:md-text-primary hover:md-surface-subtle"
                     onClick={() => {
                       const parent = currentPath.split("/").slice(0, -1).join("/");
                       navigateToDir(parent);
@@ -115,13 +119,15 @@ function RightPanel() {
                   <button
                     key={entry.path}
                     type="button"
-                    className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs hover:bg-white/5"
+                    className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition hover:md-surface-subtle ${
+                      fileContentPath === entry.path ? "md-surface-strong md-text-strong" : entry.is_dir ? "" : "md-text-secondary"
+                    }`}
                     onClick={() => entry.is_dir ? navigateToDir(entry.path) : openFile(entry.path)}
                   >
-                    <span className="material-symbols-rounded !text-[16px] md-text-muted">
+                    <span className={`material-symbols-rounded !text-[16px] ${entry.is_dir ? "md-text-primary" : "md-text-dim"}`}>
                       {entry.is_dir ? "folder" : "description"}
                     </span>
-                    <span className="truncate md-text-primary">{entry.name}</span>
+                    <span className="truncate">{entry.name}</span>
                   </button>
                 ))}
                 {files.length === 0 && (
@@ -140,16 +146,17 @@ function RightPanel() {
               </button>
             </div>
             {changes.map((change) => (
-              <div key={change.path} className="flex items-center gap-2 px-2 py-1.5 text-xs">
+              <div key={change.path} className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs transition hover:md-surface-subtle">
                 <span className={`font-mono font-bold ${
-                  change.status === "M" ? "text-yellow-400"
-                  : change.status === "A" || change.status === "??" ? "text-green-400"
-                  : change.status === "D" ? "text-red-400"
+                  change.status === "M" ? "text-sky-300"
+                  : change.status === "A" || change.status === "??" ? "text-emerald-300"
+                  : change.status === "D" ? "text-rose-300"
+                  : change.status === "R" ? "text-amber-300"
                   : "md-text-muted"
                 }`}>
                   {change.status.padEnd(2)}
                 </span>
-                <span className="truncate md-text-primary">{change.path}</span>
+                <span className="truncate md-text-secondary">{change.path}</span>
               </div>
             ))}
             {changes.length === 0 && (
@@ -166,9 +173,9 @@ function RightPanel() {
               </button>
             </div>
             {checks.map((check) => (
-              <div key={check.name} className="mb-2 rounded-lg border md-outline p-3">
+              <div key={check.name} className="md-card mb-2 p-3">
                 <div className="flex items-center gap-2 mb-1">
-                  <span className={`material-symbols-rounded !text-[16px] ${check.success ? "text-green-400" : "text-red-400"}`}>
+                  <span className={`material-symbols-rounded !text-[16px] ${check.skipped ? "md-text-dim" : check.success ? "text-emerald-300" : "text-rose-300"}`}>
                     {check.skipped ? "remove" : check.success ? "check_circle" : "cancel"}
                   </span>
                   <span className="text-xs font-medium md-text-primary">{check.name}</span>
@@ -177,12 +184,12 @@ function RightPanel() {
                   )}
                 </div>
                 {check.stdout && (
-                  <pre className="mt-1 overflow-auto rounded bg-black/20 p-2 text-[10px] font-mono md-text-muted max-h-32">
+                  <pre className="mt-1 overflow-auto rounded-lg bg-black/20 p-2 text-[10px] font-mono md-text-muted max-h-32">
                     {check.stdout.slice(0, 2000)}
                   </pre>
                 )}
                 {check.stderr && (
-                  <pre className="mt-1 overflow-auto rounded bg-red-500/10 p-2 text-[10px] font-mono text-red-300 max-h-32">
+                  <pre className="mt-1 overflow-auto rounded-lg bg-red-500/10 p-2 text-[10px] font-mono text-rose-300 max-h-32">
                     {check.stderr.slice(0, 2000)}
                   </pre>
                 )}

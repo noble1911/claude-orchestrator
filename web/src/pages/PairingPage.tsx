@@ -58,8 +58,8 @@ function PairingPage({ onConnect, error }: PairingPageProps) {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center">
-      <div className="w-full max-w-md space-y-8 p-8">
+    <div className="flex min-h-screen items-center justify-center md-surface">
+      <div className="md-card w-full max-w-md space-y-8 p-8">
         <div className="text-center space-y-3">
           <h1 className="text-2xl font-semibold md-text-strong">Claude Orchestrator</h1>
           <p className="text-sm md-text-muted">
@@ -78,13 +78,13 @@ function PairingPage({ onConnect, error }: PairingPageProps) {
               value={digit}
               onChange={(e) => handleDigit(i, e.target.value)}
               onKeyDown={(e) => handleKeyDown(i, e)}
-              className="h-14 w-11 rounded-xl border md-outline bg-black/20 text-center text-2xl font-mono md-text-strong focus:border-[var(--md-sys-color-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--md-sys-color-primary)]/40 transition"
+              className="md-field !w-11 !min-h-[56px] !p-0 text-center text-2xl font-mono md-text-strong"
             />
           ))}
         </div>
 
         {error && (
-          <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-center text-sm text-red-300">
+          <div className="md-card !bg-red-500/10 !border-red-500/25 p-3 text-center text-sm text-rose-300">
             {error}
           </div>
         )}

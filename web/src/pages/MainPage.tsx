@@ -7,7 +7,7 @@ function MainPage() {
   const [showRight, setShowRight] = useState(true);
 
   return (
-    <div className="flex h-screen">
+    <div className="flex h-screen md-surface">
       {/* Left sidebar */}
       <div className="w-64 flex-shrink-0 border-r md-outline overflow-hidden">
         <LeftSidebar />

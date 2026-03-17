@@ -4,6 +4,25 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Scrollbar styling (matches desktop app) */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background: rgb(113 113 122 / 0.7);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(113 113 122 / 1);
+}
+
 @layer base {
   :root {
     font-family: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Display", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
@@ -51,6 +70,8 @@
   .md-surface { background: var(--md-sys-color-surface); }
   .md-surface-container { background: var(--md-sys-color-surface-container); }
   .md-surface-container-high { background: var(--md-sys-color-surface-container-high); }
+  .md-surface-subtle { background: color-mix(in srgb, var(--md-sys-color-surface-container-high) 82%, transparent); }
+  .md-surface-strong { background: color-mix(in srgb, var(--md-sys-color-surface-container-high) 96%, black 4%); }
 
   .md-outline { border-color: color-mix(in srgb, var(--md-sys-color-outline) 60%, transparent); }
   .md-outline-strong { border-color: color-mix(in srgb, var(--md-sys-color-outline) 85%, transparent); }
