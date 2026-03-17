@@ -1,8 +1,12 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { useWorkspaceStore } from "../stores/workspaces";
 import { useAgentStore } from "../stores/agents";
 import { useConnectionStore } from "../stores/connection";
 import MarkdownMessage from "../components/MarkdownMessage";
+import LinkifiedInlineText from "../components/LinkifiedInlineText";
+import QuestionCard from "../components/QuestionCard";
+import { compactActivityLines } from "../services/utils";
+import type { ChatRow } from "../types";
 
 interface CenterPanelProps {
   /** Mobile: navigate back to workspace list */
@@ -20,6 +24,7 @@ function CenterPanel({ onBack, onOpenTools }: CenterPanelProps) {
 
   const [input, setInput] = useState("");
   const [queuedMessages, setQueuedMessages] = useState<string[]>([]);
+  const [expandedActivityIds, setExpandedActivityIds] = useState<Set<string>>(new Set());
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -40,9 +45,10 @@ function CenterPanel({ onBack, onOpenTools }: CenterPanelProps) {
     el.style.height = `${el.scrollHeight}px`;
   }, [input]);
 
-  // Clear queue when switching workspaces
+  // Clear queue and expanded activity when switching workspaces
   useEffect(() => {
     setQueuedMessages([]);
+    setExpandedActivityIds(new Set());
   }, [selectedWorkspaceId]);
 
   // Drain one queued message when agent becomes idle
@@ -57,6 +63,68 @@ function CenterPanel({ onBack, onOpenTools }: CenterPanelProps) {
       });
     }
   }, [isRunning, selectedWorkspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Build collapsed activity groups from flat message list
+  const chatRows = useMemo<ChatRow[]>(() => {
+    const rows: ChatRow[] = [];
+    let systemBuffer: typeof workspaceMessages = [];
+    let sequence = 0;
+
+    const flushSystemBuffer = () => {
+      if (systemBuffer.length === 0) return;
+      const first = systemBuffer[0];
+      const rowId = `activity-${first.timestamp}-${sequence}`;
+      rows.push({
+        kind: "activity",
+        id: rowId,
+        group: {
+          id: rowId,
+          messages: systemBuffer,
+          lines: compactActivityLines(systemBuffer),
+        },
+      });
+      sequence += 1;
+      systemBuffer = [];
+    };
+
+    for (const message of workspaceMessages) {
+      const isSystemActivity = message.role === "system" && !message.is_error;
+      if (isSystemActivity) {
+        systemBuffer.push(message);
+        continue;
+      }
+      flushSystemBuffer();
+      rows.push({
+        kind: "message",
+        id: `message-${message.timestamp}-${sequence}`,
+        message,
+      });
+      sequence += 1;
+    }
+
+    flushSystemBuffer();
+    return rows;
+  }, [workspaceMessages]);
+
+  // Track which question messages have been answered
+  const answeredQuestionTimestamps = useMemo(() => {
+    const answered = new Set<string>();
+    let pendingQuestionTimestamp: string | null = null;
+
+    for (const message of workspaceMessages) {
+      if (message.role === "question") {
+        if (pendingQuestionTimestamp) answered.add(pendingQuestionTimestamp);
+        pendingQuestionTimestamp = message.timestamp;
+        continue;
+      }
+      if (pendingQuestionTimestamp && (message.role === "user" || message.agent_id === "user")) {
+        answered.add(pendingQuestionTimestamp);
+        pendingQuestionTimestamp = null;
+      }
+    }
+
+    return answered;
+  }, [workspaceMessages]);
 
   const handleSend = () => {
     if (!input.trim() || !selectedWorkspaceId || !wsClient) return;
@@ -85,8 +153,29 @@ function CenterPanel({ onBack, onOpenTools }: CenterPanelProps) {
     wsClient.send({ type: "interrupt_agent", workspace_id: selectedWorkspaceId });
   };
 
+  const handleQuestionAnswer = (answer: string) => {
+    if (!selectedWorkspaceId || !wsClient) return;
+    wsClient.send({
+      type: "send_message",
+      workspace_id: selectedWorkspaceId,
+      message: answer,
+    });
+  };
+
   const removeQueued = (idx: number) => {
     setQueuedMessages((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const toggleActivityRow = (rowId: string) => {
+    setExpandedActivityIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(rowId)) {
+        next.delete(rowId);
+      } else {
+        next.add(rowId);
+      }
+      return next;
+    });
   };
 
   if (!selectedWorkspaceId || !workspace) {
@@ -135,39 +224,115 @@ function CenterPanel({ onBack, onOpenTools }: CenterPanelProps) {
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-        {workspaceMessages.length === 0 && (
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+        {chatRows.length === 0 && (
           <div className="text-center text-sm md-text-faint py-8">
             No messages yet. Send a prompt to get started.
           </div>
         )}
-        {workspaceMessages.map((msg, i) => {
-          if (msg.role === "system" && msg.content.startsWith("cli:")) return null;
 
-          const isUser = msg.role === "user";
-          const isError = msg.is_error;
+        {chatRows.map((row, rowIdx) => {
+          if (row.kind === "activity") {
+            const isLatestRunningActivity = isRunning && rowIdx === chatRows.length - 1;
+            const expanded = expandedActivityIds.has(row.id);
+            return (
+              <div key={row.id}>
+                <button
+                  type="button"
+                  onClick={() => toggleActivityRow(row.id)}
+                  className="flex w-full items-center gap-2 py-1.5 text-left transition hover:bg-white/5"
+                >
+                  <span className="text-xs md-text-faint">
+                    Agent activity ({row.group.messages.length} events)
+                  </span>
+                  {isLatestRunningActivity && (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-amber-700/60 bg-amber-950/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
+                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-300" />
+                      running
+                    </span>
+                  )}
+                  <span className="material-symbols-rounded ml-auto !text-sm md-text-faint">
+                    {expanded ? "expand_more" : "chevron_right"}
+                  </span>
+                </button>
 
-          return (
-            <div key={`${msg.timestamp}-${i}`} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-              <div
-                className={`max-w-[85%] rounded-2xl px-4 py-3 ${
-                  isUser
-                    ? "bg-[var(--md-sys-color-primary)]/15 border border-[var(--md-sys-color-primary)]/30"
-                    : isError
-                      ? "bg-red-500/10 border border-red-500/20"
-                      : "md-surface-container-high border md-outline"
-                }`}
-              >
-                {isUser ? (
-                  <p className="text-sm md-text-primary whitespace-pre-wrap">{msg.content}</p>
-                ) : (
-                  <MarkdownMessage content={msg.content} />
+                {expanded && (
+                  <div className="space-y-1.5 pl-2 pt-1 pb-1">
+                    {row.group.lines.map((line, lineIdx) => (
+                      <div key={`${row.id}-line-${lineIdx}`} className="flex items-start gap-2 text-xs md-text-faint">
+                        <span className="mt-1 h-1 w-1 flex-none rounded-full bg-white/20" />
+                        <span className="break-all font-mono">
+                          <LinkifiedInlineText
+                            text={line.text}
+                            className="underline decoration-white/35 underline-offset-2 hover:decoration-white/70"
+                          />
+                        </span>
+                        {line.count > 1 && (
+                          <span className="text-[10px] md-text-faint">x{line.count}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
+            );
+          }
+
+          const msg = row.message;
+          const isUser =
+            msg.role === "user" ||
+            msg.agent_id === "user" ||
+            msg.content.trimStart().startsWith(">");
+
+          if (msg.is_error) {
+            if (msg.role === "credential_error") {
+              return (
+                <div key={row.id} className="rounded-xl border border-amber-700/60 bg-amber-950/25 px-3 py-2">
+                  <div className="mb-1 text-[11px] uppercase tracking-wide text-amber-300">Credential Error</div>
+                  <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm text-amber-200">{msg.content}</pre>
+                </div>
+              );
+            }
+            return (
+              <div key={row.id} className="rounded-xl border border-rose-700/60 bg-rose-950/20 px-3 py-2">
+                <div className="mb-1 text-[11px] uppercase tracking-wide text-rose-300">Error</div>
+                <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm text-rose-200">{msg.content}</pre>
+              </div>
+            );
+          }
+
+          if (msg.role === "question") {
+            return (
+              <QuestionCard
+                key={row.id}
+                message={msg}
+                rowId={row.id}
+                isAnswered={answeredQuestionTimestamps.has(msg.timestamp)}
+                onAnswer={handleQuestionAnswer}
+              />
+            );
+          }
+
+          if (isUser) {
+            return (
+              <div key={row.id} className="flex justify-end">
+                <div className="max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-3">
+                  <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm leading-relaxed md-text-strong">
+                    {msg.content.replace(/^>\s?/, "")}
+                  </pre>
+                </div>
+              </div>
+            );
+          }
+
+          return (
+            <div key={row.id}>
+              <MarkdownMessage content={msg.content} />
             </div>
           );
         })}
-        {isRunning && (
+
+        {isRunning && chatRows.length > 0 && chatRows[chatRows.length - 1].kind !== "activity" && (
           <div className="flex items-center gap-2 text-sm md-text-muted">
             <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
             Claude is thinking...
