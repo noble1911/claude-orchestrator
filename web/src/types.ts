@@ -94,3 +94,34 @@ export interface WorkspaceGroup {
   label: string;
   statuses: string[];
 }
+
+export interface ActivityLine {
+  text: string;
+  count: number;
+}
+
+export interface ActivityGroup {
+  id: string;
+  messages: MessageInfo[];
+  lines: ActivityLine[];
+}
+
+export type ChatRow =
+  | { kind: "message"; id: string; message: MessageInfo }
+  | { kind: "activity"; id: string; group: ActivityGroup };
+
+export interface QuestionOption {
+  label: string;
+  description?: string;
+}
+
+export interface QuestionItem {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options?: QuestionOption[];
+}
+
+export interface AskUserQuestionPayload {
+  questions: QuestionItem[];
+}
