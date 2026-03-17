@@ -12,35 +12,75 @@ function CenterPanel() {
   const wsClient = useConnectionStore((s) => s.wsClient);
 
   const [input, setInput] = useState("");
+  const [queuedMessages, setQueuedMessages] = useState<string[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const workspace = workspaces.find((w) => w.id === selectedWorkspaceId);
   const workspaceMessages = selectedWorkspaceId ? (messages[selectedWorkspaceId] ?? []) : [];
-  const isRunning = selectedWorkspaceId ? running[selectedWorkspaceId] ?? false : false;
+  const isRunning = selectedWorkspaceId ? (running[selectedWorkspaceId] ?? false) : false;
 
+  // Auto-scroll to latest message
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [workspaceMessages.length]);
 
+  // Auto-resize textarea to fit content
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
+
+  // Clear queue when switching workspaces
+  useEffect(() => {
+    setQueuedMessages([]);
+  }, [selectedWorkspaceId]);
+
+  // Drain one queued message when agent becomes idle
+  useEffect(() => {
+    if (!isRunning && queuedMessages.length > 0 && selectedWorkspaceId && wsClient) {
+      const [next, ...rest] = queuedMessages;
+      setQueuedMessages(rest);
+      wsClient.send({
+        type: "send_message",
+        workspace_id: selectedWorkspaceId,
+        message: next,
+      });
+    }
+  }, [isRunning, selectedWorkspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleSend = () => {
     if (!input.trim() || !selectedWorkspaceId || !wsClient) return;
 
-    // Start agent if not running
-    if (!isRunning && !workspace?.has_agent) {
+    const text = input.trim();
+    setInput("");
+
+    // If agent is busy, queue instead of sending
+    if (isRunning) {
+      setQueuedMessages((prev) => [...prev, text]);
+      return;
+    }
+
+    if (!workspace?.has_agent) {
       wsClient.send({ type: "start_agent", workspace_id: selectedWorkspaceId });
     }
 
     wsClient.send({
       type: "send_message",
       workspace_id: selectedWorkspaceId,
-      message: input.trim(),
+      message: text,
     });
-    setInput("");
   };
 
   const handleStop = () => {
     if (!selectedWorkspaceId || !wsClient) return;
     wsClient.send({ type: "interrupt_agent", workspace_id: selectedWorkspaceId });
+  };
+
+  const removeQueued = (idx: number) => {
+    setQueuedMessages((prev) => prev.filter((_, i) => i !== idx));
   };
 
   if (!selectedWorkspaceId || !workspace) {
@@ -74,7 +114,6 @@ function CenterPanel() {
           </div>
         )}
         {workspaceMessages.map((msg, i) => {
-          // Skip activity/system lines that are just CLI noise
           if (msg.role === "system" && msg.content.startsWith("cli:")) return null;
 
           const isUser = msg.role === "user";
@@ -109,12 +148,40 @@ function CenterPanel() {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Input */}
+      {/* Input area */}
       <div className="border-t md-outline px-4 py-3">
-        <div className="flex items-end gap-2">
+        {/* Queued messages */}
+        {queuedMessages.length > 0 && (
+          <div className="mb-2 space-y-1.5">
+            <div className="text-[10px] font-semibold uppercase tracking-wider md-text-faint">
+              Queued ({queuedMessages.length})
+            </div>
+            {queuedMessages.map((msg, idx) => (
+              <div
+                key={idx}
+                className="flex items-start gap-2 rounded-lg border border-dashed border-sky-500/30 bg-sky-950/20 px-3 py-2"
+              >
+                <span className="mt-0.5 shrink-0 text-[10px] font-mono text-sky-400/70">#{idx + 1}</span>
+                <p className="min-w-0 flex-1 text-xs md-text-secondary line-clamp-2">{msg}</p>
+                <button
+                  type="button"
+                  onClick={() => removeQueued(idx)}
+                  className="shrink-0 opacity-60 hover:opacity-100 transition-opacity"
+                  title="Remove from queue"
+                >
+                  <span className="material-symbols-rounded !text-[14px] md-text-faint">close</span>
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Composer card */}
+        <div className="rounded-xl border md-outline overflow-hidden">
           <textarea
-            className="md-field flex-1 resize-none"
-            rows={1}
+            ref={textareaRef}
+            className="w-full bg-transparent px-3 pt-2.5 pb-1 text-sm leading-relaxed outline-none md-text-primary placeholder:md-text-muted resize-none overflow-y-auto"
+            style={{ minHeight: "96px", maxHeight: "45vh" }}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -123,22 +190,38 @@ function CenterPanel() {
                 handleSend();
               }
             }}
-            placeholder="Send a message..."
+            placeholder="Ask to make changes..."
           />
-          {isRunning ? (
-            <button type="button" className="md-btn" onClick={handleStop} title="Interrupt">
-              <span className="material-symbols-rounded !text-[18px]">stop</span>
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="md-btn md-btn-tonal"
-              onClick={handleSend}
-              disabled={!input.trim()}
-            >
-              <span className="material-symbols-rounded !text-[18px]">send</span>
-            </button>
-          )}
+
+          {/* Toolbar */}
+          <div className="flex items-center justify-between px-3 py-2 border-t border-[var(--md-sys-color-outline)]/30">
+            <span className="text-[10px] md-text-faint select-none">Shift+Enter for newline</span>
+            <div className="flex items-center gap-1">
+              {isRunning && (
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-red-400 hover:bg-red-500/10 transition-colors"
+                  title="Interrupt agent"
+                >
+                  <span className="material-symbols-rounded !text-[15px]">stop</span>
+                  <span>Stop</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleSend}
+                disabled={!input.trim()}
+                className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-sky-400 hover:bg-sky-500/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                title={isRunning ? "Queue message (sent after current run)" : "Send message"}
+              >
+                <span className="material-symbols-rounded !text-[15px]">
+                  {isRunning ? "queue" : "send"}
+                </span>
+                <span>{isRunning ? "Queue" : "Send"}</span>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
