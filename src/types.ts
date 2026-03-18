@@ -218,6 +218,28 @@ export interface WorkspaceGroup {
   statuses: Workspace["status"][];
 }
 
+export interface ShortcutKeys {
+  /** KeyboardEvent.key value (e.g. "/", "ArrowUp", "Escape") */
+  key: string;
+  /** KeyboardEvent.code value when needed (e.g. "BracketLeft") — if set, code is matched instead of key */
+  code?: string;
+  meta?: boolean;
+  shift?: boolean;
+  alt?: boolean;
+  /** Human-readable label for display (e.g. "⌘[", "Esc") */
+  displayLabel: string;
+}
+
+export interface ShortcutBinding {
+  id: string;
+  label: string;
+  defaultKeys: ShortcutKeys;
+  /** User override — undefined means use defaultKeys */
+  customKeys?: ShortcutKeys;
+  /** If true, shortcut is displayed but not rebindable (native Tauri or range-based) */
+  readonly?: boolean;
+}
+
 export interface QuestionCardProps {
   message: AgentMessage;
   rowId: string;
