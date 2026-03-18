@@ -238,6 +238,7 @@ function App() {
   const [isTogglingRemoteServer, setIsTogglingRemoteServer] = useState(false);
   const [terminalTab, setTerminalTab] = useState<"setup" | "remote" | "terminal">("terminal");
   const [pendingAutoPromptsByWorkspace, setPendingAutoPromptsByWorkspace] = useState<Record<string, PromptShortcut[]>>({});
+  const autoPromptInFlightRef = useRef<Set<string>>(new Set());
   const [orchestratorConfig, setOrchestratorConfig] = useState<OrchestratorConfig | null>(null);
   const [isRunningScript, setIsRunningScript] = useState(false);
   const startingWorkspaceIdsRef = useRef<Set<string>>(new Set());
@@ -972,6 +973,9 @@ function App() {
     const pending = pendingAutoPromptsByWorkspace[selectedWorkspace] || [];
     if (pending.length === 0) return;
 
+    // Prevent duplicate sends — skip if we're already sending for this workspace
+    if (autoPromptInFlightRef.current.has(selectedWorkspace)) return;
+
     const thinkingSince = thinkingSinceByWorkspace[selectedWorkspace] ?? null;
     if (thinkingSince !== null) return;
 
@@ -980,36 +984,36 @@ function App() {
     );
     if (!hasRunningAgent) return;
 
-    let cancelled = false;
     const nextPrompt = pending[0];
     const visibleLabel = `/auto ${nextPrompt.name}`;
+    autoPromptInFlightRef.current.add(selectedWorkspace);
 
     const runAutoPrompt = async () => {
-      const sent = await sendMessage(nextPrompt.prompt, visibleLabel);
-      if (cancelled) return;
-      setPendingAutoPromptsByWorkspace((prev) => {
-        const current = prev[selectedWorkspace] || [];
-        if (current.length === 0) return prev;
-        const [, ...rest] = current;
-        if (rest.length === 0) {
-          const next = { ...prev };
-          delete next[selectedWorkspace];
-          return next;
+      try {
+        const sent = await sendMessage(nextPrompt.prompt, visibleLabel);
+        setPendingAutoPromptsByWorkspace((prev) => {
+          const current = prev[selectedWorkspace] || [];
+          if (current.length === 0) return prev;
+          const [, ...rest] = current;
+          if (rest.length === 0) {
+            const next = { ...prev };
+            delete next[selectedWorkspace];
+            return next;
+          }
+          return {
+            ...prev,
+            [selectedWorkspace]: rest,
+          };
+        });
+        if (!sent) {
+          setError(`Failed to auto-run prompt: ${nextPrompt.name}`);
         }
-        return {
-          ...prev,
-          [selectedWorkspace]: rest,
-        };
-      });
-      if (!sent) {
-        setError(`Failed to auto-run prompt: ${nextPrompt.name}`);
+      } finally {
+        autoPromptInFlightRef.current.delete(selectedWorkspace);
       }
     };
 
     void runAutoPrompt();
-    return () => {
-      cancelled = true;
-    };
   }, [selectedWorkspace, pendingAutoPromptsByWorkspace, thinkingSinceByWorkspace, agents]);
 
   async function loadInitialState() {
