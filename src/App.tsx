@@ -271,6 +271,9 @@ function App() {
   const chatTextareaRef = useRef<HTMLTextAreaElement>(null);
   const lastWorkspaceByRepoRef = useRef<Record<string, string>>({});
   const pendingWorkspaceRestoreRef = useRef<string | null>(null);
+  const repoSwitchGenRef = useRef(0);
+  const selectedRepoRef = useRef(selectedRepo);
+  selectedRepoRef.current = selectedRepo;
   const terminalInputRef = useRef<HTMLInputElement>(null);
   const bedrockEnabled = useMemo(
     () => isTruthyEnvValue(parseEnvOverrides(envOverridesText)[BEDROCK_ENV_KEY]),
@@ -649,7 +652,10 @@ function App() {
     const sync = async () => {
       try {
         await invoke<string[]>("sync_pr_statuses");
-        await loadWorkspaces(selectedRepo);
+        // Use ref to avoid stale closure — if user switched repos during
+        // the await above, selectedRepo here would be the old value.
+        const currentRepo = selectedRepoRef.current;
+        if (currentRepo) await loadWorkspaces(currentRepo);
       } catch {
         // Silently ignore — gh CLI may not be available
       }
@@ -1247,8 +1253,11 @@ function App() {
   }
 
   async function loadWorkspaces(repoId: string) {
+    const gen = repoSwitchGenRef.current;
     try {
       const ws = await invoke<Workspace[]>("list_workspaces", { repoId });
+      // Discard results if user switched repos while we were loading
+      if (repoSwitchGenRef.current !== gen) return;
       setWorkspaces((prev) => {
         // Preserve optimistic workspaces (status=initializing) that haven't been committed to DB yet.
         // Without this, background loadWorkspaces calls (e.g. PR sync) wipe the optimistic entry
@@ -1263,16 +1272,27 @@ function App() {
         if (w.unread > 0) unreadInit[w.id] = w.unread;
       }
       setUnreadByWorkspace((prev) => ({ ...unreadInit, ...prev }));
-      // Restore the remembered workspace after switching repos
+      // Restore the remembered workspace after switching repos — set selection
+      // atomically (same React batch as setWorkspaces above) so there's no
+      // render frame where workspaces are visible but nothing is highlighted.
       if (pendingWorkspaceRestoreRef.current === repoId) {
         pendingWorkspaceRestoreRef.current = null;
         const remembered = lastWorkspaceByRepoRef.current[repoId];
         const target = ws.find((w) => w.id === remembered) || ws[0];
         if (target) {
-          handleSelectWorkspace(target.id);
+          setSelectedWorkspace(target.id);
+          selectedWorkspaceRef.current = target.id;
+          if (selectedRepoRef.current) {
+            lastWorkspaceByRepoRef.current[selectedRepoRef.current] = target.id;
+          }
+          if (window.innerWidth < 1024) setIsLeftPanelOpen(false);
+          void ensureAgentRef.current(target.id);
+          void loadConfigRef.current(target.id);
         }
       }
     } catch (err) {
+      // Discard errors from stale loads too
+      if (repoSwitchGenRef.current !== gen) return;
       console.error("Failed to load workspaces:", err);
     }
   }
@@ -1314,6 +1334,8 @@ function App() {
     if (selectedRepo && selectedWorkspace) {
       lastWorkspaceByRepoRef.current[selectedRepo] = selectedWorkspace;
     }
+    // Invalidate any in-flight loadWorkspaces calls (e.g. PR sync polling)
+    repoSwitchGenRef.current += 1;
     setSelectedRepo(repoId);
     setMessages([]);
     // Clear workspaces immediately so the sidebar doesn't flash the old repo's items
@@ -1540,7 +1562,8 @@ function App() {
         envOverrides: parseEnvOverrides(envOverridesText),
       });
       setAgents(prev => [...prev, agent]);
-      await loadWorkspaces(selectedRepo!);
+      const currentRepo = selectedRepoRef.current;
+      if (currentRepo) await loadWorkspaces(currentRepo);
     } catch (err) {
       console.error("Failed to start agent:", err);
       setError(String(err));
@@ -1574,7 +1597,8 @@ function App() {
       if (stoppedWorkspaceId) {
         setThinkingSinceByWorkspace((prev) => ({ ...prev, [stoppedWorkspaceId]: null }));
       }
-      if (selectedRepo) await loadWorkspaces(selectedRepo);
+      const currentRepo = selectedRepoRef.current;
+      if (currentRepo) await loadWorkspaces(currentRepo);
     } catch (err) {
       console.error("Failed to stop agent:", err);
       setError(String(err));
@@ -2045,9 +2069,6 @@ function App() {
     setNewWorkspaceName(generateWorkspaceName());
     setShowCreateForm(true);
   }
-
-  const selectedRepoRef = useRef(selectedRepo);
-  selectedRepoRef.current = selectedRepo;
 
   const ensureAgentRef = useRef(ensureAgentForWorkspace);
   ensureAgentRef.current = ensureAgentForWorkspace;
