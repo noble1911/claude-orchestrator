@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
-use tauri::menu::Menu;
+use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
@@ -6142,23 +6142,66 @@ pub fn run() {
         .manage(app_state)
         .setup(move |app| {
             let app_handle = app.handle().clone();
-            // Ensure the native menu bar is present and About displays package version metadata.
-            let default_menu = Menu::default(&app_handle)?;
-            app.set_menu(default_menu)?;
+
+            // Build native menu bar with a Settings item in the application menu.
+            let settings_item = MenuItemBuilder::with_id("settings", "Settings...")
+                .accelerator("CmdOrCtrl+;")
+                .build(app)?;
+
+            let app_menu = SubmenuBuilder::new(app, "Claude Orchestrator")
+                .about(None)
+                .separator()
+                .item(&settings_item)
+                .separator()
+                .services()
+                .separator()
+                .hide()
+                .hide_others()
+                .show_all()
+                .separator()
+                .quit()
+                .build()?;
+
+            let edit_menu = SubmenuBuilder::new(app, "Edit")
+                .undo()
+                .redo()
+                .separator()
+                .cut()
+                .copy()
+                .paste()
+                .select_all()
+                .build()?;
+
+            let window_menu = SubmenuBuilder::new(app, "Window")
+                .minimize()
+                .separator()
+                .close_window()
+                .build()?;
+
+            let menu = Menu::with_items(app, &[&app_menu, &edit_menu, &window_menu])?;
+            app.set_menu(menu)?;
+
+            let app_handle_menu = app_handle.clone();
+            app.on_menu_event(move |_app, event| {
+                if event.id().as_ref() == "settings" {
+                    let _ = app_handle_menu.emit("open-settings", ());
+                }
+            });
+
             let ws_server_clone = ws_server.clone();
             let startup_state = app_state_for_ws.clone();
             let command_state = app_state_for_ws.clone();
-            
+
             // WebSocket server is started manually by the user via start_remote_server command.
             // Drop unused clones to avoid resource leaks.
             drop(ws_server_clone);
             drop(startup_state);
-            
+
             // Start command handler
             tauri::async_runtime::spawn(async move {
                 handle_ws_commands(ws_cmd_rx, command_state, app_handle).await;
             });
-            
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

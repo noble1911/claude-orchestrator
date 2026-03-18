@@ -63,6 +63,10 @@ import {
   DEFAULT_WORKSPACE_GROUPS,
   LEFT_PANEL_OPEN_STORAGE_KEY,
   RIGHT_PANEL_OPEN_STORAGE_KEY,
+  SIDEBAR_FONT_SIZE_STORAGE_KEY,
+  CHAT_FONT_SIZE_STORAGE_KEY,
+  SIDEBAR_FONT_SIZE_DEFAULT,
+  CHAT_FONT_SIZE_DEFAULT,
 } from "./constants";
 import {
   compactActivityLines,
@@ -111,6 +115,7 @@ import SortableWorkspaceItem from "./components/SortableWorkspaceItem";
 import GroupDropZone from "./components/GroupDropZone";
 import ThinkingTimer from "./components/ThinkingTimer";
 import SortableGroupItem from "./components/SortableGroupItem";
+import SettingsModal from "./components/SettingsModal";
 
 const getStatusColor = (status: string) => {
   switch (status) {
@@ -240,6 +245,17 @@ function App() {
   const [pendingAutoPromptsByWorkspace, setPendingAutoPromptsByWorkspace] = useState<Record<string, PromptShortcut[]>>({});
   const [orchestratorConfig, setOrchestratorConfig] = useState<OrchestratorConfig | null>(null);
   const [isRunningScript, setIsRunningScript] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [sidebarFontSize, setSidebarFontSize] = useState<number>(() => {
+    const stored = localStorage.getItem(SIDEBAR_FONT_SIZE_STORAGE_KEY);
+    const parsed = stored ? Number(stored) : NaN;
+    return Number.isNaN(parsed) ? SIDEBAR_FONT_SIZE_DEFAULT : parsed;
+  });
+  const [chatFontSize, setChatFontSize] = useState<number>(() => {
+    const stored = localStorage.getItem(CHAT_FONT_SIZE_STORAGE_KEY);
+    const parsed = stored ? Number(stored) : NaN;
+    return Number.isNaN(parsed) ? CHAT_FONT_SIZE_DEFAULT : parsed;
+  });
   const startingWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const selectedWorkspaceRef = useRef<string | null>(null);
   const thinkingSinceByWorkspaceRef = useRef<Record<string, number | null>>({});
@@ -320,7 +336,8 @@ function App() {
 
       // Escape: Close any open dialog/form
       if (e.key === "Escape") {
-        if (showGroupSettings) setShowGroupSettings(false);
+        if (showSettingsModal) setShowSettingsModal(false);
+        else if (showGroupSettings) setShowGroupSettings(false);
         else if (showKeyboardShortcuts) setShowKeyboardShortcuts(false);
         else if (showCreateForm) setShowCreateForm(false);
         else if (showRenameForm) setShowRenameForm(false);
@@ -330,7 +347,7 @@ function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [showGroupSettings, showKeyboardShortcuts, showCreateForm, showRenameForm, showThemeForm]);
+  }, [showSettingsModal, showGroupSettings, showKeyboardShortcuts, showCreateForm, showRenameForm, showThemeForm]);
 
   function normalizeUpdateErrorMessage(rawError: string): string {
     const message = rawError.trim();
@@ -484,10 +501,15 @@ function App() {
       });
     });
     
+    const unlistenSettings = listen("open-settings", () => {
+      setShowSettingsModal(true);
+    });
+
     return () => {
       unlisten.then(fn => fn());
       unlistenRunState.then(fn => fn());
       unlistenClients.then(fn => fn());
+      unlistenSettings.then(fn => fn());
     };
   }, []);
 
@@ -764,6 +786,14 @@ function App() {
       console.error("Failed to persist env overrides:", err);
     }
   }, [envOverridesText]);
+
+  useEffect(() => {
+    localStorage.setItem(SIDEBAR_FONT_SIZE_STORAGE_KEY, String(sidebarFontSize));
+  }, [sidebarFontSize]);
+
+  useEffect(() => {
+    localStorage.setItem(CHAT_FONT_SIZE_STORAGE_KEY, String(chatFontSize));
+  }, [chatFontSize]);
 
   useEffect(() => {
     try {
@@ -2940,7 +2970,7 @@ function App() {
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto md-px-4 md-py-4">
+        <div className="flex-1 overflow-y-auto md-px-4 md-py-4" style={{ zoom: sidebarFontSize / 12 }}>
           <div className="mb-4">
             <div className="mb-2 flex items-center justify-between md-px-1">
               <h2 className="md-title-small">Repositories</h2>
@@ -3227,7 +3257,7 @@ function App() {
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto md-px-3 md-py-3">
+              <div className="flex-1 overflow-y-auto md-px-3 md-py-3" style={{ zoom: chatFontSize / 14 }}>
                 <div className="space-y-3">
                   {activeCenterTab.type === "chat" && workspaceMessages.length === 0 ? (
                     <div className="flex h-[55vh] items-center justify-center md-text-muted">
@@ -3550,7 +3580,7 @@ function App() {
             </button>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto md-px-4 md-py-4">
+        <div className="min-h-0 flex-1 overflow-y-auto md-px-4 md-py-4" style={{ zoom: sidebarFontSize / 12 }}>
           {activeRightTab === "prompts" && (
             <div className="space-y-3 text-sm">
               <p className="md-label-medium">Prompt Library</p>
@@ -4037,61 +4067,6 @@ function App() {
                 {updateError && <p className="mt-1 text-[11px] text-amber-300">{updateError}</p>}
               </div>
 
-              <div className="border-t md-outline pt-3">
-                <p className="md-text-dim">Theme</p>
-                <div className="mt-2 space-y-2">
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={selectedTheme}
-                      onChange={(event) => setSelectedTheme(normalizeThemeId(event.target.value, availableThemes))}
-                      className="md-select !min-h-0"
-                      aria-label="Theme selection"
-                    >
-                      {themeOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      onClick={openCreateThemeForm}
-                      className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle"
-                      title="Create theme"
-                      aria-label="Create theme"
-                    >
-                      <span className="material-symbols-rounded !text-[18px]">add</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={openEditThemeForm}
-                      disabled={isBuiltInTheme(selectedTheme)}
-                      className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle disabled:cursor-not-allowed disabled:opacity-40"
-                      title={isBuiltInTheme(selectedTheme) ? "Only custom themes are editable" : "Edit theme"}
-                      aria-label="Edit theme"
-                    >
-                      <span className="material-symbols-rounded !text-[16px]">edit</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={deleteSelectedCustomTheme}
-                      disabled={isBuiltInTheme(selectedTheme)}
-                      className="md-icon-plain md-icon-plain-danger !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle disabled:cursor-not-allowed disabled:opacity-40"
-                      title={isBuiltInTheme(selectedTheme) ? "Built-in themes cannot be deleted" : "Delete custom theme"}
-                      aria-label="Delete custom theme"
-                    >
-                      <span className="material-symbols-rounded !text-[16px]">delete</span>
-                    </button>
-                  </div>
-                  <p className="text-[11px] md-text-muted">
-                    {themeOptions.find((option) => option.value === selectedTheme)?.description}
-                  </p>
-                  <p className="text-[11px] md-text-muted">
-                    Use + to create themes from the app. Built-ins stay unchanged.
-                  </p>
-                </div>
-              </div>
-
               {currentWorkspace && (
                 <div className="border-t md-outline pt-3">
                   <p className="md-text-dim">Notes</p>
@@ -4108,29 +4083,6 @@ function App() {
                   />
                 </div>
               )}
-
-              <div className="border-t md-outline pt-3">
-                <p className="md-text-dim">Environment overrides (app-wide)</p>
-                <p className="mb-2 text-[11px] md-text-muted">
-                  Supports lines like `export KEY=VALUE` or `KEY=VALUE`. Applied to agents, chat and terminal commands.
-                </p>
-                <label className="mb-2 flex items-center gap-2 rounded-md border px-2 py-1.5 md-outline">
-                  <input
-                    type="checkbox"
-                    checked={bedrockEnabled}
-                    onChange={(e) => setBedrockEnabled(e.target.checked)}
-                    className="h-4 w-4 accent-sky-500"
-                  />
-                  <span className="text-[11px] md-text-strong">Use AWS Bedrock (`CLAUDE_CODE_USE_BEDROCK=1`)</span>
-                </label>
-                <textarea
-                  value={envOverridesText}
-                  onChange={(e) => setEnvOverridesText(e.target.value)}
-                  rows={6}
-                  className="md-field font-mono"
-                  placeholder={"export CLAUDE_CODE_USE_BEDROCK=1\n# optional if not using default profile\nexport AWS_PROFILE=your-profile"}
-                />
-              </div>
 
               {/* Scripts (conductor.json / orchestrator.json) */}
               <div className="border-t md-outline pt-3">
@@ -4577,6 +4529,27 @@ function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {showSettingsModal && (
+        <SettingsModal
+          onClose={() => setShowSettingsModal(false)}
+          selectedTheme={selectedTheme}
+          onThemeChange={setSelectedTheme}
+          themeOptions={themeOptions}
+          availableThemes={availableThemes}
+          onCreateTheme={() => { setShowSettingsModal(false); openCreateThemeForm(); }}
+          onEditTheme={() => { setShowSettingsModal(false); openEditThemeForm(); }}
+          onDeleteTheme={deleteSelectedCustomTheme}
+          sidebarFontSize={sidebarFontSize}
+          onSidebarFontSizeChange={setSidebarFontSize}
+          chatFontSize={chatFontSize}
+          onChatFontSizeChange={setChatFontSize}
+          envOverridesText={envOverridesText}
+          onEnvOverridesChange={setEnvOverridesText}
+          bedrockEnabled={bedrockEnabled}
+          onBedrockToggle={setBedrockEnabled}
+        />
       )}
 
       {showThemeForm && (
