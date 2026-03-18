@@ -1,4 +1,4 @@
-import type { WorkspaceGroup } from "./types";
+import type { WorkspaceGroup, ShortcutBinding } from "./types";
 
 export const NAME_ADJECTIVES = [
   "swift",
@@ -47,6 +47,58 @@ export const SIDEBAR_FONT_SIZE_DEFAULT = 12;
 export const CHAT_FONT_SIZE_DEFAULT = 14;
 export const SIDEBAR_FONT_SIZE_OPTIONS = [10, 11, 12, 13, 14] as const;
 export const CHAT_FONT_SIZE_OPTIONS = [12, 13, 14, 15, 16] as const;
+
+export const SHORTCUTS_STORAGE_KEY = "claude_orchestrator_shortcuts";
+
+export const DEFAULT_SHORTCUTS: ShortcutBinding[] = [
+  {
+    id: "toggleLeftSidebar",
+    label: "Toggle left sidebar",
+    defaultKeys: { code: "BracketLeft", key: "[", meta: true, displayLabel: "⌘[" },
+  },
+  {
+    id: "toggleRightSidebar",
+    label: "Toggle right sidebar",
+    defaultKeys: { code: "BracketRight", key: "]", meta: true, displayLabel: "⌘]" },
+  },
+  {
+    id: "showShortcuts",
+    label: "Show shortcuts",
+    defaultKeys: { key: "/", meta: true, displayLabel: "⌘/" },
+  },
+  {
+    id: "newWorkspace",
+    label: "New workspace",
+    defaultKeys: { key: "=", meta: true, displayLabel: "⌘+" },
+  },
+  {
+    id: "closeDialog",
+    label: "Close dialog",
+    defaultKeys: { key: "Escape", displayLabel: "Esc" },
+  },
+  {
+    id: "prevWorkspace",
+    label: "Previous workspace",
+    defaultKeys: { key: "ArrowUp", meta: true, displayLabel: "⌘↑" },
+  },
+  {
+    id: "nextWorkspace",
+    label: "Next workspace",
+    defaultKeys: { key: "ArrowDown", meta: true, displayLabel: "⌘↓" },
+  },
+  {
+    id: "switchRepo",
+    label: "Switch to repository 1–9",
+    defaultKeys: { key: "1", meta: true, displayLabel: "⌘1–9" },
+    readonly: true,
+  },
+  {
+    id: "openSettings",
+    label: "Open Settings",
+    defaultKeys: { key: ";", meta: true, displayLabel: "⌘;" },
+    readonly: true,
+  },
+];
 
 export const DEFAULT_WORKSPACE_GROUPS: WorkspaceGroup[] = [
   { id: "in-progress", label: "In progress", statuses: ["running"] },

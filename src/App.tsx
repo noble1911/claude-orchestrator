@@ -61,6 +61,7 @@ import {
   WORKSPACE_GROUPS_STORAGE_KEY,
   WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY,
   DEFAULT_WORKSPACE_GROUPS,
+  DEFAULT_SHORTCUTS,
   LEFT_PANEL_OPEN_STORAGE_KEY,
   RIGHT_PANEL_OPEN_STORAGE_KEY,
   SIDEBAR_FONT_SIZE_STORAGE_KEY,
@@ -78,6 +79,11 @@ import {
   createThemeDraftFromTheme,
   isTruthyEnvValue,
   upsertEnvOverrideLine,
+  loadCustomShortcuts,
+  saveCustomShortcuts,
+  resolveShortcuts,
+  activeKeys,
+  shortcutMatchesEvent,
 } from "./utils";
 import type {
   Repository,
@@ -107,6 +113,7 @@ import type {
   ThemeDraft,
   ChatRow,
   WorkspaceGroup,
+  ShortcutKeys,
 } from "./types";
 import LinkifiedInlineText from "./components/LinkifiedInlineText";
 import MarkdownMessage from "./components/MarkdownMessage";
@@ -115,7 +122,7 @@ import SortableWorkspaceItem from "./components/SortableWorkspaceItem";
 import GroupDropZone from "./components/GroupDropZone";
 import ThinkingTimer from "./components/ThinkingTimer";
 import SortableGroupItem from "./components/SortableGroupItem";
-import SettingsModal from "./components/SettingsModal";
+import SettingsModal, { type SettingsTab } from "./components/SettingsModal";
 
 const getStatusColor = (status: string) => {
   switch (status) {
@@ -225,7 +232,8 @@ function App() {
   const [showRenameForm, setShowRenameForm] = useState(false);
   const [renameWorkspaceId, setRenameWorkspaceId] = useState<string | null>(null);
   const [renameWorkspaceName, setRenameWorkspaceName] = useState("");
-  const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false);
+  const [shortcutOverrides, setShortcutOverrides] = useState<Record<string, ShortcutKeys>>(() => loadCustomShortcuts());
+  const [initialSettingsTab, setInitialSettingsTab] = useState<SettingsTab | undefined>(undefined);
   const [workspaceOpenTarget, setWorkspaceOpenTarget] = useState<WorkspaceOpenTarget>("");
   const [leftPanelWidth, setLeftPanelWidth] = useState(280);
   const [rightPanelWidth, setRightPanelWidth] = useState(360);
@@ -290,6 +298,11 @@ function App() {
     ? (selectedModelByWorkspace[selectedWorkspace] ?? defaultModel)
     : defaultModel;
 
+  const resolvedShortcuts = useMemo(
+    () => resolveShortcuts(DEFAULT_SHORTCUTS, shortcutOverrides),
+    [shortcutOverrides],
+  );
+
   useEffect(() => {
     selectedWorkspaceRef.current = selectedWorkspace;
   }, [selectedWorkspace]);
@@ -302,8 +315,13 @@ function App() {
     pendingUnreadByWorkspaceRef.current = pendingUnreadByWorkspace;
   }, [pendingUnreadByWorkspace]);
 
-  // Global keyboard shortcuts (Conductor pattern)
+  // Global keyboard shortcuts (Conductor pattern) — uses resolved shortcut config
   useEffect(() => {
+    const getKeys = (id: string) => {
+      const binding = resolvedShortcuts.find((s) => s.id === id);
+      return binding ? activeKeys(binding) : null;
+    };
+
     const handleKeyDown = (e: KeyboardEvent) => {
       // Don't trigger unmodified shortcuts when typing in inputs
       // Allow Cmd/Ctrl combos and Escape through regardless of focus
@@ -314,35 +332,39 @@ function App() {
         return;
       }
 
-      // Cmd+[: Toggle left sidebar
-      if (e.metaKey && e.code === "BracketLeft" && !e.shiftKey && !e.altKey) {
+      const toggleLeftKeys = getKeys("toggleLeftSidebar");
+      if (toggleLeftKeys && shortcutMatchesEvent(toggleLeftKeys, e)) {
         e.preventDefault();
         setIsLeftPanelOpen(prev => !prev);
+        return;
       }
 
-      // Cmd+]: Toggle right sidebar
-      if (e.metaKey && e.code === "BracketRight" && !e.shiftKey && !e.altKey) {
+      const toggleRightKeys = getKeys("toggleRightSidebar");
+      if (toggleRightKeys && shortcutMatchesEvent(toggleRightKeys, e)) {
         e.preventDefault();
         setIsRightPanelOpen(prev => !prev);
+        return;
       }
 
-      // Cmd+/: Show keyboard shortcuts
-      if (e.metaKey && e.key === "/" && !e.shiftKey && !e.altKey) {
+      const showShortcutsKeys = getKeys("showShortcuts");
+      if (showShortcutsKeys && shortcutMatchesEvent(showShortcutsKeys, e)) {
         e.preventDefault();
-        setShowKeyboardShortcuts(true);
+        setInitialSettingsTab("shortcuts");
+        setShowSettingsModal(true);
+        return;
       }
 
-      // Cmd+Plus: Open create workspace form
-      if (e.metaKey && e.key === "=" && !e.altKey) {
+      const newWorkspaceKeys = getKeys("newWorkspace");
+      if (newWorkspaceKeys && shortcutMatchesEvent(newWorkspaceKeys, e)) {
         e.preventDefault();
         openCreateWorkspaceForm();
+        return;
       }
 
-      // Escape: Close any open dialog/form
-      if (e.key === "Escape") {
-        if (showSettingsModal) setShowSettingsModal(false);
+      const closeKeys = getKeys("closeDialog");
+      if (closeKeys && shortcutMatchesEvent(closeKeys, e)) {
+        if (showSettingsModal) { setShowSettingsModal(false); setInitialSettingsTab(undefined); }
         else if (showGroupSettings) setShowGroupSettings(false);
-        else if (showKeyboardShortcuts) setShowKeyboardShortcuts(false);
         else if (showCreateForm) setShowCreateForm(false);
         else if (showRenameForm) setShowRenameForm(false);
         else if (showThemeForm) setShowThemeForm(false);
@@ -351,7 +373,7 @@ function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [showSettingsModal, showGroupSettings, showKeyboardShortcuts, showCreateForm, showRenameForm, showThemeForm]);
+  }, [showSettingsModal, showGroupSettings, showCreateForm, showRenameForm, showThemeForm, resolvedShortcuts]);
 
   function normalizeUpdateErrorMessage(rawError: string): string {
     const message = rawError.trim();
@@ -878,6 +900,10 @@ function App() {
       console.error("Failed to persist per-workspace model selection:", err);
     }
   }, [selectedModelByWorkspace]);
+
+  useEffect(() => {
+    saveCustomShortcuts(shortcutOverrides);
+  }, [shortcutOverrides]);
 
   useEffect(() => {
     try {
@@ -2660,29 +2686,33 @@ function App() {
 
   // Keyboard shortcuts that depend on workspaceGroups (visual order) and repositories
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (!e.metaKey || e.shiftKey || e.altKey) return;
+    const prevBinding = resolvedShortcuts.find((s) => s.id === "prevWorkspace");
+    const nextBinding = resolvedShortcuts.find((s) => s.id === "nextWorkspace");
+    const prevKeys = prevBinding ? activeKeys(prevBinding) : null;
+    const nextKeys = nextBinding ? activeKeys(nextBinding) : null;
 
-      // Cmd+ArrowUp/Down: Navigate workspaces in sidebar order
-      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Navigate workspaces in sidebar order
+      const goingUp = prevKeys && shortcutMatchesEvent(prevKeys, e);
+      const goingDown = nextKeys && shortcutMatchesEvent(nextKeys, e);
+      if (goingUp || goingDown) {
         e.preventDefault();
         const flat = workspaceGroups.flatMap((g) => g.items);
         if (flat.length === 0) return;
         const idx = flat.findIndex((w) => w.id === selectedWorkspace);
         if (idx === -1) {
-          // Nothing selected — jump to first workspace
           handleSelectWorkspace(flat[0].id);
-        } else if (e.key === "ArrowUp" && idx > 0) {
+        } else if (goingUp && idx > 0) {
           handleSelectWorkspace(flat[idx - 1].id);
-        } else if (e.key === "ArrowDown" && idx < flat.length - 1) {
+        } else if (!goingUp && idx < flat.length - 1) {
           handleSelectWorkspace(flat[idx + 1].id);
         }
         setTimeout(() => chatTextareaRef.current?.focus(), 0);
         return;
       }
 
-      // Cmd+1-9: Switch repository by position
-      if (/^[1-9]$/.test(e.key)) {
+      // Cmd+1-9: Switch repository by position (readonly, always hardcoded)
+      if (e.metaKey && !e.shiftKey && !e.altKey && /^[1-9]$/.test(e.key)) {
         e.preventDefault();
         const repo = repositories[parseInt(e.key, 10) - 1];
         if (repo) handleSelectRepository(repo.id);
@@ -2691,7 +2721,7 @@ function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [workspaceGroups, selectedWorkspace, repositories]);
+  }, [workspaceGroups, selectedWorkspace, repositories, resolvedShortcuts]);
 
   const currentRepo = useMemo(() => repositories.find(r => r.id === selectedRepo), [repositories, selectedRepo]);
   const currentWorkspace = useMemo(() => workspaces.find(w => w.id === selectedWorkspace), [workspaces, selectedWorkspace]);
@@ -3419,7 +3449,7 @@ function App() {
                     />
                     <div className="flex items-center justify-end px-1">
                       <button
-                        onClick={() => setShowKeyboardShortcuts(true)}
+                        onClick={() => { setInitialSettingsTab("shortcuts"); setShowSettingsModal(true); }}
                         className="text-[10px] md-text-muted hover:md-text-secondary transition-colors"
                       >
                         ⌘/ for shortcuts
@@ -4558,7 +4588,7 @@ function App() {
 
       {showSettingsModal && (
         <SettingsModal
-          onClose={() => setShowSettingsModal(false)}
+          onClose={() => { setShowSettingsModal(false); setInitialSettingsTab(undefined); }}
           selectedTheme={selectedTheme}
           onThemeChange={setSelectedTheme}
           themeOptions={themeOptions}
@@ -4570,10 +4600,17 @@ function App() {
           onSidebarFontSizeChange={setSidebarFontSize}
           chatFontSize={chatFontSize}
           onChatFontSizeChange={setChatFontSize}
+          defaultModel={defaultModel}
+          onDefaultModelChange={setDefaultModel}
           envOverridesText={envOverridesText}
           onEnvOverridesChange={setEnvOverridesText}
           bedrockEnabled={bedrockEnabled}
           onBedrockToggle={setBedrockEnabled}
+          shortcuts={resolvedShortcuts}
+          onShortcutChange={(id, newKeys) => setShortcutOverrides((prev) => ({ ...prev, [id]: newKeys }))}
+          onShortcutReset={(id) => setShortcutOverrides((prev) => { const next = { ...prev }; delete next[id]; return next; })}
+          onShortcutResetAll={() => setShortcutOverrides({})}
+          initialTab={initialSettingsTab}
         />
       )}
 
@@ -4751,60 +4788,6 @@ function App() {
                 </button>
               </div>
               <button onClick={() => setShowGroupSettings(false)} className="md-btn md-btn-tonal">
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {showKeyboardShortcuts && (
-        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
-          <div className="md-dialog mx-4 w-full max-w-md">
-            <div className="border-b md-outline p-4">
-              <h3 className="text-lg font-semibold md-text-strong">Keyboard Shortcuts</h3>
-              <p className="mt-1 text-sm md-text-muted">
-                Quick actions to boost your productivity
-              </p>
-            </div>
-
-            <div className="p-4 space-y-3">
-              <div className="flex items-center justify-between py-2 border-b md-outline">
-                <span className="md-text-secondary">Toggle left sidebar</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘[</kbd>
-              </div>
-              <div className="flex items-center justify-between py-2 border-b md-outline">
-                <span className="md-text-secondary">Toggle right sidebar</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘]</kbd>
-              </div>
-              <div className="flex items-center justify-between py-2 border-b md-outline">
-                <span className="md-text-secondary">Show shortcuts</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘/</kbd>
-              </div>
-              <div className="flex items-center justify-between py-2 border-b md-outline">
-                <span className="md-text-secondary">Close dialog</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">Esc</kbd>
-              </div>
-              <div className="flex items-center justify-between py-2 border-b md-outline">
-                <span className="md-text-secondary">Previous workspace</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘↑</kbd>
-              </div>
-              <div className="flex items-center justify-between py-2 border-b md-outline">
-                <span className="md-text-secondary">Next workspace</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘↓</kbd>
-              </div>
-              <div className="flex items-center justify-between py-2 border-b md-outline">
-                <span className="md-text-secondary">Switch to repository 1–9</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘1–9</kbd>
-              </div>
-              <div className="flex items-center justify-between py-2">
-                <span className="md-text-secondary">New workspace</span>
-                <kbd className="px-2 py-1 rounded md-surface text-xs font-mono">⌘+</kbd>
-              </div>
-            </div>
-
-            <div className="flex justify-end border-t md-outline p-4">
-              <button onClick={() => setShowKeyboardShortcuts(false)} className="md-btn md-btn-tonal">
                 Done
               </button>
             </div>

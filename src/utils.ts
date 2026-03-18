@@ -6,10 +6,13 @@ import type {
   AskUserQuestionPayload,
   QuestionItem,
   QuestionOption,
+  ShortcutBinding,
+  ShortcutKeys,
   ThemeDraft,
   Workspace,
   WorkspaceGroup,
 } from "./types";
+import { SHORTCUTS_STORAGE_KEY } from "./constants";
 import {
   COLOR_TOKEN_KEYS,
   type ThemeColorTokenKey,
@@ -387,4 +390,137 @@ export function buildBundledQuestionAnswerText(
       return `${questionIdx + 1}. ${promptText}: ${selectedValues.join(", ")}`;
     })
     .join("\n");
+}
+
+// ─── Shortcut utilities ─────────────────────────────────────────────
+
+/** Load user's custom shortcut overrides from localStorage. */
+export function loadCustomShortcuts(): Record<string, ShortcutKeys> {
+  try {
+    const raw = localStorage.getItem(SHORTCUTS_STORAGE_KEY);
+    if (raw) return JSON.parse(raw) as Record<string, ShortcutKeys>;
+  } catch {
+    // ignore corrupt data
+  }
+  return {};
+}
+
+/** Persist custom shortcut overrides to localStorage. */
+export function saveCustomShortcuts(overrides: Record<string, ShortcutKeys>): void {
+  try {
+    if (Object.keys(overrides).length > 0) {
+      localStorage.setItem(SHORTCUTS_STORAGE_KEY, JSON.stringify(overrides));
+    } else {
+      localStorage.removeItem(SHORTCUTS_STORAGE_KEY);
+    }
+  } catch {
+    // localStorage may be full or unavailable
+  }
+}
+
+/** Merge default shortcuts with user overrides, returning the resolved list. */
+export function resolveShortcuts(
+  defaults: ShortcutBinding[],
+  overrides: Record<string, ShortcutKeys>,
+): ShortcutBinding[] {
+  return defaults.map((binding) => {
+    const custom = overrides[binding.id];
+    if (custom && !binding.readonly) {
+      return { ...binding, customKeys: custom };
+    }
+    return binding;
+  });
+}
+
+/** Get the active keys (custom or default) for a shortcut binding. */
+export function activeKeys(binding: ShortcutBinding): ShortcutKeys {
+  return binding.customKeys ?? binding.defaultKeys;
+}
+
+/** Check whether a KeyboardEvent matches a ShortcutKeys definition. */
+export function shortcutMatchesEvent(keys: ShortcutKeys, e: KeyboardEvent): boolean {
+  if (keys.meta && !e.metaKey) return false;
+  if (!keys.meta && e.metaKey) return false;
+  if (keys.shift && !e.shiftKey) return false;
+  if (!keys.shift && e.shiftKey) return false;
+  if (keys.alt && !e.altKey) return false;
+  if (!keys.alt && e.altKey) return false;
+  if (keys.code) return e.code === keys.code;
+  return e.key === keys.key;
+}
+
+const KEY_DISPLAY_MAP: Record<string, string> = {
+  ArrowUp: "↑",
+  ArrowDown: "↓",
+  ArrowLeft: "←",
+  ArrowRight: "→",
+  Escape: "Esc",
+  Backspace: "⌫",
+  Delete: "⌦",
+  Enter: "↵",
+  Tab: "⇥",
+  " ": "Space",
+  BracketLeft: "[",
+  BracketRight: "]",
+  Backslash: "\\",
+  Slash: "/",
+  Semicolon: ";",
+  Quote: "'",
+  Comma: ",",
+  Period: ".",
+  Minus: "-",
+  Equal: "+",
+};
+
+/** Build a human-readable display label from a ShortcutKeys (e.g. "⌘⇧["). */
+export function formatKeyCombination(keys: ShortcutKeys): string {
+  let label = "";
+  if (keys.meta) label += "⌘";
+  if (keys.alt) label += "⌥";
+  if (keys.shift) label += "⇧";
+  const mainKey = keys.code
+    ? (KEY_DISPLAY_MAP[keys.code] ?? keys.code)
+    : (KEY_DISPLAY_MAP[keys.key] ?? keys.key.toUpperCase());
+  return label + mainKey;
+}
+
+/** Extract a ShortcutKeys from a live KeyboardEvent (for recording new bindings). Returns null if only modifiers are pressed. */
+export function recordKeysFromEvent(e: KeyboardEvent): ShortcutKeys | null {
+  // Ignore bare modifier presses
+  if (["Meta", "Control", "Alt", "Shift"].includes(e.key)) return null;
+  const keys: ShortcutKeys = {
+    key: e.key,
+    meta: e.metaKey || undefined,
+    shift: e.shiftKey || undefined,
+    alt: e.altKey || undefined,
+    displayLabel: "", // will be computed
+  };
+  // For bracket-style keys, prefer code for accurate matching
+  if (e.code && /^(Bracket|Backslash|Slash|Semicolon|Quote|Comma|Period|Minus|Equal)/.test(e.code)) {
+    keys.code = e.code;
+  }
+  keys.displayLabel = formatKeyCombination(keys);
+  return keys;
+}
+
+/** Check if a new binding conflicts with existing shortcuts. Returns the conflicting shortcut label or null. */
+export function detectShortcutConflict(
+  shortcuts: ShortcutBinding[],
+  changedId: string,
+  newKeys: ShortcutKeys,
+): string | null {
+  for (const binding of shortcuts) {
+    if (binding.id === changedId) continue;
+    const existing = activeKeys(binding);
+    if (
+      existing.key === newKeys.key &&
+      (existing.code ?? null) === (newKeys.code ?? null) &&
+      !!existing.meta === !!newKeys.meta &&
+      !!existing.shift === !!newKeys.shift &&
+      !!existing.alt === !!newKeys.alt
+    ) {
+      return binding.label;
+    }
+  }
+  return null;
 }
