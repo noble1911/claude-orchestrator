@@ -41,6 +41,12 @@ export const WORKSPACE_GROUPS_STORAGE_KEY = "claude_orchestrator_workspace_group
 export const WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY = "claude_orchestrator_workspace_group_overrides";
 export const LEFT_PANEL_OPEN_STORAGE_KEY = "claude_orchestrator_left_panel_open";
 export const RIGHT_PANEL_OPEN_STORAGE_KEY = "claude_orchestrator_right_panel_open";
+export const SIDEBAR_FONT_SIZE_STORAGE_KEY = "claude_orchestrator_sidebar_font_size";
+export const CHAT_FONT_SIZE_STORAGE_KEY = "claude_orchestrator_chat_font_size";
+export const SIDEBAR_FONT_SIZE_DEFAULT = 12;
+export const CHAT_FONT_SIZE_DEFAULT = 14;
+export const SIDEBAR_FONT_SIZE_OPTIONS = [10, 11, 12, 13, 14] as const;
+export const CHAT_FONT_SIZE_OPTIONS = [12, 13, 14, 15, 16] as const;
 
 export const DEFAULT_WORKSPACE_GROUPS: WorkspaceGroup[] = [
   { id: "in-progress", label: "In progress", statuses: ["running"] },
