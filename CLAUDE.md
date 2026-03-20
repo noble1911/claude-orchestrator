@@ -183,9 +183,10 @@ Mobile clients connect to `ws://localhost:3001` and can send:
 ## Common Tasks
 
 ### Adding a new Tauri command
-1. Add function in `lib.rs` with `#[tauri::command]` attribute
-2. Register in `invoke_handler` at end of `run()`
+1. Add function with `#[tauri::command]` in the appropriate `commands/*.rs` module (or `lib.rs` until modules are extracted)
+2. Register in `invoke_handler` at end of `run()` in `lib.rs`
 3. Call from frontend with `invoke<ReturnType>("command_name", { params })`
+4. If the command also needs WebSocket support, have the WS handler call the same function — do NOT duplicate the logic
 
 ### Adding a new TypeScript type
 1. Define in `src/types.ts` with `export`
@@ -223,13 +224,120 @@ Mobile clients connect to `ws://localhost:3001` and can send:
 - Don't define new types inline in `App.tsx` - put them in `types.ts`
 - Don't add pure utility functions to `App.tsx` - put them in `utils.ts`
 - Don't add new components inline in `App.tsx` - create files in `components/`
+- Don't duplicate logic between Tauri commands and WebSocket handlers — have WS handlers call the shared function
+- Don't add new `useEffect` pairs for localStorage — use `usePersistedState` hook (once extracted)
+- Don't add new modal dialogs inline in `App.tsx` — use `<Modal>` component in `components/dialogs/`
+- Don't hardcode magic numbers — define named constants (e.g., `MAX_FILE_READ_BYTES`, `WORKTREES_DIR`)
+- Don't add new `setError(String(err))` catch blocks — use `wrapCommand()` helper (once extracted)
 
-## Future Refactoring Opportunities
+## Refactoring Roadmap
 
-App.tsx is still ~4,500 lines. The next refactoring phases would be:
-1. **State management**: Introduce zustand or React Context to decouple state from the App component
-2. **Panel extraction**: Extract LeftSidebar, CenterPanel, RightPanel, TerminalPanel as components (requires state management first, since they share ~120 state variables)
-3. **Hook extraction**: Extract groups of related useEffect/useState into custom hooks (e.g., `useAgentMessages`, `useWorkspaceFiles`, `useTerminal`)
+### Current State
+- `src-tauri/src/lib.rs` is ~6,300 lines — all Tauri commands, Claude CLI execution, stream parsing, env management live in one file
+- `src-tauri/src/types.rs` — all shared structs/enums extracted (Phase 1 complete)
+- `src/App.tsx` is ~4,700 lines — all state (~120 useState hooks), effects, handlers, and JSX layout in one component
+- `src-tauri/src/process_manager.rs` — deleted (confirmed unused, Phase 1 complete)
+- The Claude execution loop (~700 lines) is **duplicated verbatim** between `send_message_to_agent` and `handle_ws_commands::SendMessage`
+- Multiple WS command handlers duplicate their corresponding Tauri commands (remove_workspace, remove_repository, run_checks, list_files, etc.)
+
+### Known DRY Violations
+
+**Rust (`lib.rs`)**
+- ~~`chrono::Utc::now().to_rfc3339()` — 25 occurrences~~ → resolved: `fn now_rfc3339()` (Phase 1)
+- ~~`Uuid::new_v4().to_string()` — 8 occurrences~~ → resolved: `fn new_id()` (Phase 1)
+- `response_tx.send(serde_json::to_string(&resp).unwrap())` — 66 occurrences, needs helper/macro
+- ~~`"Workspace not found"` error string — 10+ occurrences~~ → resolved: `ERR_WORKSPACE_NOT_FOUND` (Phase 1)
+- ~~`200_000` file read limit — 3 occurrences~~ → resolved: `const MAX_FILE_READ_BYTES` (Phase 1)
+- `WorkspaceCheckResult` and `CheckInfo` are identical structs — unify
+- String-to-`WorkspaceStatus` parsing duplicated — needs `impl FromStr`
+
+**TypeScript (`App.tsx`)**
+- localStorage load/persist effect pairs — 10 pairs (~160 lines), needs `usePersistedState<T>` hook
+- `setError(String(err))` catch blocks — 24 occurrences, needs `wrapCommand()` helper
+- Modal dialog scaffolding — 5 identical wrappers, needs `<Modal>` component
+- Skill card JSX duplicated verbatim — needs `<SkillCard>` component
+- `delete next[workspaceId]` record cleanup — 16 occurrences, needs `deleteFromRecord()` updater
+- `prev.map(w => w.id === updated.id ? updated : w)` — 4 occurrences, needs `replaceById()` utility
+- ~~Pure functions defined inside component~~ → resolved: moved to `utils.ts` (Phase 1)
+
+### Target Architecture — Rust Backend
+
+```
+src-tauri/src/
+├── lib.rs                  # ~300 lines: AppState, run(), invoke_handler registration
+├── types.rs                # All pub structs/enums
+├── git.rs                  # Worktree ops, branch detection
+├── claude/
+│   ├── runner.rs           # Shared Claude execution loop (eliminates duplication)
+│   ├── env.rs              # CLI env building, AWS auth, shell env
+│   ├── stream.rs           # Stream event parsing, text extraction
+│   ├── discovery.rs        # CLI path finding, capability detection
+│   └── models.rs           # Model/effort/permission normalization
+├── commands/
+│   ├── repository.rs       # add/remove/list repositories
+│   ├── workspace.rs        # CRUD, terminal, orchestrator scripts
+│   ├── agent.rs            # start/stop/interrupt/send_message
+│   ├── files.rs            # File browser, changes, diff
+│   ├── checks.rs           # Workspace health checks
+│   ├── pr.rs               # PR creation, sync, editor launch
+│   ├── skills.rs           # Skill listing, saving, path helpers
+│   └── server.rs           # Remote server, app status
+├── database.rs             # (unchanged)
+├── websocket_server.rs     # Slimmed: dispatch delegates to commands/*
+└── http_server.rs          # (unchanged)
+```
+
+### Target Architecture — TypeScript Frontend
+
+```
+src/
+├── hooks/
+│   ├── usePersistedState.ts    # Replaces localStorage effect pairs
+│   ├── useAgentEvents.ts       # Tauri event listeners
+│   ├── usePanelResize.ts       # 3-panel resize logic
+│   ├── useKeyboardShortcuts.ts # Global hotkeys
+│   └── useTauriListener.ts     # Generic Tauri listen/unlisten
+├── components/
+│   ├── Modal.tsx               # Shared modal shell
+│   ├── SkillCard.tsx           # Skill card (deduplicated)
+│   ├── FileTree.tsx            # Recursive file browser
+│   ├── ChatComposer.tsx        # Input area + toolbar
+│   ├── (existing components)
+│   └── dialogs/                # All modal dialogs extracted from App.tsx
+├── utils/
+│   ├── workspace.ts            # replaceById, deleteFromRecord, statusForGroup
+│   └── commands.ts             # wrapCommand (error-handling invoke wrapper)
+├── App.tsx                     # Slimmed to ~1,500 lines
+├── types.ts, constants.ts, themes.ts, utils.ts  # (unchanged)
+```
+
+### Phased Execution Order
+
+**Phase 1 — Zero-risk extractions (no dependency changes)**
+1. Move pure functions from `App.tsx` to `utils.ts`
+2. Add Rust helper functions (`now_rfc3339`, `new_id`, constants)
+3. Extract Rust `types.rs` module
+4. Delete `process_manager.rs` if confirmed unused
+
+**Phase 2 — Custom hooks (big line-count wins)**
+5. `usePersistedState` hook (~160 lines eliminated)
+6. `useTauriListener` wrapper
+7. `useAgentEvents` hook (splits the mega-effect)
+8. `usePanelResize` hook
+
+**Phase 3 — Component extraction**
+9. `<Modal>` component (prerequisite for dialog extraction)
+10. Extract 7 dialog components from App.tsx
+11. `<SkillCard>`, `<FileTree>` components
+
+**Phase 4 — Rust module extraction (highest impact)**
+12. Extract `claude/runner.rs` — shared execution loop
+13. Extract `commands/` modules
+14. Slim `handle_ws_commands` to delegate to `commands/*`
+
+**Phase 5 — State management (enables panel extraction)**
+15. Introduce zustand or React Context
+16. Extract LeftSidebar, CenterPanel, RightPanel as components
 
 ## Dependencies
 

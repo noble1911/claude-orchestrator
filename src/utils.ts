@@ -8,6 +8,7 @@ import type {
   QuestionOption,
   ShortcutBinding,
   ShortcutKeys,
+  SkillShortcut,
   ThemeDraft,
   Workspace,
   WorkspaceGroup,
@@ -512,9 +513,13 @@ export function detectShortcutConflict(
   for (const binding of shortcuts) {
     if (binding.id === changedId) continue;
     const existing = activeKeys(binding);
+    const existingCode = existing.code ?? null;
+    const newCode = newKeys.code ?? null;
+    const keysMatch = existingCode !== null || newCode !== null
+      ? existingCode === newCode
+      : existing.key === newKeys.key;
     if (
-      existing.key === newKeys.key &&
-      (existing.code ?? null) === (newKeys.code ?? null) &&
+      keysMatch &&
       !!existing.meta === !!newKeys.meta &&
       !!existing.shift === !!newKeys.shift &&
       !!existing.alt === !!newKeys.alt
@@ -523,4 +528,139 @@ export function detectShortcutConflict(
     }
   }
   return null;
+}
+
+// ─── Functions extracted from App.tsx ────────────────────────────────
+
+/** Map workspace status to a Tailwind background-color class. */
+export function getStatusColor(status: string): string {
+  switch (status) {
+    case "initializing": return "bg-sky-400 animate-pulse";
+    case "running": return "bg-emerald-400";
+    case "inReview": return "bg-amber-400";
+    case "merged": return "bg-violet-400";
+    case "idle": return "bg-zinc-500";
+    default: return "bg-zinc-500";
+  }
+}
+
+/** Normalize a raw Tauri update error into a user-friendly string. */
+export function normalizeUpdateErrorMessage(rawError: string): string {
+  const message = rawError.trim();
+  const lowered = message.toLowerCase();
+  if (
+    lowered.includes("could not fetch a valid release json from the remote") ||
+    lowered.includes("404")
+  ) {
+    return "Update feed is unavailable for this release.";
+  }
+  return message;
+}
+
+/** Returns true when the message should increment the unread badge. */
+export function isUnreadCandidateMessage(message: AgentMessage): boolean {
+  const role = message.role ?? "";
+  if (role === "user" || message.agentId === "user") return false;
+  if (role === "assistant" || role === "question" || role === "error" || role === "credential_error") {
+    return true;
+  }
+  return message.isError;
+}
+
+/** Extract the first GitHub/GitLab pull-request URL from arbitrary text. */
+export function extractPullRequestUrl(content: string): string | null {
+  const match = content.match(/https?:\/\/[^\s)]+\/pull\/\d+/i);
+  return match ? match[0] : null;
+}
+
+/** Normalize a prompt shortcut name for case-insensitive matching. */
+export function normalizePromptName(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** Normalize a skill command/path for matching (lowercased, forward slashes). */
+export function normalizeSkillCommand(value: string): string {
+  return value.trim().toLowerCase().replace(/\\/g, "/");
+}
+
+/** Convert a skill name into a filesystem-safe directory name. */
+export function sanitizeSkillDirName(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s_-]/g, "")
+    .replace(/[\s_]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+/** Build the prompt text sent to Claude when executing a skill. */
+export function formatSkillExecutionPrompt(skill: SkillShortcut, userInput?: string): string {
+  const trimmedInput = userInput?.trim();
+  const blocks: string[] = [
+    `Execute the following ${skill.scope} skill in this workspace.`,
+    `<skill name="${skill.name}" scope="${skill.scope}" command="/${skill.commandName}" path="${skill.relativePath}">\n${skill.content}\n</skill>`,
+  ];
+  if (trimmedInput) {
+    blocks.push(`User request:\n${trimmedInput}`);
+  }
+  return blocks.join("\n\n");
+}
+
+/** Parse a multi-line KEY=VALUE env overrides string into a record. */
+export function parseEnvOverrides(raw: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const line of raw.split("\n")) {
+    let trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+
+    if (trimmed.startsWith("export ")) {
+      trimmed = trimmed.slice("export ".length).trim();
+    }
+
+    if (trimmed.startsWith("set ")) {
+      trimmed = trimmed.slice("set ".length).trim();
+    }
+
+    const idx = trimmed.indexOf("=");
+    if (idx <= 0) continue;
+    const key = trimmed.slice(0, idx).trim();
+    let value = trimmed.slice(idx + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (!key) continue;
+    map[key] = value;
+  }
+  return map;
+}
+
+/** Normalize a git change status string (e.g. " M" → "M"). */
+export function normalizeChangeStatus(status: string): string {
+  return status.trim() || status;
+}
+
+/** Map a git change status to a Tailwind text-color class. */
+export function getChangeStatusClass(status: string): string {
+  const normalized = normalizeChangeStatus(status);
+  if (normalized === "??" || normalized.includes("A")) return "text-emerald-300";
+  if (normalized.includes("D")) return "text-rose-300";
+  if (normalized.includes("R")) return "text-amber-300";
+  if (normalized.includes("M")) return "text-sky-300";
+  return "md-text-muted";
+}
+
+/** Map a unified diff line to a Tailwind text-color class. */
+export function getDiffLineClass(line: string): string {
+  if (line.startsWith("+++ ") || line.startsWith("--- ")) return "text-indigo-300";
+  if (line.startsWith("+")) return "text-emerald-300";
+  if (line.startsWith("-")) return "text-rose-300";
+  if (line.startsWith("@@")) return "text-amber-300";
+  if (line.startsWith("diff --git") || line.startsWith("index ") || line.startsWith("new file mode") || line.startsWith("deleted file mode")) {
+    return "md-text-muted";
+  }
+  return "md-text-primary";
 }
