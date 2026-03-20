@@ -16,11 +16,12 @@ use uuid::Uuid;
 
 mod database;
 mod http_server;
-mod process_manager;
+pub mod types;
 mod websocket_server;
 
 use database::Database;
 use http_server::HttpServer;
+pub use types::*;
 use websocket_server::{
     ChangeInfo, CheckInfo, FileEntryInfo, MessageInfo, RepositoryInfo, ServerCommand, WebSocketServer,
     WorkspaceInfo, WsResponse,
@@ -30,213 +31,20 @@ static CLAUDE_HELP_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::n
 const REMOTE_SERVER_PORT: u16 = 3001;
 const HTTP_SERVER_PORT: u16 = 3002;
 
-// Types
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Repository {
-    pub id: String,
-    pub path: String,
-    pub name: String,
-    pub default_branch: String,
-    pub added_at: String,
+/// Maximum number of bytes to read from a workspace file.
+const MAX_FILE_READ_BYTES: usize = 200_000;
+
+/// Error message returned when a workspace ID is not found in state.
+const ERR_WORKSPACE_NOT_FOUND: &str = "Workspace not found";
+
+/// Generate a new RFC 3339 timestamp string for the current instant.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
-/// Configuration file for repository-specific scripts (orchestrator.json)
-/// Inspired by Conductor's script system
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct OrchestratorConfig {
-    /// Script to run when setting up a new workspace
-    #[serde(default)]
-    pub setup_script: Option<String>,
-    /// Script to run for the "Run" command
-    #[serde(default)]
-    pub run_script: Option<String>,
-    /// How to handle concurrent run scripts: "concurrent" or "sequential"
-    #[serde(default = "default_run_mode")]
-    pub run_mode: String,
-    /// Script to run before archiving a workspace
-    #[serde(default)]
-    pub archive_script: Option<String>,
-    /// Custom check commands (like lint, test, build)
-    #[serde(default)]
-    pub checks: Vec<OrchestratorCheck>,
-}
-
-fn default_run_mode() -> String {
-    "concurrent".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OrchestratorCheck {
-    pub name: String,
-    pub command: String,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Workspace {
-    pub id: String,
-    pub repo_id: String,
-    pub name: String,
-    pub branch: String,
-    pub worktree_path: String,
-    pub status: WorkspaceStatus,
-    pub last_activity: Option<String>,
-    pub pr_url: Option<String>,
-    pub unread: i32,
-    pub display_order: i32,
-    pub pinned_at: Option<String>,
-    pub notes: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WorkspaceStatus {
-    Idle,
-    Running,
-    #[serde(rename = "inReview")]
-    InReview,
-    Merged,
-    Initializing,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Agent {
-    pub id: String,
-    pub workspace_id: String,
-    pub status: AgentStatus,
-    pub session_id: Option<String>,
-    pub claude_session_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentStatus {
-    Starting,
-    Running,
-    Stopped,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServerStatus {
-    pub running: bool,
-    pub port: u16,
-    pub connected_clients: usize,
-    pub connect_url: String,
-    pub web_url: String,
-    pub pairing_code: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AppStatus {
-    pub repositories: Vec<Repository>,
-    pub server_status: ServerStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateInfo {
-    pub current_version: String,
-    pub version: String,
-    pub body: Option<String>,
-    pub date: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentMessage {
-    pub agent_id: String,
-    pub workspace_id: Option<String>,
-    pub role: String,
-    pub content: String,
-    pub is_error: bool,
-    pub timestamp: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentRunStateEvent {
-    pub workspace_id: String,
-    pub agent_id: String,
-    pub running: bool,
-    pub timestamp: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceFileEntry {
-    pub name: String,
-    pub path: String,
-    pub is_dir: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceChangeEntry {
-    pub status: String,
-    pub path: String,
-    pub old_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceCheckResult {
-    pub name: String,
-    pub command: String,
-    pub success: bool,
-    pub exit_code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-    pub duration_ms: u128,
-    pub skipped: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceCheckDefinition {
-    pub name: String,
-    pub command: String,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillEntry {
-    pub id: String,
-    pub scope: String,
-    pub name: String,
-    pub command_name: String,
-    pub relative_path: String,
-    pub file_path: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillListResponse {
-    pub project_root: Option<String>,
-    pub user_root: Option<String>,
-    pub project_skills: Vec<SkillEntry>,
-    pub user_skills: Vec<SkillEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalCommandResult {
-    pub command: String,
-    pub cwd: String,
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: Option<i32>,
-    pub duration_ms: u128,
+/// Generate a new random UUID string.
+fn new_id() -> String {
+    Uuid::new_v4().to_string()
 }
 
 // Application State
@@ -720,11 +528,11 @@ async fn add_repository(
     let default_branch = get_default_branch(&path)?;
     
     let repo = Repository {
-        id: Uuid::new_v4().to_string(),
+        id: new_id(),
         path,
         name,
         default_branch,
-        added_at: chrono::Utc::now().to_rfc3339(),
+        added_at: now_rfc3339(),
     };
     
     // Save to database
@@ -841,7 +649,7 @@ async fn get_workspace_config(
     let workspace = {
         let workspaces = state.workspaces.read();
         workspaces.get(&workspace_id).cloned()
-            .ok_or("Workspace not found")?
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?
     };
     // First check workspace path, then fall back to repo path
     let config = read_orchestrator_config(&workspace.worktree_path);
@@ -867,7 +675,7 @@ async fn run_orchestrator_script(
     let workspace = {
         let workspaces = state.workspaces.read();
         workspaces.get(&workspace_id).cloned()
-            .ok_or("Workspace not found")?
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?
     };
 
     let config = read_orchestrator_config(&workspace.worktree_path);
@@ -906,7 +714,7 @@ async fn create_workspace(
     create_worktree(&repo.path, &worktree_path_str, &branch, &repo.default_branch)?;
 
     let workspace = Workspace {
-        id: Uuid::new_v4().to_string(),
+        id: new_id(),
         repo_id,
         name,
         branch,
@@ -938,7 +746,7 @@ async fn remove_workspace(
     let (repo_path, worktree_path) = {
         let workspaces = state.workspaces.read();
         let workspace = workspaces.get(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         
         let repos = state.repositories.read();
         let repo = repos.get(&workspace.repo_id)
@@ -977,7 +785,7 @@ async fn rename_workspace(
         let mut workspaces = state.workspaces.write();
         let workspace = workspaces
             .get_mut(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.name = trimmed.to_string();
         workspace.clone()
     };
@@ -998,7 +806,7 @@ async fn update_workspace_unread(
 ) -> Result<(), String> {
     {
         let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.unread = unread;
     }
     state.db.update_workspace_unread(&workspace_id, unread)
@@ -1014,7 +822,7 @@ async fn update_workspace_display_order(
 ) -> Result<(), String> {
     {
         let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.display_order = display_order;
     }
     state.db.update_workspace_display_order(&workspace_id, display_order)
@@ -1029,11 +837,11 @@ async fn toggle_workspace_pinned(
 ) -> Result<Workspace, String> {
     let updated = {
         let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         if workspace.pinned_at.is_some() {
             workspace.pinned_at = None;
         } else {
-            workspace.pinned_at = Some(chrono::Utc::now().to_rfc3339());
+            workspace.pinned_at = Some(now_rfc3339());
         }
         workspace.clone()
     };
@@ -1051,7 +859,7 @@ async fn update_workspace_notes(
     let notes_opt = if notes.trim().is_empty() { None } else { Some(notes.as_str()) };
     {
         let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.notes = notes_opt.map(String::from);
     }
     state.db.update_workspace_notes(&workspace_id, notes_opt)
@@ -1074,12 +882,12 @@ async fn set_workspace_status(
     };
     let updated = {
         let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or("Workspace not found")?;
+        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.status = new_status;
-        workspace.last_activity = Some(chrono::Utc::now().to_rfc3339());
+        workspace.last_activity = Some(now_rfc3339());
         workspace.clone()
     };
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = now_rfc3339();
     state.db.update_workspace_status(&workspace_id, &updated.status, Some(&now))
         .map_err(|e| format!("Failed to update status: {}", e))?;
     Ok(updated)
@@ -1102,7 +910,7 @@ async fn run_workspace_terminal_command(
         workspaces
             .get(&workspace_id)
             .cloned()
-            .ok_or("Workspace not found")?
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?
     };
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
@@ -1144,11 +952,11 @@ async fn start_agent(
     let workspace = {
         let workspaces = state.workspaces.read();
         workspaces.get(&workspace_id).cloned()
-            .ok_or("Workspace not found")?
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?
     };
     
-    let agent_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
+    let agent_id = new_id();
+    let session_id = new_id();
     
     // Try to resume the most recent Claude session for this workspace so that
     // conversations survive app restarts.  Falls back to a fresh session if
@@ -1159,7 +967,7 @@ async fn start_agent(
         .unwrap_or(None);
     
     // Create session in database
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = now_rfc3339();
     state.db.insert_session(&session_id, &workspace_id, claude_session_id.as_deref(), &now)
         .map_err(|e| format!("Failed to create session: {}", e))?;
     
@@ -1183,7 +991,7 @@ async fn start_agent(
         if let Some(workspace) = workspaces.get_mut(&workspace_id) {
             let next = status_for_agent_start(&workspace.status);
             workspace.status = next.clone();
-            workspace.last_activity = Some(chrono::Utc::now().to_rfc3339());
+            workspace.last_activity = Some(now_rfc3339());
             Some(next)
         } else {
             None
@@ -1192,7 +1000,7 @@ async fn start_agent(
     
     // Update database
     if let Some(status) = next_status {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         let _ = state
             .db
             .update_workspace_status(&workspace_id, &status, Some(&now));
@@ -1916,7 +1724,7 @@ fn emit_agent_message_with_options(
 ) {
     let timestamp = timestamp
         .map(|value| value.to_string())
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        .unwrap_or_else(|| now_rfc3339());
     let msg = AgentMessage {
         agent_id: agent_id.to_string(),
         workspace_id: Some(workspace_id.to_string()),
@@ -1973,7 +1781,7 @@ fn emit_agent_run_state(
     agent_id: &str,
     running: bool,
 ) {
-    let timestamp = chrono::Utc::now().to_rfc3339();
+    let timestamp = now_rfc3339();
     let event = AgentRunStateEvent {
         workspace_id: workspace_id.to_string(),
         agent_id: agent_id.to_string(),
@@ -2458,7 +2266,7 @@ fn run_claude_cli(
                 role: "system".to_string(),
                 content: "Error: Claude CLI not found. Please install claude.".to_string(),
                 is_error: true,
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: now_rfc3339(),
             };
             let _ = db.insert_message(&session_id, &agent_id, "system", &msg.content, true, &msg.timestamp);
             let _ = app.emit("agent-message", msg.clone());
@@ -2484,7 +2292,7 @@ fn run_claude_cli(
         role: "system".to_string(),
         content: format!("Launching Claude in workspace: {}", workspace_name),
         is_error: false,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: now_rfc3339(),
     };
     let _ = db.insert_message(&session_id, &agent_id, "system", &init_msg.content, false, &init_msg.timestamp);
     let _ = app.emit("agent-message", init_msg.clone());
@@ -2508,7 +2316,7 @@ fn run_claude_cli(
         role: "system".to_string(),
         content: format!("Claude is ready in workspace: {}", workspace_name),
         is_error: false,
-        timestamp: chrono::Utc::now().to_rfc3339(),
+        timestamp: now_rfc3339(),
     };
     let _ = db.insert_message(&session_id, &agent_id, "system", &ready_msg.content, false, &ready_msg.timestamp);
     let _ = app.emit("agent-message", ready_msg.clone());
@@ -2542,7 +2350,7 @@ async fn stop_agent(
     
     // End session in database
     if let Some(sid) = session_id {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         let _ = state.db.end_session(&sid, &now);
     }
     
@@ -2620,14 +2428,14 @@ async fn send_message_to_agent(
         let agent = agents.get(&agent_id).ok_or("Agent not found")?;
         
         let workspaces = app_state.workspaces.read();
-        let workspace = workspaces.get(&agent.workspace_id).ok_or("Workspace not found")?;
+        let workspace = workspaces.get(&agent.workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         (agent.workspace_id.clone(), workspace.worktree_path.clone(), agent.session_id.clone(), agent.claude_session_id.clone())
     };
     
     let session_id = session_id.ok_or("No active session")?;
     
     // Save user message to database
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = now_rfc3339();
     let _ = app_state
         .db
         .insert_message(&session_id, &agent_id, "user", &message, false, &now);
@@ -2668,7 +2476,7 @@ async fn send_message_to_agent(
                     role: "system".to_string(),
                     content: "Error: Claude CLI not found".to_string(),
                     is_error: true,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    timestamp: now_rfc3339(),
                 };
                 let _ = app.emit("agent-message", msg.clone());
                 
@@ -2954,7 +2762,7 @@ async fn send_message_to_agent(
                             && last_plan.as_deref() != Some(normalized_stream.as_str())
                         {
                             if assistant_stream_timestamp.is_none() {
-                                assistant_stream_timestamp = Some(chrono::Utc::now().to_rfc3339());
+                                assistant_stream_timestamp = Some(now_rfc3339());
                             }
                             emit_agent_message_with_options(
                                 &app,
@@ -3418,7 +3226,7 @@ async fn open_workspace_in_editor(
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.worktree_path.clone()
     };
 
@@ -3452,7 +3260,7 @@ async fn create_pull_request(
     let (repo_path, worktree_path, branch) = {
         let workspaces = state.workspaces.read();
         let workspace = workspaces.get(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         
         let repos = state.repositories.read();
         let repo = repos.get(&workspace.repo_id)
@@ -3586,7 +3394,7 @@ async fn mark_workspace_in_review(
         let mut workspaces = state.workspaces.write();
         let workspace = workspaces
             .get_mut(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         if !matches!(workspace.status, WorkspaceStatus::Merged) {
             workspace.status = WorkspaceStatus::InReview;
         }
@@ -3979,7 +3787,7 @@ async fn list_workspace_files(
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.worktree_path.clone()
     };
 
@@ -4047,7 +3855,7 @@ async fn read_workspace_file(
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.worktree_path.clone()
     };
 
@@ -4067,7 +3875,7 @@ async fn read_workspace_file(
         return Err("Path is not a file".to_string());
     }
 
-    let limit = max_bytes.unwrap_or(200_000);
+    let limit = max_bytes.unwrap_or(MAX_FILE_READ_BYTES);
     let bytes = std::fs::read(&canonical_target)
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
@@ -4093,7 +3901,7 @@ async fn list_workspace_changes(
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.worktree_path.clone()
     };
 
@@ -4148,7 +3956,7 @@ async fn read_workspace_change_diff(
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.worktree_path.clone()
     };
 
@@ -4157,7 +3965,7 @@ async fn read_workspace_change_diff(
         let full_path = PathBuf::from(&workspace_root).join(&path);
         let bytes = std::fs::read(&full_path)
             .map_err(|e| format!("Failed to read untracked file for diff: {}", e))?;
-        let limit = 200_000usize;
+        let limit = MAX_FILE_READ_BYTES;
         let (slice, truncated) = if bytes.len() > limit {
             (&bytes[..limit], true)
         } else {
@@ -4275,7 +4083,7 @@ async fn list_workspace_checks(
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.worktree_path.clone()
     };
 
@@ -4291,7 +4099,7 @@ async fn run_workspace_checks(
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
-            .ok_or("Workspace not found")?;
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
         workspace.worktree_path.clone()
     };
 
@@ -4429,11 +4237,11 @@ async fn handle_ws_commands(
                 };
 
                 let repository = Repository {
-                    id: Uuid::new_v4().to_string(),
+                    id: new_id(),
                     path,
                     name,
                     default_branch,
-                    added_at: chrono::Utc::now().to_rfc3339(),
+                    added_at: now_rfc3339(),
                 };
 
                 if let Err(err) = state.db.insert_repository(&repository) {
@@ -4570,7 +4378,7 @@ async fn handle_ws_commands(
                 }
 
                 let workspace = Workspace {
-                    id: Uuid::new_v4().to_string(),
+                    id: new_id(),
                     repo_id: repo_id.clone(),
                     name: trimmed.to_string(),
                     branch,
@@ -4623,7 +4431,7 @@ async fn handle_ws_commands(
                         }
                         None => {
                             let response = WsResponse::Error {
-                                message: "Workspace not found".to_string(),
+                                message: ERR_WORKSPACE_NOT_FOUND.to_string(),
                             };
                             let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                             continue;
@@ -4658,7 +4466,7 @@ async fn handle_ws_commands(
                         Some(workspace) => workspace,
                         None => {
                             let response = WsResponse::Error {
-                                message: "Workspace not found".to_string(),
+                                message: ERR_WORKSPACE_NOT_FOUND.to_string(),
                             };
                             let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                             continue;
@@ -4756,7 +4564,7 @@ async fn handle_ws_commands(
                     match workspaces.get(&workspace_id) {
                         Some(ws) => ws.worktree_path.clone(),
                         None => {
-                            let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                            let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
                             let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                             continue;
                         }
@@ -4830,7 +4638,7 @@ async fn handle_ws_commands(
                     match workspaces.get(&workspace_id) {
                         Some(ws) => ws.worktree_path.clone(),
                         None => {
-                            let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                            let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
                             let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                             continue;
                         }
@@ -4858,7 +4666,7 @@ async fn handle_ws_commands(
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                     continue;
                 }
-                let limit = max_bytes.unwrap_or(200_000);
+                let limit = max_bytes.unwrap_or(MAX_FILE_READ_BYTES);
                 let bytes = match std::fs::read(&canonical_target) {
                     Ok(b) => b,
                     Err(e) => {
@@ -4886,7 +4694,7 @@ async fn handle_ws_commands(
                     match workspaces.get(&workspace_id) {
                         Some(ws) => ws.worktree_path.clone(),
                         None => {
-                            let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                            let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
                             let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                             continue;
                         }
@@ -4934,7 +4742,7 @@ async fn handle_ws_commands(
                     match workspaces.get(&workspace_id) {
                         Some(ws) => ws.worktree_path.clone(),
                         None => {
-                            let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                            let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
                             let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                             continue;
                         }
@@ -5038,7 +4846,7 @@ async fn handle_ws_commands(
                     };
                     
                     if let Some(session_id) = session_id {
-                        let now = chrono::Utc::now().to_rfc3339();
+                        let now = now_rfc3339();
                         let _ = state.db.insert_message(&session_id, &agent_id, "user", &message, false, &now);
                         
                         let ws_server = state.ws_server.clone();
@@ -5332,7 +5140,7 @@ async fn handle_ws_commands(
                                                 {
                                                     if assistant_stream_timestamp.is_none() {
                                                         assistant_stream_timestamp =
-                                                            Some(chrono::Utc::now().to_rfc3339());
+                                                            Some(now_rfc3339());
                                                     }
                                                     emit_agent_message_with_options(
                                                         &app_clone,
@@ -5767,7 +5575,7 @@ async fn handle_ws_commands(
                         Some(ws) => ws.clone(),
                         None => {
                             let response = WsResponse::Error {
-                                message: "Workspace not found".to_string(),
+                                message: ERR_WORKSPACE_NOT_FOUND.to_string(),
                             };
                             let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                             continue;
@@ -5775,10 +5583,10 @@ async fn handle_ws_commands(
                     }
                 };
 
-                let agent_id = Uuid::new_v4().to_string();
-                let session_id = Uuid::new_v4().to_string();
+                let agent_id = new_id();
+                let session_id = new_id();
                 let claude_session_id: Option<String> = None;
-                let now = chrono::Utc::now().to_rfc3339();
+                let now = now_rfc3339();
 
                 if let Err(e) = state.db.insert_session(
                     &session_id,
@@ -5811,7 +5619,7 @@ async fn handle_ws_commands(
                     if let Some(workspace) = workspaces.get_mut(&workspace_id) {
                         let next = status_for_agent_start(&workspace.status);
                         workspace.status = next.clone();
-                        workspace.last_activity = Some(chrono::Utc::now().to_rfc3339());
+                        workspace.last_activity = Some(now_rfc3339());
                         Some(next)
                     } else {
                         None
@@ -5875,7 +5683,7 @@ async fn handle_ws_commands(
                     };
 
                     if let Some(sid) = session_id {
-                        let now = chrono::Utc::now().to_rfc3339();
+                        let now = now_rfc3339();
                         let _ = state.db.end_session(&sid, &now);
                     }
 
@@ -5942,7 +5750,7 @@ async fn handle_ws_commands(
                     let mut workspaces = state.workspaces.write();
                     if let Some(workspace) = workspaces.get_mut(&workspace_id) {
                         workspace.status = new_status.clone();
-                        workspace.last_activity = Some(chrono::Utc::now().to_rfc3339());
+                        workspace.last_activity = Some(now_rfc3339());
                         let has_agent = state.agents.read().values().any(|a| a.workspace_id == workspace_id);
                         Some(to_workspace_info(workspace, has_agent))
                     } else {
@@ -5950,7 +5758,7 @@ async fn handle_ws_commands(
                     }
                 };
                 if let Some(info) = workspace_info {
-                    let now = chrono::Utc::now().to_rfc3339();
+                    let now = now_rfc3339();
                     let _ = state.db.update_workspace_status(&workspace_id, &new_status, Some(&now));
                     let response = WsResponse::WorkspaceUpdated { workspace: info.clone() };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
@@ -5959,7 +5767,7 @@ async fn handle_ws_commands(
                         ws_server.broadcast_all(&WsResponse::WorkspaceUpdated { workspace: info });
                     }
                 } else {
-                    let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                    let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 }
             }
@@ -5971,7 +5779,7 @@ async fn handle_ws_commands(
                         if workspace.pinned_at.is_some() {
                             workspace.pinned_at = None;
                         } else {
-                            workspace.pinned_at = Some(chrono::Utc::now().to_rfc3339());
+                            workspace.pinned_at = Some(now_rfc3339());
                         }
                         let has_agent = state.agents.read().values().any(|a| a.workspace_id == workspace_id);
                         Some(to_workspace_info(workspace, has_agent))
@@ -5984,7 +5792,7 @@ async fn handle_ws_commands(
                     let response = WsResponse::WorkspaceUpdated { workspace: info };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 } else {
-                    let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                    let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 }
             }
@@ -6049,7 +5857,7 @@ async fn handle_ws_commands(
                     let response = WsResponse::ChangeDiff { workspace_id, file_path, diff };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 } else {
-                    let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                    let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 }
             }
@@ -6081,7 +5889,7 @@ async fn handle_ws_commands(
                         }
                     }
                 } else {
-                    let response = WsResponse::Error { message: "Workspace not found".to_string() };
+                    let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 }
             }

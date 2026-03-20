@@ -84,6 +84,18 @@ import {
   resolveShortcuts,
   activeKeys,
   shortcutMatchesEvent,
+  getStatusColor,
+  normalizeUpdateErrorMessage,
+  isUnreadCandidateMessage,
+  extractPullRequestUrl,
+  normalizePromptName,
+  normalizeSkillCommand,
+  sanitizeSkillDirName,
+  formatSkillExecutionPrompt,
+  parseEnvOverrides,
+  normalizeChangeStatus,
+  getChangeStatusClass,
+  getDiffLineClass,
 } from "./utils";
 import type {
   Repository,
@@ -123,17 +135,6 @@ import GroupDropZone from "./components/GroupDropZone";
 import ThinkingTimer from "./components/ThinkingTimer";
 import SortableGroupItem from "./components/SortableGroupItem";
 import SettingsModal, { type SettingsTab } from "./components/SettingsModal";
-
-const getStatusColor = (status: string) => {
-  switch (status) {
-    case "initializing": return "bg-sky-400 animate-pulse";
-    case "running": return "bg-emerald-400";
-    case "inReview": return "bg-amber-400";
-    case "merged": return "bg-violet-400";
-    case "idle": return "bg-zinc-500";
-    default: return "bg-zinc-500";
-  }
-};
 
 function App() {
   const [repositories, setRepositories] = useState<Repository[]>([]);
@@ -368,38 +369,13 @@ function App() {
         else if (showCreateForm) setShowCreateForm(false);
         else if (showRenameForm) setShowRenameForm(false);
         else if (showThemeForm) setShowThemeForm(false);
+        return;
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [showSettingsModal, showGroupSettings, showCreateForm, showRenameForm, showThemeForm, resolvedShortcuts]);
-
-  function normalizeUpdateErrorMessage(rawError: string): string {
-    const message = rawError.trim();
-    const lowered = message.toLowerCase();
-    if (
-      lowered.includes("could not fetch a valid release json from the remote") ||
-      lowered.includes("404")
-    ) {
-      return "Update feed is unavailable for this release.";
-    }
-    return message;
-  }
-
-  function isUnreadCandidateMessage(message: AgentMessage): boolean {
-    const role = message.role ?? "";
-    if (role === "user" || message.agentId === "user") return false;
-    if (role === "assistant" || role === "question" || role === "error" || role === "credential_error") {
-      return true;
-    }
-    return message.isError;
-  }
-
-  function extractPullRequestUrl(content: string): string | null {
-    const match = content.match(/https?:\/\/[^\s)]+\/pull\/\d+/i);
-    return match ? match[0] : null;
-  }
 
   useEffect(() => {
     loadInitialState();
@@ -1644,36 +1620,6 @@ function App() {
     }
   }
 
-  function normalizePromptName(value: string) {
-    return value.trim().toLowerCase().replace(/\s+/g, " ");
-  }
-
-  function normalizeSkillCommand(value: string) {
-    return value.trim().toLowerCase().replace(/\\/g, "/");
-  }
-
-  function sanitizeSkillDirName(value: string) {
-    return value
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9\s_-]/g, "")
-      .replace(/[\s_]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-  }
-
-  function formatSkillExecutionPrompt(skill: SkillShortcut, userInput?: string) {
-    const trimmedInput = userInput?.trim();
-    const blocks: string[] = [
-      `Execute the following ${skill.scope} skill in this workspace.`,
-      `<skill name="${skill.name}" scope="${skill.scope}" command="/${skill.commandName}" path="${skill.relativePath}">\n${skill.content}\n</skill>`,
-    ];
-    if (trimmedInput) {
-      blocks.push(`User request:\n${trimmedInput}`);
-    }
-    return blocks.join("\n\n");
-  }
-
   function resolveSkillSlashCommand(rawCommand: string): { skill: SkillShortcut; args: string } | null {
     const trimmed = rawCommand.trim();
     if (!trimmed) return null;
@@ -1865,36 +1811,6 @@ function App() {
       return next;
     });
     setSelectedTheme(DEFAULT_THEME_ID);
-  }
-
-  function parseEnvOverrides(raw: string): Record<string, string> {
-    const map: Record<string, string> = {};
-    for (const line of raw.split("\n")) {
-      let trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-
-      if (trimmed.startsWith("export ")) {
-        trimmed = trimmed.slice("export ".length).trim();
-      }
-
-      if (trimmed.startsWith("set ")) {
-        trimmed = trimmed.slice("set ".length).trim();
-      }
-
-      const idx = trimmed.indexOf("=");
-      if (idx <= 0) continue;
-      const key = trimmed.slice(0, idx).trim();
-      let value = trimmed.slice(idx + 1).trim();
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
-      }
-      if (!key) continue;
-      map[key] = value;
-    }
-    return map;
   }
 
   function setWorkspaceInputDraft(value: string) {
@@ -2508,19 +2424,6 @@ function App() {
     }
   }
 
-  function normalizeChangeStatus(status: string): string {
-    return status.trim() || status;
-  }
-
-  function getChangeStatusClass(status: string): string {
-    const normalized = normalizeChangeStatus(status);
-    if (normalized === "??" || normalized.includes("A")) return "text-emerald-300";
-    if (normalized.includes("D")) return "text-rose-300";
-    if (normalized.includes("R")) return "text-amber-300";
-    if (normalized.includes("M")) return "text-sky-300";
-    return "md-text-muted";
-  }
-
   async function openChangedFile(change: WorkspaceChangeEntry) {
     if (!selectedWorkspace) return;
 
@@ -2579,17 +2482,6 @@ function App() {
       return;
     }
     await openCurrentWorkspaceInEditor(target);
-  }
-
-  function getDiffLineClass(line: string): string {
-    if (line.startsWith("+++ ") || line.startsWith("--- ")) return "text-indigo-300";
-    if (line.startsWith("+")) return "text-emerald-300";
-    if (line.startsWith("-")) return "text-rose-300";
-    if (line.startsWith("@@")) return "text-amber-300";
-    if (line.startsWith("diff --git") || line.startsWith("index ") || line.startsWith("new file mode") || line.startsWith("deleted file mode")) {
-      return "md-text-muted";
-    }
-    return "md-text-primary";
   }
 
   function renderFileTree(path: string, depth: number) {

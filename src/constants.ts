@@ -75,6 +75,7 @@ export const DEFAULT_SHORTCUTS: ShortcutBinding[] = [
     id: "closeDialog",
     label: "Close dialog",
     defaultKeys: { key: "Escape", displayLabel: "Esc" },
+    readonly: true,
   },
   {
     id: "prevWorkspace",
