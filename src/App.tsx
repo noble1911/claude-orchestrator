@@ -3861,9 +3861,16 @@ function App() {
                             }`}
                           >
                             <span className="material-symbols-rounded !text-base md-text-dim">description</span>
-                            <span className="truncate">{change.path}</span>
-                            <span className={`ml-auto w-8 flex-none text-right font-mono text-[11px] ${getChangeStatusClass(change.status)}`}>
-                              {normalizeChangeStatus(change.status)}
+                            <span className="min-w-0 flex-1">
+                              <span className="flex items-center gap-1">
+                                <span className="truncate font-medium md-text-strong">{change.path.split("/").pop()}</span>
+                                <span className={`w-8 flex-none text-right font-mono text-[11px] ${getChangeStatusClass(change.status)}`}>
+                                  {normalizeChangeStatus(change.status)}
+                                </span>
+                              </span>
+                              {change.path.includes("/") && (
+                                <span className="block truncate text-[11px] md-text-muted">{change.path.substring(0, change.path.lastIndexOf("/"))}</span>
+                              )}
                             </span>
                           </button>
                           {change.oldPath && (
