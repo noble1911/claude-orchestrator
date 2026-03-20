@@ -1915,41 +1915,36 @@ function App() {
       return false;
     }
 
-    const attachedRelativePaths: string[] = [];
     if (attachedFiles.length > 0) {
       try {
-        const attachmentSections: string[] = [];
-        for (const absolutePath of attachedFiles) {
-          const relativePath = toWorkspaceRelativePath(absolutePath, workspace.worktreePath);
-          if (relativePath === null || !relativePath.trim()) {
-            continue;
-          }
+        const results = await Promise.all(
+          attachedFiles.map(async (absolutePath) => {
+            const content = await invoke<string>("read_file_by_path", {
+              filePath: absolutePath,
+              maxBytes: 200000,
+            });
+            const relativePath = toWorkspaceRelativePath(absolutePath, workspace.worktreePath);
+            const displayPath = relativePath ?? absolutePath;
+            return { displayPath, content };
+          })
+        );
 
-          const content = await invoke<string>("read_workspace_file", {
-            workspaceId: workspace.id,
-            relativePath,
-            maxBytes: 200000,
-          });
-
-          attachedRelativePaths.push(relativePath);
-          attachmentSections.push(
-            `<attached_file path="${relativePath}">\n${content}\n</attached_file>`,
-          );
-        }
+        const attachmentSections = results.map(
+          ({ displayPath, content }) =>
+            `<attached_file path="${displayPath}">\n${content}\n</attached_file>`,
+        );
 
         if (attachmentSections.length > 0) {
           messageToSend = `${messageToSend}\n\nUse these attached files as context:\n\n${attachmentSections.join("\n\n")}`;
         }
+
+        const fileSummary = `[Files: ${results.map((r) => r.displayPath).join(", ")}]`;
+        visibleMessage = visibleMessage ? `${visibleMessage}\n${fileSummary}` : fileSummary;
       } catch (err) {
         console.error("Failed to prepare attached files:", err);
         setError(String(err));
         return false;
       }
-    }
-
-    if (attachedRelativePaths.length > 0) {
-      const fileSummary = `[Files: ${attachedRelativePaths.join(", ")}]`;
-      visibleMessage = visibleMessage ? `${visibleMessage}\n${fileSummary}` : fileSummary;
     }
     
     // Add user message to display
@@ -2088,23 +2083,14 @@ function App() {
 
       const pickedFiles = Array.isArray(picked) ? picked : [picked];
       const accepted: string[] = [];
-      let ignoredCount = 0;
 
       for (const item of pickedFiles) {
         if (typeof item !== "string") continue;
-        const relativePath = toWorkspaceRelativePath(item, workspace.worktreePath);
-        if (relativePath === null) {
-          ignoredCount += 1;
-          continue;
-        }
         accepted.push(item);
       }
 
       if (accepted.length > 0) {
         setAttachedFiles((prev) => Array.from(new Set([...prev, ...accepted])));
-      }
-      if (ignoredCount > 0) {
-        setError(`${ignoredCount} file(s) were ignored because they are outside the workspace.`);
       }
     } catch (err) {
       console.error("Failed to attach files:", err);
@@ -3323,6 +3309,59 @@ function App() {
               {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && (
                 <div className="border-t md-outline md-surface-container-high md-px-3 md-py-2">
                   <div className="rounded-2xl border md-outline md-surface-container md-px-3 md-py-2">
+                    {attachedFiles.length > 0 && (
+                      <div className="mb-2 rounded-lg border md-outline bg-black/5 p-2">
+                        <div className="mb-1.5 flex items-center justify-between">
+                          <span className="flex items-center gap-1 text-[11px] font-medium md-text-secondary">
+                            <span className="material-symbols-rounded !text-sm">attach_file</span>
+                            {attachedFiles.length} file{attachedFiles.length !== 1 ? "s" : ""} attached
+                          </span>
+                          <button
+                            type="button"
+                            className="text-[10px] md-text-muted hover:md-text-secondary transition-colors"
+                            onClick={() => setAttachedFiles([])}
+                          >
+                            Clear all
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {attachedFiles.map((path) => {
+                            const fileName = path.split("/").pop() ?? path;
+                            const relativePath = currentWorkspace
+                              ? toWorkspaceRelativePath(path, currentWorkspace.worktreePath)
+                              : null;
+                            const isExternal = relativePath === null;
+                            const displayPath = relativePath ?? path;
+                            return (
+                              <span
+                                key={path}
+                                className="md-chip gap-1.5 pr-1"
+                                title={path}
+                              >
+                                <span className="material-symbols-rounded !text-sm">
+                                  {isExternal ? "folder_open" : "description"}
+                                </span>
+                                <span className="flex flex-col leading-tight">
+                                  <span className="text-xs font-medium max-w-[200px] truncate">{fileName}</span>
+                                  {displayPath !== fileName && (
+                                    <span className="text-[10px] md-text-muted max-w-[200px] truncate">{displayPath}</span>
+                                  )}
+                                </span>
+                                <button
+                                  type="button"
+                                  className="md-icon-plain !h-4 !w-4 ml-0.5"
+                                  onClick={() => removeAttachedFile(path)}
+                                  title="Remove attached file"
+                                >
+                                  <span className="material-symbols-rounded !text-sm">close</span>
+                                </button>
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
                     <textarea
                       ref={chatTextareaRef}
                       value={inputMessage}
@@ -3347,30 +3386,6 @@ function App() {
                         ⌘/ for shortcuts
                       </button>
                     </div>
-
-                    {attachedFiles.length > 0 && (
-                      <div className="flex flex-wrap gap-2 border-t md-outline pt-2">
-                        {attachedFiles.map((path) => {
-                          const relativePath = currentWorkspace
-                            ? toWorkspaceRelativePath(path, currentWorkspace.worktreePath) ?? path.split("/").pop() ?? path
-                            : path.split("/").pop() ?? path;
-                          return (
-                            <span key={path} className="md-chip gap-1">
-                              <span className="material-symbols-rounded !text-sm">description</span>
-                              <span className="max-w-[240px] truncate">{relativePath}</span>
-                              <button
-                                type="button"
-                                className="md-icon-plain !h-4 !w-4"
-                                onClick={() => removeAttachedFile(path)}
-                                title="Remove attached file"
-                              >
-                                <span className="material-symbols-rounded !text-sm">close</span>
-                              </button>
-                            </span>
-                          );
-                        })}
-                      </div>
-                    )}
 
                     <div className="mt-1.5 flex items-center gap-1.5 border-t md-outline pt-1.5">
                         <button
