@@ -29,6 +29,13 @@ export const MODEL_OPTIONS: Array<{ value: string; label: string }> = [
 ];
 export const DEFAULT_MODEL_ID = "opus";
 
+export const THINKING_MODE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "off", label: "Think off" },
+  { value: "low", label: "Think low" },
+  { value: "medium", label: "Think med" },
+  { value: "high", label: "Think high" },
+];
+
 export const PROMPT_SHORTCUTS_STORAGE_KEY = "claude_orchestrator_prompt_shortcuts";
 export const ENV_OVERRIDES_STORAGE_KEY = "claude_orchestrator_env_overrides";
 export const CLAUDE_MODE_STORAGE_KEY = "claude_orchestrator_mode";
