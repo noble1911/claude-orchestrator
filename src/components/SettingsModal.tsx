@@ -52,6 +52,10 @@ interface SettingsModalProps {
   onShortcutReset: (id: string) => void;
   onShortcutResetAll: () => void;
 
+  // v2 Chat
+  v2Chat: boolean;
+  onV2ChatToggle: (enabled: boolean) => void;
+
   // Tab control
   initialTab?: SettingsTab;
 }
@@ -82,6 +86,8 @@ export default function SettingsModal({
   shortcuts,
   onShortcutChange,
   onShortcutReset,
+  v2Chat,
+  onV2ChatToggle,
   onShortcutResetAll,
   initialTab,
 }: SettingsModalProps) {
@@ -320,6 +326,23 @@ export default function SettingsModal({
                     ))}
                   </select>
                 </div>
+              </section>
+
+              {/* v2 Chat */}
+              <section className="border-t md-outline pt-4">
+                <p className="mb-3 text-sm font-medium md-text-secondary">Chat Display</p>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={v2Chat}
+                    onChange={(e) => onV2ChatToggle(e.target.checked)}
+                    className="h-4 w-4 accent-sky-500"
+                  />
+                  <span className="text-sm md-text-strong">v2 Chat style</span>
+                </label>
+                <p className="mt-1 text-[11px] md-text-muted">
+                  Refined message styling with updated typography and spacing
+                </p>
               </section>
             </>
           )}
