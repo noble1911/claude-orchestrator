@@ -3844,6 +3844,31 @@ async fn list_workspace_files(
     Ok(entries)
 }
 
+/// Read a file's contents up to `max_bytes`, returning the content as a UTF-8 string.
+/// Appends `[truncated]` if the file exceeds the limit.
+fn read_file_contents(path: &std::path::Path, max_bytes: usize) -> Result<String, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+    if !metadata.is_file() {
+        return Err("Path is not a file".to_string());
+    }
+
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let (slice, truncated) = if bytes.len() > max_bytes {
+        (&bytes[..max_bytes], true)
+    } else {
+        (&bytes[..], false)
+    };
+
+    let mut content = String::from_utf8_lossy(slice).to_string();
+    if truncated {
+        content.push_str("\n\n[truncated]");
+    }
+    Ok(content)
+}
+
 #[tauri::command]
 async fn read_workspace_file(
     workspace_id: String,
@@ -3869,27 +3894,19 @@ async fn read_workspace_file(
         return Err("Path is outside workspace root".to_string());
     }
 
-    let metadata = std::fs::metadata(&canonical_target)
-        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
-    if !metadata.is_file() {
-        return Err("Path is not a file".to_string());
-    }
+    read_file_contents(&canonical_target, max_bytes.unwrap_or(MAX_FILE_READ_BYTES))
+}
 
-    let limit = max_bytes.unwrap_or(MAX_FILE_READ_BYTES);
-    let bytes = std::fs::read(&canonical_target)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+/// Read any file by absolute path. No workspace restriction.
+#[tauri::command]
+async fn read_file_by_path(
+    file_path: String,
+    max_bytes: Option<usize>,
+) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(&file_path)
+        .map_err(|e| format!("Failed to resolve file path: {}", e))?;
 
-    let (slice, truncated) = if bytes.len() > limit {
-        (&bytes[..limit], true)
-    } else {
-        (&bytes[..], false)
-    };
-
-    let mut content = String::from_utf8_lossy(slice).to_string();
-    if truncated {
-        content.push_str("\n\n[truncated]");
-    }
-    Ok(content)
+    read_file_contents(&canonical, max_bytes.unwrap_or(MAX_FILE_READ_BYTES))
 }
 
 #[tauri::command]
@@ -6050,6 +6067,7 @@ pub fn run() {
             save_skill,
             list_workspace_files,
             read_workspace_file,
+            read_file_by_path,
             list_workspace_changes,
             read_workspace_change_diff,
             list_workspace_checks,
