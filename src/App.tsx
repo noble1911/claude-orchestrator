@@ -69,6 +69,7 @@ import {
   SIDEBAR_FONT_SIZE_DEFAULT,
   CHAT_FONT_SIZE_DEFAULT,
   V2_CHAT_STORAGE_KEY,
+  THINKING_MODE_OPTIONS,
 } from "./constants";
 import {
   compactActivityLines,
@@ -136,6 +137,7 @@ import GroupDropZone from "./components/GroupDropZone";
 import ThinkingTimer from "./components/ThinkingTimer";
 import SortableGroupItem from "./components/SortableGroupItem";
 import SettingsModal, { type SettingsTab } from "./components/SettingsModal";
+import ToolbarDropdown from "./components/ToolbarDropdown";
 import { usePersistedState } from "./hooks/usePersistedState";
 
 function App() {
@@ -3424,31 +3426,20 @@ function App() {
                         >
                           <span className="material-symbols-rounded !text-[18px]">attach_file</span>
                         </button>
-                        <select
+                        <ToolbarDropdown
                           value={selectedModel}
-                          onChange={(e) => setWorkspaceModel(e.target.value)}
-                          className="md-select !min-h-0 h-7 py-0 pl-2 pr-6 text-[11px]"
-                          style={{ width: "auto" }}
-                          aria-label="Model selection"
-                        >
-                          {MODEL_OPTIONS.map((option) => (
-                            <option key={option.value} value={option.value}>
-                              {option.label}
-                            </option>
-                          ))}
-                        </select>
-                        <select
+                          options={MODEL_OPTIONS}
+                          onChange={setWorkspaceModel}
+                          icon="auto_awesome"
+                          ariaLabel="Model selection"
+                        />
+                        <ToolbarDropdown
                           value={thinkingMode}
-                          onChange={(e) => setThinkingMode(e.target.value as "off" | "low" | "medium" | "high")}
-                          className="md-select !min-h-0 h-7 py-0 pl-2 pr-6 text-[11px]"
-                          style={{ width: "auto" }}
-                          aria-label="Thinking mode"
-                        >
-                          <option value="off">Think off</option>
-                          <option value="low">Think low</option>
-                          <option value="medium">Think med</option>
-                          <option value="high">Think high</option>
-                        </select>
+                          options={THINKING_MODE_OPTIONS}
+                          onChange={(v) => setThinkingMode(v as "off" | "low" | "medium" | "high")}
+                          icon="psychology"
+                          ariaLabel="Thinking mode"
+                        />
 
                         <div className="ml-auto flex items-center gap-1">
                           <button
