@@ -68,6 +68,7 @@ import {
   CHAT_FONT_SIZE_STORAGE_KEY,
   SIDEBAR_FONT_SIZE_DEFAULT,
   CHAT_FONT_SIZE_DEFAULT,
+  V2_CHAT_STORAGE_KEY,
 } from "./constants";
 import {
   compactActivityLines,
@@ -135,6 +136,7 @@ import GroupDropZone from "./components/GroupDropZone";
 import ThinkingTimer from "./components/ThinkingTimer";
 import SortableGroupItem from "./components/SortableGroupItem";
 import SettingsModal, { type SettingsTab } from "./components/SettingsModal";
+import { usePersistedState } from "./hooks/usePersistedState";
 
 function App() {
   const [repositories, setRepositories] = useState<Repository[]>([]);
@@ -266,6 +268,9 @@ function App() {
     const parsed = stored ? Number(stored) : NaN;
     return Number.isNaN(parsed) ? CHAT_FONT_SIZE_DEFAULT : parsed;
   });
+  const [v2Chat, setV2Chat] = usePersistedState<boolean>(
+    V2_CHAT_STORAGE_KEY, false, String, (raw) => raw === "true",
+  );
   const startingWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const selectedWorkspaceRef = useRef<string | null>(null);
   const thinkingSinceByWorkspaceRef = useRef<Record<string, number | null>>({});
@@ -2725,20 +2730,35 @@ function App() {
                   };
                 });
               }}
-              className="flex w-full items-center gap-2 py-1.5 text-left transition hover:bg-white/5"
+              className={v2Chat
+                ? "flex w-full items-center gap-2 py-0.5 text-left cursor-pointer group/activity"
+                : "flex w-full items-center gap-2 py-1.5 text-left transition hover:bg-white/5"
+              }
             >
-              <span className="text-xs md-text-faint">
+              {v2Chat && (
+                <span className={`h-[5px] w-[5px] flex-none rounded-full ${isLatestRunningActivity ? "animate-pulse bg-amber-300" : "bg-white/20"}`} />
+              )}
+              <span className={v2Chat
+                ? "text-[11.5px] text-white/30 group-hover/activity:text-white/50"
+                : "text-xs md-text-faint"
+              }>
                 Agent activity ({row.group.messages.length} events)
               </span>
-              {isLatestRunningActivity && (
+              {!v2Chat && isLatestRunningActivity && (
                 <span className="inline-flex items-center gap-1 rounded-full border border-amber-700/60 bg-amber-950/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-300">
                   <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-300" />
                   running
                 </span>
               )}
-              <span className="material-symbols-rounded ml-auto !text-sm md-text-faint">
-                {expanded ? "expand_more" : "chevron_right"}
-              </span>
+              {v2Chat ? (
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" className="ml-auto text-white/20">
+                  <path d={expanded ? "M3 6L5 4L7 6" : "M3 4L5 6L7 4"} stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+                </svg>
+              ) : (
+                <span className="material-symbols-rounded ml-auto !text-sm md-text-faint">
+                  {expanded ? "expand_more" : "chevron_right"}
+                </span>
+              )}
             </button>
 
             {expanded && (
@@ -2811,8 +2831,14 @@ function App() {
       if (isUser) {
         return (
           <div key={row.id} className="flex justify-end">
-            <div className="max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-3">
-              <pre className="select-text overflow-x-auto whitespace-pre-wrap text-sm leading-relaxed md-text-strong">
+            <div className={v2Chat
+              ? "max-w-[72%] rounded-[18px] rounded-br-[4px] border-[0.5px] border-white/[0.13] bg-white/[0.05] px-3.5 py-2"
+              : "max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-3"
+            }>
+              <pre className={v2Chat
+                ? "select-text overflow-x-auto whitespace-pre-wrap font-mono text-xs leading-relaxed md-text-primary"
+                : "select-text overflow-x-auto whitespace-pre-wrap text-sm leading-relaxed md-text-strong"
+              }>
                 {msg.content.replace(/^>\s?/, "")}
               </pre>
             </div>
@@ -2821,8 +2847,8 @@ function App() {
       }
 
       return (
-        <div key={row.id}>
-          <MarkdownMessage content={msg.content} />
+        <div key={row.id} className={v2Chat ? "rounded-lg border-[0.5px] border-white/[0.08] bg-white/[0.03] px-4 py-3.5" : ""}>
+          <MarkdownMessage content={msg.content} v2={v2Chat} />
         </div>
       );
     });
@@ -2834,6 +2860,7 @@ function App() {
     handleQuestionAnswer,
     isThinkingCurrentWorkspace,
     selectedWorkspace,
+    v2Chat,
   ]);
   const sortedWorkspaceChanges = useMemo(
     () =>
@@ -3204,8 +3231,8 @@ function App() {
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto md-px-3 md-py-3" style={{ zoom: chatFontSize / 14 }}>
-                <div className="space-y-3">
+              <div className={`flex-1 overflow-y-auto ${v2Chat ? "px-5 py-5" : "md-px-3 md-py-3"}`} style={{ zoom: chatFontSize / 14 }}>
+                <div className={v2Chat ? "flex flex-col gap-[18px]" : "space-y-3"}>
                   {activeCenterTab.type === "chat" && workspaceMessages.length === 0 ? (
                     <div className="flex h-[55vh] items-center justify-center md-text-muted">
                       {workspaceAgents.length > 0 || isAutoStartingCurrentWorkspace ? (
@@ -4498,6 +4525,8 @@ function App() {
           onEnvOverridesChange={setEnvOverridesText}
           bedrockEnabled={bedrockEnabled}
           onBedrockToggle={setBedrockEnabled}
+          v2Chat={v2Chat}
+          onV2ChatToggle={setV2Chat}
           shortcuts={resolvedShortcuts}
           onShortcutChange={(id, newKeys) => setShortcutOverrides((prev) => ({ ...prev, [id]: newKeys }))}
           onShortcutReset={(id) => setShortcutOverrides((prev) => { const next = { ...prev }; delete next[id]; return next; })}

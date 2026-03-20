@@ -47,6 +47,7 @@ export const SIDEBAR_FONT_SIZE_DEFAULT = 12;
 export const CHAT_FONT_SIZE_DEFAULT = 14;
 export const SIDEBAR_FONT_SIZE_OPTIONS = [10, 11, 12, 13, 14] as const;
 export const CHAT_FONT_SIZE_OPTIONS = [12, 13, 14, 15, 16] as const;
+export const V2_CHAT_STORAGE_KEY = "claude_orchestrator_v2_chat";
 
 export const SHORTCUTS_STORAGE_KEY = "claude_orchestrator_shortcuts";
 
