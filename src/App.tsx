@@ -287,7 +287,7 @@ function App() {
     return Number.isNaN(parsed) ? CHAT_FONT_SIZE_DEFAULT : parsed;
   });
   const [v2Chat, setV2Chat] = usePersistedState<boolean>(
-    V2_CHAT_STORAGE_KEY, false, String, (raw) => raw === "true",
+    V2_CHAT_STORAGE_KEY, true, String, (raw) => raw === "true",
   );
   const startingWorkspaceIdsRef = useRef<Set<string>>(new Set());
   const selectedWorkspaceRef = useRef<string | null>(null);
