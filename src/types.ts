@@ -47,6 +47,15 @@ export interface AgentRunStateEvent {
   timestamp: string;
 }
 
+export interface PermissionRequestEvent {
+  workspaceId: string;
+  agentId: string;
+  requestId: string;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  toolUseId: string;
+}
+
 export interface ServerStatus {
   running: boolean;
   port: number;
