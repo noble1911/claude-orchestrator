@@ -166,6 +166,19 @@ export interface MarketplaceSkill {
   description: string;
   /** Full SKILL.md content (body without frontmatter) */
   content: string;
+  /** Which repo this skill came from (undefined = official) */
+  repoSource?: string;
+}
+
+export interface CustomSkillRepo {
+  /** Unique ID */
+  id: string;
+  /** GitHub owner/repo (e.g., "myuser/my-skills") */
+  repo: string;
+  /** Optional subdirectory within the repo (default: "skills") */
+  path: string;
+  /** Optional display label */
+  label: string;
 }
 
 export interface CenterTab {
