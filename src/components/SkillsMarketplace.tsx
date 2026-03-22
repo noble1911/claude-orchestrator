@@ -28,7 +28,7 @@ function parseFrontmatter(raw: string): {
 }
 
 /** Parse "owner/repo" from various GitHub URL formats or plain owner/repo */
-function parseGitHubRepo(input: string): { repo: string; path: string } | null {
+function parseGitHubRepo(input: string): { repo: string; path: string | null } | null {
   const trimmed = input.trim().replace(/\/+$/, "");
 
   // Try URL patterns: https://github.com/owner/repo[/tree/branch/path]
@@ -36,39 +36,127 @@ function parseGitHubRepo(input: string): { repo: string; path: string } | null {
     /github\.com\/([^/]+\/[^/]+?)(?:\/tree\/[^/]+\/(.+))?(?:\.git)?$/,
   );
   if (urlMatch) {
-    return { repo: urlMatch[1], path: urlMatch[2] || "skills" };
+    return { repo: urlMatch[1], path: urlMatch[2] || null };
   }
 
   // Plain owner/repo format
   const plainMatch = trimmed.match(/^([^/]+\/[^/]+)$/);
   if (plainMatch) {
-    return { repo: plainMatch[1], path: "skills" };
+    return { repo: plainMatch[1], path: null };
   }
 
   return null;
 }
 
-async function fetchSkillsFromRepo(
+/** Fetch the default branch name for a GitHub repo */
+async function fetchDefaultBranch(repo: string): Promise<string> {
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.default_branch) return data.default_branch;
+    }
+  } catch {
+    // Fall back to "main"
+  }
+  return "main";
+}
+
+/** Manifest plugin entry from .claude-plugin/marketplace.json */
+interface ManifestPlugin {
+  name: string;
+  source: string;
+  description?: string;
+  category?: string;
+  keywords?: string[];
+}
+
+/** Try to fetch .claude-plugin/marketplace.json from the repo */
+async function fetchManifest(
   repo: string,
+  branch: string,
+): Promise<ManifestPlugin[] | null> {
+  try {
+    const url = `https://raw.githubusercontent.com/${repo}/${branch}/.claude-plugin/marketplace.json`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.plugins && Array.isArray(data.plugins)) {
+      return data.plugins as ManifestPlugin[];
+    }
+  } catch {
+    // No manifest available
+  }
+  return null;
+}
+
+/** Fetch skills using the manifest's plugin list */
+async function fetchSkillsFromManifest(
+  repo: string,
+  branch: string,
+  plugins: ManifestPlugin[],
+): Promise<MarketplaceSkill[]> {
+  const results = await Promise.allSettled(
+    plugins.map(async (plugin) => {
+      const sourcePath = plugin.source.replace(/^\.\//, "");
+      const skillUrl = `https://raw.githubusercontent.com/${repo}/${branch}/${sourcePath}/SKILL.md`;
+      const res = await fetch(skillUrl);
+      if (!res.ok) {
+        // Manifest provides name+description directly, use those even without SKILL.md
+        return {
+          dirName: sourcePath,
+          name: plugin.name,
+          description: plugin.description || "",
+          content: "",
+          repoSource: repo,
+        } as MarketplaceSkill;
+      }
+      const raw = await res.text();
+      const { name, description, body } = parseFrontmatter(raw);
+      return {
+        dirName: sourcePath,
+        name: name || plugin.name,
+        description: description || plugin.description || "",
+        content: body,
+        repoSource: repo,
+      } as MarketplaceSkill;
+    }),
+  );
+
+  return results
+    .filter(
+      (r): r is PromiseFulfilledResult<MarketplaceSkill> =>
+        r.status === "fulfilled",
+    )
+    .map((r) => r.value)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Scan a directory for subdirs containing SKILL.md (one level deep) */
+async function scanDirectoryForSkills(
+  repo: string,
+  branch: string,
   path: string,
-  branch = "main",
 ): Promise<MarketplaceSkill[]> {
   const contentsUrl = `https://api.github.com/repos/${repo}/contents/${path}`;
   const rawBaseUrl = `https://raw.githubusercontent.com/${repo}/${branch}/${path}`;
 
   const dirRes = await fetch(contentsUrl);
-  if (!dirRes.ok) throw new Error(`GitHub API error: ${dirRes.status}`);
+  if (!dirRes.ok) return [];
   const entries: { name: string; type: string }[] = await dirRes.json();
-  const dirs = entries.filter((e) => e.type === "dir");
+  const dirs = entries.filter(
+    (e) => e.type === "dir" && !e.name.startsWith("."),
+  );
 
   const results = await Promise.allSettled(
     dirs.map(async (dir) => {
+      // Try SKILL.md in this subdirectory
       const res = await fetch(`${rawBaseUrl}/${dir.name}/SKILL.md`);
       if (!res.ok) return null;
       const raw = await res.text();
       const { name, description, body } = parseFrontmatter(raw);
       return {
-        dirName: dir.name,
+        dirName: path ? `${path}/${dir.name}` : dir.name,
         name: name || dir.name,
         description,
         content: body,
@@ -83,8 +171,68 @@ async function fetchSkillsFromRepo(
         r.status === "fulfilled",
     )
     .map((r) => r.value)
-    .filter((s): s is MarketplaceSkill => s !== null)
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .filter((s): s is MarketplaceSkill => s !== null);
+}
+
+/**
+ * Fetch skills from a GitHub repo using a multi-strategy approach:
+ * 1. Check for .claude-plugin/marketplace.json manifest (Claude Code standard)
+ * 2. Scan the specified path (or common paths) for SKILL.md files
+ * 3. For repos with category directories, scan one level deeper
+ */
+async function fetchSkillsFromRepo(
+  repo: string,
+  path: string | null,
+): Promise<MarketplaceSkill[]> {
+  const branch = await fetchDefaultBranch(repo);
+
+  // Strategy 1: Check for .claude-plugin/marketplace.json
+  const manifest = await fetchManifest(repo, branch);
+  if (manifest && manifest.length > 0) {
+    return fetchSkillsFromManifest(repo, branch, manifest);
+  }
+
+  // Strategy 2: Scan specified path for SKILL.md in subdirectories
+  const pathsToTry = path != null ? [path] : ["skills", ""];
+  for (const tryPath of pathsToTry) {
+    const skills = await scanDirectoryForSkills(repo, branch, tryPath);
+    if (skills.length > 0) return skills.sort((a, b) => a.name.localeCompare(b.name));
+
+    // Strategy 3: If direct scan found no SKILL.md but found subdirs,
+    // try scanning one level deeper (category directories pattern)
+    if (tryPath === "" || tryPath === path) {
+      const contentsUrl = `https://api.github.com/repos/${repo}/contents/${tryPath}`;
+      const dirRes = await fetch(contentsUrl);
+      if (dirRes.ok) {
+        const entries: { name: string; type: string }[] = await dirRes.json();
+        const dirs = entries.filter(
+          (e) => e.type === "dir" && !e.name.startsWith("."),
+        );
+        const nestedResults = await Promise.allSettled(
+          dirs.map((dir) =>
+            scanDirectoryForSkills(
+              repo,
+              branch,
+              tryPath ? `${tryPath}/${dir.name}` : dir.name,
+            ),
+          ),
+        );
+        const nestedSkills = nestedResults
+          .filter(
+            (r): r is PromiseFulfilledResult<MarketplaceSkill[]> =>
+              r.status === "fulfilled",
+          )
+          .flatMap((r) => r.value);
+        if (nestedSkills.length > 0) {
+          return nestedSkills.sort((a, b) => a.name.localeCompare(b.name));
+        }
+      }
+    }
+  }
+
+  throw new Error(
+    "No skills found. The repository needs a .claude-plugin/marketplace.json manifest or directories containing SKILL.md files.",
+  );
 }
 
 interface RepoSection {
@@ -260,7 +408,7 @@ export default function SkillsMarketplace() {
 
   async function fetchAllSections() {
     // Build the list of repos to fetch: official first, then custom
-    const repoList: { id: string; label: string; repo: string; path: string }[] = [
+    const repoList: { id: string; label: string; repo: string; path: string | null }[] = [
       {
         id: "__official__",
         label: "Official Skills",
@@ -271,7 +419,7 @@ export default function SkillsMarketplace() {
         id: r.id,
         label: r.label || r.repo,
         repo: r.repo,
-        path: r.path,
+        path: r.path || null,
       })),
     ];
 
@@ -344,7 +492,7 @@ export default function SkillsMarketplace() {
       const newRepo: CustomSkillRepo = {
         id: crypto.randomUUID(),
         repo: parsed.repo,
-        path: parsed.path,
+        path: parsed.path ?? "",
         label: addRepoLabel.trim() || parsed.repo,
       };
 
@@ -358,7 +506,7 @@ export default function SkillsMarketplace() {
       setShowAddForm(false);
     } catch (err) {
       setAddRepoError(
-        `Could not fetch skills from ${parsed.repo}/${parsed.path}: ${String(err)}`,
+        `Could not fetch skills from ${parsed.repo}: ${String(err)}`,
       );
     } finally {
       setAddingRepo(false);
@@ -455,11 +603,11 @@ export default function SkillsMarketplace() {
               Add Custom Repository
             </h3>
             <p className="mb-3 text-[11px] leading-relaxed md-text-muted">
-              Enter a GitHub repository URL or owner/repo that contains a{" "}
+              Enter a GitHub repository URL or owner/repo. Supports repos with a{" "}
               <code className="rounded px-1 py-0.5 md-surface-container-high">
-                skills/
+                .claude-plugin/marketplace.json
               </code>{" "}
-              directory with SKILL.md files.
+              manifest or directories containing SKILL.md files.
             </p>
             <div className="flex flex-col gap-2">
               <input
