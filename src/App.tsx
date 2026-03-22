@@ -3337,8 +3337,7 @@ function App() {
               )}
 
               {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && (
-                <div className="border-t md-outline md-surface-container-high md-px-3 md-py-2">
-                  <div className="rounded-2xl border md-outline md-surface-container md-px-3 md-py-2">
+                <div className="border-t md-outline md-surface-container md-px-3 md-py-2">
                     {attachedFiles.length > 0 && (
                       <div className="mb-2 rounded-lg border md-outline bg-black/5 p-2">
                         <div className="mb-1.5 flex items-center justify-between">
@@ -3483,7 +3482,6 @@ function App() {
                           </button>
                         </div>
                     </div>
-                  </div>
                 </div>
               )}
             </>
