@@ -69,6 +69,9 @@ interface ManifestPlugin {
   description?: string;
   category?: string;
   keywords?: string[];
+  /** Explicit list of skill directory paths (e.g., ["./skills/xlsx", "./skills/pdf"]).
+   *  Used by the official Anthropic repo where source is "./" and skills are listed individually. */
+  skills?: string[];
 }
 
 /** Try to fetch .claude-plugin/marketplace.json from the repo */
@@ -91,73 +94,146 @@ async function fetchManifest(
 }
 
 /**
+ * Fetch the complete file tree for a repo using the Git Trees API (single API call).
+ * This dramatically reduces GitHub API usage compared to per-directory Contents API calls.
+ * Returns an empty array if the API call fails (e.g., rate-limited).
+ */
+async function fetchRepoTree(
+  repo: string,
+  branch: string,
+): Promise<{ path: string; type: string }[]> {
+  try {
+    const url = `https://api.github.com/repos/${repo}/git/trees/${branch}?recursive=1`;
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.tree || []) as { path: string; type: string }[];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Fetch a single SKILL.md from raw.githubusercontent.com and parse it.
+ * Raw content fetches are NOT subject to the GitHub API rate limit (60/hr).
+ */
+async function fetchSkillMd(
+  repo: string,
+  branch: string,
+  skillDirPath: string,
+): Promise<MarketplaceSkill | null> {
+  try {
+    const url = `https://raw.githubusercontent.com/${repo}/${branch}/${skillDirPath}/SKILL.md`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const raw = await res.text();
+    const { name, description, body } = parseFrontmatter(raw);
+    const dirBaseName = skillDirPath.split("/").pop() || skillDirPath;
+    return {
+      dirName: skillDirPath,
+      name: name || dirBaseName,
+      description,
+      content: body,
+      repoSource: repo,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fetch skills using the manifest's plugin list.
- * Each manifest plugin may be a leaf skill (has SKILL.md directly) or a
- * package containing sub-skill directories. We expand packages into
- * individual skills so users can install them granularly.
+ * Supports two manifest formats:
+ * 1. Plugins with explicit `skills` arrays listing skill directory paths
+ *    (e.g., Anthropic official repo where all plugins have source: "./" and skills: [...])
+ * 2. Plugins with `source` paths pointing to directories containing sub-skills
+ *    (e.g., community repos where source: "./engineering" contains skill subdirectories)
+ *
+ * Uses the Git Trees API for efficient directory scanning (1 API call instead of N).
  */
 async function fetchSkillsFromManifest(
   repo: string,
   branch: string,
   plugins: ManifestPlugin[],
 ): Promise<MarketplaceSkill[]> {
-  const allSkills: MarketplaceSkill[] = [];
+  // Separate plugins into two groups:
+  // 1. Plugins with explicit `skills` arrays (fetch each path directly — no API calls needed)
+  // 2. Plugins with `source` paths to scan for sub-skills (use tree API)
+  const explicitDirPaths: string[] = [];
+  const sourcePaths: string[] = [];
 
-  const results = await Promise.allSettled(
-    plugins.map(async (plugin) => {
-      const sourcePath = plugin.source.replace(/^\.\//, "");
-
-      // Check if this plugin directory contains sub-skill directories
-      const subSkills = await scanDirectoryForSkills(repo, branch, sourcePath);
-      if (subSkills.length > 0) {
-        // This is a package — return expanded sub-skills
-        return subSkills;
+  for (const plugin of plugins) {
+    if (plugin.skills && plugin.skills.length > 0) {
+      // Plugin explicitly lists its skill directories (e.g., Anthropic official repo)
+      for (const s of plugin.skills) {
+        explicitDirPaths.push(s.replace(/^\.\//, ""));
       }
+    } else if (plugin.source !== "./" && plugin.source !== ".") {
+      // Plugin points to a directory to scan for sub-skills (e.g., community repos)
+      sourcePaths.push(plugin.source.replace(/^\.\//, ""));
+    }
+    // Plugins with source: "./" and no skills array are skipped —
+    // they can't be resolved to individual skills without explicit paths.
+    // The caller (fetchSkillsFromRepo) will fall through to tree-based scanning.
+  }
 
-      // Leaf skill — fetch its own SKILL.md
-      const skillUrl = `https://raw.githubusercontent.com/${repo}/${branch}/${sourcePath}/SKILL.md`;
-      const res = await fetch(skillUrl);
-      if (!res.ok) {
-        // Use manifest metadata as fallback
-        return [
-          {
-            dirName: sourcePath,
-            name: plugin.name,
-            description: plugin.description || "",
-            content: "",
-            repoSource: repo,
-          } as MarketplaceSkill,
-        ];
-      }
-      const raw = await res.text();
-      const { name, description, body } = parseFrontmatter(raw);
-      return [
-        {
-          dirName: sourcePath,
-          name: name || plugin.name,
-          description: description || plugin.description || "",
-          content: body,
-          repoSource: repo,
-        } as MarketplaceSkill,
-      ];
-    }),
+  // Fetch explicitly listed skills (raw.githubusercontent.com only — no API rate limit)
+  const explicitResults = await Promise.allSettled(
+    explicitDirPaths.map((p) => fetchSkillMd(repo, branch, p)),
   );
+  const explicitSkills = explicitResults
+    .filter(
+      (r): r is PromiseFulfilledResult<MarketplaceSkill | null> =>
+        r.status === "fulfilled",
+    )
+    .map((r) => r.value)
+    .filter((s): s is MarketplaceSkill => s !== null);
 
-  for (const r of results) {
-    if (r.status === "fulfilled") {
-      allSkills.push(...r.value);
+  // For source-path plugins, use the tree API to discover sub-skills efficiently
+  let scannedSkills: MarketplaceSkill[] = [];
+  if (sourcePaths.length > 0) {
+    const tree = await fetchRepoTree(repo, branch);
+    // Find all SKILL.md files under any of the source paths
+    const skillDirPaths = tree
+      .filter((f) => {
+        if (f.type !== "blob" || !f.path.endsWith("/SKILL.md")) return false;
+        return sourcePaths.some((sp) => f.path.startsWith(sp + "/"));
+      })
+      .map((f) => f.path.replace(/\/SKILL\.md$/, ""));
+
+    if (skillDirPaths.length > 0) {
+      // Tree API found SKILL.md files — fetch them from raw.githubusercontent.com
+      const scannedResults = await Promise.allSettled(
+        skillDirPaths.map((p) => fetchSkillMd(repo, branch, p)),
+      );
+      scannedSkills = scannedResults
+        .filter(
+          (r): r is PromiseFulfilledResult<MarketplaceSkill | null> =>
+            r.status === "fulfilled",
+        )
+        .map((r) => r.value)
+        .filter((s): s is MarketplaceSkill => s !== null);
+    } else {
+      // Tree API failed or found no matches — fall back to per-directory scanning
+      const fallbackResults = await Promise.allSettled(
+        sourcePaths.map((sp) => scanDirectoryForSkills(repo, branch, sp)),
+      );
+      for (const r of fallbackResults) {
+        if (r.status === "fulfilled") scannedSkills.push(...r.value);
+      }
     }
   }
 
-  // Deduplicate by dirName (a sub-skill may appear in multiple manifest entries)
+  // Combine and deduplicate by dirName (a skill may appear via multiple plugins)
+  const allSkills = [...explicitSkills, ...scannedSkills];
   const seen = new Set<string>();
-  const deduped = allSkills.filter((s) => {
-    if (seen.has(s.dirName)) return false;
-    seen.add(s.dirName);
-    return true;
-  });
-
-  return deduped.sort((a, b) => a.name.localeCompare(b.name));
+  return allSkills
+    .filter((s) => {
+      if (seen.has(s.dirName)) return false;
+      seen.add(s.dirName);
+      return true;
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Scan a directory for subdirs containing SKILL.md (one level deep) */
@@ -204,9 +280,14 @@ async function scanDirectoryForSkills(
 
 /**
  * Fetch skills from a GitHub repo using a multi-strategy approach:
- * 1. Check for .claude-plugin/marketplace.json manifest (Claude Code standard)
- * 2. Scan the specified path (or common paths) for SKILL.md files
- * 3. For repos with category directories, scan one level deeper
+ * 1. Check for .claude-plugin/marketplace.json manifest
+ *    - If plugins have `skills` arrays → fetch those paths directly (no API calls)
+ *    - If plugins have `source` paths → use tree API to find SKILL.md files
+ * 2. Use Git Trees API to find all SKILL.md files under the specified path
+ * 3. Fall back to per-directory Contents API scanning (if tree API fails)
+ *
+ * Total GitHub API calls: typically 2 per repo (default branch + tree),
+ * vs. the old approach which could make 100+ calls and hit rate limits.
  */
 async function fetchSkillsFromRepo(
   repo: string,
@@ -215,51 +296,48 @@ async function fetchSkillsFromRepo(
   const branch = await fetchDefaultBranch(repo);
 
   // Strategy 1: Check for .claude-plugin/marketplace.json
-  // Filter out root-level entries (source: "./") which are repo metadata, not skill pointers
+  // Pass ALL plugins to fetchSkillsFromManifest — it handles both `skills` arrays
+  // and `source` paths internally, including plugins with source: "./" that have skills arrays
   const manifest = await fetchManifest(repo, branch);
-  const skillPlugins = manifest?.filter(
-    (p) => p.source !== "./" && p.source !== ".",
-  );
-  if (skillPlugins && skillPlugins.length > 0) {
-    return fetchSkillsFromManifest(repo, branch, skillPlugins);
+  if (manifest && manifest.length > 0) {
+    const skills = await fetchSkillsFromManifest(repo, branch, manifest);
+    if (skills.length > 0) return skills;
   }
 
-  // Strategy 2: Scan specified path for SKILL.md in subdirectories
+  // Strategy 2: Use Git Trees API to find SKILL.md files efficiently (1 API call)
+  const tree = await fetchRepoTree(repo, branch);
+  if (tree.length > 0) {
+    const basePath = path || "";
+    const skillDirPaths = tree
+      .filter((f) => {
+        if (f.type !== "blob" || !f.path.endsWith("/SKILL.md")) return false;
+        if (basePath) return f.path.startsWith(basePath + "/");
+        return true;
+      })
+      .map((f) => f.path.replace(/\/SKILL\.md$/, ""));
+
+    if (skillDirPaths.length > 0) {
+      const results = await Promise.allSettled(
+        skillDirPaths.map((p) => fetchSkillMd(repo, branch, p)),
+      );
+      const skills = results
+        .filter(
+          (r): r is PromiseFulfilledResult<MarketplaceSkill | null> =>
+            r.status === "fulfilled",
+        )
+        .map((r) => r.value)
+        .filter((s): s is MarketplaceSkill => s !== null);
+      if (skills.length > 0)
+        return skills.sort((a, b) => a.name.localeCompare(b.name));
+    }
+  }
+
+  // Strategy 3: Fall back to per-directory scanning (if tree API failed, e.g., rate-limited)
   const pathsToTry = path != null ? [path] : ["skills", ""];
   for (const tryPath of pathsToTry) {
     const skills = await scanDirectoryForSkills(repo, branch, tryPath);
-    if (skills.length > 0) return skills.sort((a, b) => a.name.localeCompare(b.name));
-
-    // Strategy 3: If direct scan found no SKILL.md but found subdirs,
-    // try scanning one level deeper (category directories pattern)
-    if (tryPath === "" || tryPath === path) {
-      const contentsUrl = `https://api.github.com/repos/${repo}/contents/${tryPath}`;
-      const dirRes = await fetch(contentsUrl);
-      if (dirRes.ok) {
-        const entries: { name: string; type: string }[] = await dirRes.json();
-        const dirs = entries.filter(
-          (e) => e.type === "dir" && !e.name.startsWith("."),
-        );
-        const nestedResults = await Promise.allSettled(
-          dirs.map((dir) =>
-            scanDirectoryForSkills(
-              repo,
-              branch,
-              tryPath ? `${tryPath}/${dir.name}` : dir.name,
-            ),
-          ),
-        );
-        const nestedSkills = nestedResults
-          .filter(
-            (r): r is PromiseFulfilledResult<MarketplaceSkill[]> =>
-              r.status === "fulfilled",
-          )
-          .flatMap((r) => r.value);
-        if (nestedSkills.length > 0) {
-          return nestedSkills.sort((a, b) => a.name.localeCompare(b.name));
-        }
-      }
-    }
+    if (skills.length > 0)
+      return skills.sort((a, b) => a.name.localeCompare(b.name));
   }
 
   throw new Error(
@@ -802,7 +880,9 @@ export default function SkillsMarketplace() {
               {/* Section skills — grouped by category when applicable */}
               {!section.loading && section.skills.length > 0 && (() => {
                 const groups = groupSkillsByCategory(section.skills);
-                const hasCategories = groups.some((g) => g.category !== "");
+                // Show category grouping only when there are multiple groups —
+                // a single category (e.g., all skills under "skills/") is redundant
+                const hasCategories = groups.length > 1;
                 // Default to collapsed when section has many skills
                 const defaultCollapsed = section.skills.length > 12;
 
