@@ -4114,7 +4114,7 @@ function App() {
                 <p className="md-text-muted">Working tree is clean.</p>
               )}
               {!isLoadingChanges && workspaceChanges.length > 0 && (
-                <div className="mt-3 max-h-[52vh] space-y-1 overflow-auto pr-1">
+                <div className="mt-3 space-y-1 pr-1">
                   {sortedWorkspaceChanges.map((change) => {
                     const tabId = `diff:${change.status}:${change.oldPath ?? ""}:${change.path}`;
                     const isActive = activeCenterTabId === tabId;
