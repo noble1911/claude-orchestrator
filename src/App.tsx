@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   DndContext,
@@ -161,6 +162,7 @@ function App() {
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [inputMessageByWorkspace, setInputMessageByWorkspace] = useState<Record<string, string>>({});
   const [activeRightTab, setActiveRightTab] = useState<"prompts" | "files" | "changes" | "checks">("prompts");
@@ -400,8 +402,10 @@ function App() {
 
   useEffect(() => {
     loadInitialState();
-    // Silent background check on launch; surfaced only on explicit user action.
+    // Silent background check on launch and every hour thereafter.
     void checkForAppUpdate(false, false);
+    const updateInterval = setInterval(() => void checkForAppUpdate(false, false), 60 * 60 * 1000);
+    void getVersion().then(setAppVersion);
     
     // Listen for agent messages from backend
     const unlisten = listen<AgentMessage>("agent-message", (event) => {
@@ -533,6 +537,7 @@ function App() {
       unlistenRunState.then(fn => fn());
       unlistenClients.then(fn => fn());
       unlistenSettings.then(fn => fn());
+      clearInterval(updateInterval);
     };
   }, []);
 
@@ -4499,7 +4504,7 @@ function App() {
 
               <div className="border-t md-outline pt-3">
                 <div className="mb-2 flex items-center justify-between gap-2">
-                  <p className="md-text-dim">App updates</p>
+                  <p className="md-text-dim">App updates{appVersion && <span className="ml-1 md-text-muted">v{appVersion}</span>}</p>
                   <button
                     type="button"
                     className="md-btn md-btn-tonal !min-h-0 !px-2 !py-1 text-[11px] disabled:opacity-50"
