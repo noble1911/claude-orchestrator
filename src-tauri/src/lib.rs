@@ -3910,6 +3910,42 @@ async fn read_workspace_file(
     read_file_contents(&canonical_target, max_bytes.unwrap_or(MAX_FILE_READ_BYTES))
 }
 
+/// Write content to a file inside a workspace. Path-traversal guarded.
+#[tauri::command]
+async fn write_workspace_file(
+    workspace_id: String,
+    relative_path: String,
+    content: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let workspace_root = {
+        let workspaces = state.workspaces.read();
+        let workspace = workspaces
+            .get(&workspace_id)
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
+        workspace.worktree_path.clone()
+    };
+
+    let root = std::fs::canonicalize(&workspace_root)
+        .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
+    let target = root.join(&relative_path);
+
+    // For new files the target may not exist yet, so canonicalize the parent instead.
+    let parent = target
+        .parent()
+        .ok_or_else(|| "Invalid file path".to_string())?;
+    let canonical_parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("Failed to resolve parent directory: {}", e))?;
+    if !canonical_parent.starts_with(&root) {
+        return Err("Path is outside workspace root".to_string());
+    }
+
+    std::fs::write(&target, content.as_bytes())
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+
+    Ok(())
+}
+
 /// Read any file by absolute path. No workspace restriction.
 #[tauri::command]
 async fn read_file_by_path(
@@ -6080,6 +6116,7 @@ pub fn run() {
             save_skill,
             list_workspace_files,
             read_workspace_file,
+            write_workspace_file,
             read_file_by_path,
             list_workspace_changes,
             read_workspace_change_diff,

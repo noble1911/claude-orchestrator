@@ -167,6 +167,8 @@ function App() {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [fileContentsByPath, setFileContentsByPath] = useState<Record<string, string>>({});
   const [isLoadingFileContent, setIsLoadingFileContent] = useState(false);
+  const [editedContentsByPath, setEditedContentsByPath] = useState<Record<string, string>>({});
+  const [savingFilePath, setSavingFilePath] = useState<string | null>(null);
   const [diffContentsByTab, setDiffContentsByTab] = useState<Record<string, string>>({});
   const [loadingDiffTabId, setLoadingDiffTabId] = useState<string | null>(null);
   const [centerTabs, setCenterTabs] = useState<CenterTab[]>([{ id: "chat", type: "chat", title: "Chat" }]);
@@ -962,6 +964,7 @@ function App() {
       setLoadingPaths(new Set());
       setSelectedFilePath(null);
       setFileContentsByPath({});
+      setEditedContentsByPath({});
       setDiffContentsByTab({});
       setLoadingDiffTabId(null);
       setCenterTabs([{ id: "chat", type: "chat", title: "Chat" }]);
@@ -979,6 +982,7 @@ function App() {
     setLoadingPaths(new Set());
     setSelectedFilePath(null);
     setFileContentsByPath({});
+    setEditedContentsByPath({});
     setDiffContentsByTab({});
     setLoadingDiffTabId(null);
     setCenterTabs([{ id: "chat", type: "chat", title: "Chat" }]);
@@ -2258,8 +2262,46 @@ function App() {
     }
   }
 
+  async function saveFile(path: string) {
+    if (!selectedWorkspace) return;
+    const content = editedContentsByPath[path];
+    if (content === undefined) return;
+    setSavingFilePath(path);
+    try {
+      await invoke("write_workspace_file", {
+        workspaceId: selectedWorkspace,
+        relativePath: path,
+        content,
+      });
+      // Update the cached content to match saved content and clear dirty state
+      setFileContentsByPath((prev) => ({ ...prev, [path]: content }));
+      setEditedContentsByPath((prev) => {
+        const next = { ...prev };
+        delete next[path];
+        return next;
+      });
+    } catch (err) {
+      console.error("Failed to save file:", err);
+      setError(String(err));
+    } finally {
+      setSavingFilePath(null);
+    }
+  }
+
   function closeCenterTab(tabId: string) {
     if (tabId === "chat") return;
+    // Warn if there are unsaved edits for a file tab
+    if (tabId.startsWith("file:")) {
+      const path = tabId.slice(5);
+      if (editedContentsByPath[path] !== undefined) {
+        if (!window.confirm("You have unsaved changes. Close anyway?")) return;
+        setEditedContentsByPath((prev) => {
+          const next = { ...prev };
+          delete next[path];
+          return next;
+        });
+      }
+    }
     setCenterTabs((prev) => prev.filter((tab) => tab.id !== tabId));
     if (activeCenterTabId === tabId) {
       setActiveCenterTabId("chat");
@@ -3205,6 +3247,9 @@ function App() {
                     >
                       <button onClick={() => setActiveCenterTabId(tab.id)} className="whitespace-nowrap">
                         {tab.title}
+                        {tab.type === "file" && tab.path && editedContentsByPath[tab.path] !== undefined && (
+                          <span className="ml-1 text-amber-400" title="Unsaved changes">*</span>
+                        )}
                       </button>
                       {(tab.type === "file" || tab.type === "diff") && (
                         <button
@@ -3236,14 +3281,89 @@ function App() {
                   ) : activeCenterTab.type === "chat" ? (
                     renderedChatRows
                   ) : activeCenterTab.type === "file" ? (
-                    <div>
-                      <p className="mb-2 truncate text-xs md-text-muted">{activeCenterTab.path}</p>
+                    <div className="flex h-full flex-col">
+                      <div className="mb-2 flex items-center gap-2">
+                        <p className="flex-1 truncate text-xs md-text-muted">{activeCenterTab.path}</p>
+                        {activeCenterTab.path && editedContentsByPath[activeCenterTab.path] !== undefined && (
+                          <>
+                            <span className="text-[10px] font-medium text-amber-400">UNSAVED</span>
+                            <button
+                              onClick={() => {
+                                const p = activeCenterTab.path;
+                                if (p) {
+                                  setEditedContentsByPath((prev) => {
+                                    const next = { ...prev };
+                                    delete next[p];
+                                    return next;
+                                  });
+                                }
+                              }}
+                              className="rounded px-2 py-0.5 text-[10px] md-text-muted transition hover:md-text-primary"
+                            >
+                              Revert
+                            </button>
+                            <button
+                              onClick={() => activeCenterTab.path && saveFile(activeCenterTab.path)}
+                              disabled={savingFilePath === activeCenterTab.path}
+                              className="rounded bg-emerald-600 px-2 py-0.5 text-[10px] text-white transition hover:bg-emerald-500 disabled:opacity-50"
+                            >
+                              {savingFilePath === activeCenterTab.path ? "Saving..." : "Save"}
+                            </button>
+                          </>
+                        )}
+                      </div>
                       {isLoadingFileContent && selectedFilePath === activeCenterTab.path ? (
                         <p className="text-xs md-text-muted">Loading file...</p>
                       ) : (
-                        <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap font-mono text-sm md-text-primary">
-                          {(activeCenterTab.path && fileContentsByPath[activeCenterTab.path]) || "(empty file)"}
-                        </pre>
+                        <textarea
+                          className="flex-1 resize-none overflow-auto whitespace-pre rounded border border-transparent bg-transparent p-2 font-mono text-sm leading-relaxed md-text-primary outline-none focus:md-border"
+                          style={{ minHeight: "70vh", tabSize: 2 }}
+                          spellCheck={false}
+                          value={
+                            activeCenterTab.path && editedContentsByPath[activeCenterTab.path] !== undefined
+                              ? editedContentsByPath[activeCenterTab.path]
+                              : (activeCenterTab.path && fileContentsByPath[activeCenterTab.path]) || ""
+                          }
+                          onChange={(e) => {
+                            const p = activeCenterTab.path;
+                            if (!p) return;
+                            const original = fileContentsByPath[p] ?? "";
+                            // Only mark dirty if content actually differs from the original
+                            if (e.target.value === original) {
+                              setEditedContentsByPath((prev) => {
+                                const next = { ...prev };
+                                delete next[p];
+                                return next;
+                              });
+                            } else {
+                              setEditedContentsByPath((prev) => ({ ...prev, [p]: e.target.value }));
+                            }
+                          }}
+                          onKeyDown={(e) => {
+                            const p = activeCenterTab.path;
+                            // Cmd+S / Ctrl+S to save
+                            if ((e.metaKey || e.ctrlKey) && e.key === "s") {
+                              e.preventDefault();
+                              if (p && editedContentsByPath[p] !== undefined) {
+                                saveFile(p);
+                              }
+                            }
+                            // Tab key inserts spaces instead of changing focus
+                            if (e.key === "Tab") {
+                              e.preventDefault();
+                              if (!p) return;
+                              const target = e.currentTarget;
+                              const start = target.selectionStart;
+                              const end = target.selectionEnd;
+                              const newValue = target.value.substring(0, start) + "  " + target.value.substring(end);
+                              setEditedContentsByPath((prev) => ({ ...prev, [p]: newValue }));
+                              // Restore cursor position after React re-render
+                              requestAnimationFrame(() => {
+                                target.selectionStart = target.selectionEnd = start + 2;
+                              });
+                            }
+                          }}
+                        />
                       )}
                     </div>
                   ) : (
