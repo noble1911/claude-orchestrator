@@ -11,6 +11,11 @@
     "dialog:allow-message",
     "dialog:allow-ask",
     "window-state:allow-restore-state",
-    "window-state:allow-save-window-state"
+    "window-state:allow-save-window-state",
+    "core:window:allow-create",
+    "core:window:allow-set-focus",
+    "core:webview:allow-create-webview-window",
+    "core:webview:allow-get-all-webviews",
+    "core:window:allow-get-all"
   ]
 }
