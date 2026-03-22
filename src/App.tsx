@@ -3845,96 +3845,86 @@ function App() {
           )}
 
           {activeRightTab === "files" && (
-            <div className="space-y-2 text-sm">
-              <p className="md-label-medium">Workspace Files</p>
-              <div className="md-card p-3 md-text-secondary">
-                <p className="truncate text-xs md-text-muted">
-                  {currentWorkspace?.worktreePath || currentRepo?.path || "No active workspace"}
-                </p>
+            <div className="text-sm md-text-secondary">
+              <p className="truncate text-xs md-text-muted">
+                {currentWorkspace?.worktreePath || currentRepo?.path || "No active workspace"}
+              </p>
 
-                {!selectedWorkspace && (
-                  <p className="mt-3 text-xs md-text-muted">Select a workspace to browse files.</p>
+              {!selectedWorkspace && (
+                <p className="mt-3 text-xs md-text-muted">Select a workspace to browse files.</p>
+              )}
+
+              {selectedWorkspace && loadingPaths.has("") && !workspaceFilesByPath[""] && (
+                <p className="mt-3 text-xs md-text-muted">Loading files...</p>
+              )}
+
+              {selectedWorkspace &&
+                workspaceFilesByPath[""] &&
+                workspaceFilesByPath[""].length === 0 && (
+                  <p className="mt-3 text-xs md-text-muted">This workspace is empty.</p>
                 )}
 
-                {selectedWorkspace && loadingPaths.has("") && !workspaceFilesByPath[""] && (
-                  <p className="mt-3 text-xs md-text-muted">Loading files...</p>
-                )}
-
-                {selectedWorkspace &&
-                  workspaceFilesByPath[""] &&
-                  workspaceFilesByPath[""].length === 0 && (
-                    <p className="mt-3 text-xs md-text-muted">This workspace is empty.</p>
-                  )}
-
-                {selectedWorkspace && workspaceFilesByPath[""] && (
-                  <div className="mt-3">{renderFileTree("", 0)}</div>
-                )}
-              </div>
-
-              <p className="text-xs md-text-muted">Click a file to open it as a center tab.</p>
+              {selectedWorkspace && workspaceFilesByPath[""] && (
+                <div className="mt-3">{renderFileTree("", 0)}</div>
+              )}
             </div>
           )}
 
           {activeRightTab === "changes" && (
-            <div className="space-y-2 text-sm">
-              <p className="md-label-medium">Workspace Changes</p>
-              <div className="md-card p-3 md-text-secondary">
-                <div className="mb-2 flex items-center justify-between">
-                  <span className="md-text-secondary">Changed files ({workspaceChanges.length})</span>
-                  <button
-                    onClick={() => selectedWorkspace && loadWorkspaceChanges(selectedWorkspace)}
-                    className="md-btn"
-                  >
-                    Refresh
-                  </button>
-                </div>
-                <p className="truncate text-xs md-text-muted">
-                  {currentWorkspace?.worktreePath || currentRepo?.path || "No active workspace"}
-                </p>
-
-                {isLoadingChanges && <p className="md-text-muted">Loading changes...</p>}
-                {!isLoadingChanges && workspaceChanges.length === 0 && (
-                  <p className="md-text-muted">Working tree is clean.</p>
-                )}
-                {!isLoadingChanges && workspaceChanges.length > 0 && (
-                  <div className="mt-3 max-h-[52vh] space-y-1 overflow-auto pr-1">
-                    {sortedWorkspaceChanges.map((change) => {
-                      const tabId = `diff:${change.status}:${change.oldPath ?? ""}:${change.path}`;
-                      const isActive = activeCenterTabId === tabId;
-                      return (
-                        <div key={`${change.status}:${change.oldPath ?? ""}:${change.path}`}>
-                          <button
-                            onClick={() => {
-                              void openChangedFile(change);
-                            }}
-                            className={`flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle ${
-                              isActive ? "md-surface-strong md-text-strong" : "md-text-secondary"
-                            }`}
-                          >
-                            <span className="material-symbols-rounded !text-base md-text-dim">description</span>
-                            <span className="min-w-0 flex-1">
-                              <span className="flex items-center gap-1">
-                                <span className="truncate font-medium md-text-strong">{change.path.split("/").pop()}</span>
-                                <span className={`w-8 flex-none text-right font-mono text-[11px] ${getChangeStatusClass(change.status)}`}>
-                                  {normalizeChangeStatus(change.status)}
-                                </span>
-                              </span>
-                              {change.path.includes("/") && (
-                                <span className="block truncate text-[11px] md-text-muted">{change.path.substring(0, change.path.lastIndexOf("/"))}</span>
-                              )}
-                            </span>
-                          </button>
-                          {change.oldPath && (
-                            <p className="truncate pl-7 text-[11px] md-text-muted">from: {change.oldPath}</p>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+            <div className="text-sm md-text-secondary">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="md-text-secondary">Changed files ({workspaceChanges.length})</span>
+                <button
+                  onClick={() => selectedWorkspace && loadWorkspaceChanges(selectedWorkspace)}
+                  className="md-btn"
+                >
+                  Refresh
+                </button>
               </div>
+              <p className="truncate text-xs md-text-muted">
+                {currentWorkspace?.worktreePath || currentRepo?.path || "No active workspace"}
+              </p>
 
-              <p className="text-xs md-text-muted">Click any file here to open its diff in the center pane.</p>
+              {isLoadingChanges && <p className="md-text-muted">Loading changes...</p>}
+              {!isLoadingChanges && workspaceChanges.length === 0 && (
+                <p className="md-text-muted">Working tree is clean.</p>
+              )}
+              {!isLoadingChanges && workspaceChanges.length > 0 && (
+                <div className="mt-3 max-h-[52vh] space-y-1 overflow-auto pr-1">
+                  {sortedWorkspaceChanges.map((change) => {
+                    const tabId = `diff:${change.status}:${change.oldPath ?? ""}:${change.path}`;
+                    const isActive = activeCenterTabId === tabId;
+                    return (
+                      <div key={`${change.status}:${change.oldPath ?? ""}:${change.path}`}>
+                        <button
+                          onClick={() => {
+                            void openChangedFile(change);
+                          }}
+                          className={`flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle ${
+                            isActive ? "md-surface-strong md-text-strong" : "md-text-secondary"
+                          }`}
+                        >
+                          <span className="material-symbols-rounded !text-base md-text-dim">description</span>
+                          <span className="min-w-0 flex-1">
+                            <span className="flex items-center gap-1">
+                              <span className="truncate font-medium md-text-strong">{change.path.split("/").pop()}</span>
+                              <span className={`w-8 flex-none text-right font-mono text-[11px] ${getChangeStatusClass(change.status)}`}>
+                                {normalizeChangeStatus(change.status)}
+                              </span>
+                            </span>
+                            {change.path.includes("/") && (
+                              <span className="block truncate text-[11px] md-text-muted">{change.path.substring(0, change.path.lastIndexOf("/"))}</span>
+                            )}
+                          </span>
+                        </button>
+                        {change.oldPath && (
+                          <p className="truncate pl-7 text-[11px] md-text-muted">from: {change.oldPath}</p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
