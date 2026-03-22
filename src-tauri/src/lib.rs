@@ -1557,6 +1557,7 @@ fn auth_env_feedback(env_map: &HashMap<String, String>) -> (String, Option<Strin
 fn normalize_permission_mode(mode: Option<&str>) -> &'static str {
     match mode.map(|v| v.trim()) {
         Some("dangerouslySkipPermissions") => "dangerouslySkipPermissions",
+        Some("bypassPermissions") => "bypassPermissions",
         Some("plan") => "plan",
         Some("default") => "default",
         Some("acceptEdits") => "acceptEdits",
@@ -2656,7 +2657,11 @@ async fn send_message_to_agent(
         for (k, v) in &debug_env {
             eprintln!("[orchestrator] env: {}={}", k, v);
         }
-        cmd.stdin(Stdio::piped());
+        if interactive {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -5323,7 +5328,11 @@ async fn handle_ws_commands(
                                     &message,
                                 );
 
-                                cmd.stdin(Stdio::piped());
+                                if interactive {
+                                    cmd.stdin(Stdio::piped());
+                                } else {
+                                    cmd.stdin(Stdio::null());
+                                }
                                 cmd.stdout(Stdio::piped());
                                 cmd.stderr(Stdio::piped());
                                 let mut child = match cmd.spawn() {
