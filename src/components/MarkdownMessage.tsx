@@ -1,9 +1,28 @@
-import { memo, useMemo, type MouseEvent as ReactMouseEvent } from "react";
+import { memo, useMemo, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import MarkdownCodeBlock from "./MarkdownCodeBlock";
 import { openExternalHref } from "../utils";
+
+/** Splits markdown content into normal segments and insight blocks for v2 rendering */
+function splitInsightBlocks(content: string): Array<{ type: "text" | "insight"; content: string }> {
+  const segments: Array<{ type: "text" | "insight"; content: string }> = [];
+  const pattern = /`★ Insight[─ ]*`\n([\s\S]*?)\n`[─]+`/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ type: "text", content: content.slice(lastIndex, match.index) });
+    }
+    segments.push({ type: "insight", content: match[1].trim() });
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < content.length) {
+    segments.push({ type: "text", content: content.slice(lastIndex) });
+  }
+  return segments;
+}
 
 function buildMarkdownComponents(v2: boolean): Components {
   return {
@@ -101,6 +120,28 @@ function buildMarkdownComponents(v2: boolean): Components {
 
 const remarkPlugins = [remarkGfm, remarkBreaks];
 
+function MarkdownSegment({ content, components }: { content: string; components: Components }) {
+  return (
+    <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+      {content}
+    </ReactMarkdown>
+  );
+}
+
+function InsightBlock({ content, components }: { content: string; components: Components }): ReactNode {
+  return (
+    <div className="my-1 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.04] overflow-hidden">
+      <div className="flex items-center gap-2 border-b border-emerald-500/15 bg-emerald-500/[0.06] px-3.5 py-1.5">
+        <span className="text-[12px] text-emerald-400">★</span>
+        <span className="text-[11px] font-medium tracking-wide text-emerald-400/80">Insight</span>
+      </div>
+      <div className="px-3.5 py-2.5">
+        <MarkdownSegment content={content} components={components} />
+      </div>
+    </div>
+  );
+}
+
 const MarkdownMessage = memo(function MarkdownMessage({ content, v2 = false }: { content: string; v2?: boolean }) {
   const normalizedContent = content.replace(/\r\n/g, "\n");
   if (!normalizedContent.trim()) {
@@ -108,6 +149,24 @@ const MarkdownMessage = memo(function MarkdownMessage({ content, v2 = false }: {
   }
 
   const components = useMemo(() => buildMarkdownComponents(v2), [v2]);
+
+  if (v2) {
+    const segments = splitInsightBlocks(normalizedContent);
+    const hasInsights = segments.some((s) => s.type === "insight");
+    if (hasInsights) {
+      return (
+        <div className="space-y-3 select-text">
+          {segments.map((seg, i) =>
+            seg.type === "insight" ? (
+              <InsightBlock key={i} content={seg.content} components={components} />
+            ) : seg.content.trim() ? (
+              <MarkdownSegment key={i} content={seg.content} components={components} />
+            ) : null
+          )}
+        </div>
+      );
+    }
+  }
 
   return (
     <div className="space-y-3 select-text">
