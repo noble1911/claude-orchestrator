@@ -3862,6 +3862,19 @@ fn read_file_contents(path: &std::path::Path, max_bytes: usize) -> Result<String
         (&bytes[..], false)
     };
 
+    // Reject binary files: check for nul bytes in the first 8KB (or full slice if smaller).
+    // Nul bytes are valid UTF-8 but cannot appear in CLI arguments (C strings),
+    // and indicate binary content (images, compiled files, etc.) that isn't useful as text.
+    let check_len = slice.len().min(8192);
+    if slice[..check_len].contains(&0u8) {
+        return Err(format!(
+            "Binary file cannot be attached: {}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string())
+        ));
+    }
+
     let mut content = String::from_utf8_lossy(slice).to_string();
     if truncated {
         content.push_str("\n\n[truncated]");
