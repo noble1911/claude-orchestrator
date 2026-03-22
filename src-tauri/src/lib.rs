@@ -3963,47 +3963,81 @@ async fn list_workspace_changes(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<WorkspaceChangeEntry>, String> {
-    let workspace_root = {
+    let (workspace_root, default_branch) = {
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
             .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.worktree_path.clone()
+        let repos = state.repositories.read();
+        let repo = repos
+            .get(&workspace.repo_id)
+            .ok_or("Repository not found")?;
+        (workspace.worktree_path.clone(), repo.default_branch.clone())
     };
 
-    let output = Command::new("git")
-        .args(["status", "--porcelain=1", "--untracked-files=all"])
-        .current_dir(&workspace_root)
-        .output()
-        .map_err(|e| format!("Failed to run git status: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Git status failed: {}", stderr));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let compare_ref = format!("origin/{}", default_branch);
     let mut changes = Vec::new();
 
-    for line in stdout.lines() {
-        if line.len() < 3 {
-            continue;
-        }
+    // Get all changes (committed + staged + unstaged) relative to origin/<default_branch>
+    let diff_output = Command::new("git")
+        .args(["diff", "--name-status", &compare_ref])
+        .current_dir(&workspace_root)
+        .output()
+        .map_err(|e| format!("Failed to run git diff: {}", e))?;
 
-        let status = line[0..2].to_string();
-        let rest = line[3..].to_string();
-        if let Some((old_path, new_path)) = rest.split_once(" -> ") {
-            changes.push(WorkspaceChangeEntry {
-                status,
-                path: new_path.to_string(),
-                old_path: Some(old_path.to_string()),
-            });
-        } else {
-            changes.push(WorkspaceChangeEntry {
-                status,
-                path: rest,
-                old_path: None,
-            });
+    if diff_output.status.success() {
+        let stdout = String::from_utf8_lossy(&diff_output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Format: "M\tpath" or "R100\told_path\tnew_path"
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() >= 2 {
+                let status_code = parts[0].to_string();
+                if status_code.starts_with('R') && parts.len() == 3 {
+                    changes.push(WorkspaceChangeEntry {
+                        status: format!("R "),
+                        path: parts[2].to_string(),
+                        old_path: Some(parts[1].to_string()),
+                    });
+                } else {
+                    // Map git diff status codes to two-char codes matching git status format
+                    let status = match status_code.as_str() {
+                        "M" => " M".to_string(),
+                        "A" => "A ".to_string(),
+                        "D" => " D".to_string(),
+                        other => format!("{: <2}", other),
+                    };
+                    changes.push(WorkspaceChangeEntry {
+                        status,
+                        path: parts[1].to_string(),
+                        old_path: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Also pick up untracked files (not yet committed)
+    let untracked_output = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(&workspace_root)
+        .output()
+        .map_err(|e| format!("Failed to list untracked files: {}", e))?;
+
+    if untracked_output.status.success() {
+        let stdout = String::from_utf8_lossy(&untracked_output.stdout);
+        for line in stdout.lines() {
+            let path = line.trim().to_string();
+            if !path.is_empty() && !changes.iter().any(|c| c.path == path) {
+                changes.push(WorkspaceChangeEntry {
+                    status: "??".to_string(),
+                    path,
+                    old_path: None,
+                });
+            }
         }
     }
 
@@ -4018,13 +4052,19 @@ async fn read_workspace_change_diff(
     status: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let workspace_root = {
+    let (workspace_root, default_branch) = {
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
             .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.worktree_path.clone()
+        let repos = state.repositories.read();
+        let repo = repos
+            .get(&workspace.repo_id)
+            .ok_or("Repository not found")?;
+        (workspace.worktree_path.clone(), repo.default_branch.clone())
     };
+
+    let compare_ref = format!("origin/{}", default_branch);
 
     let status_trimmed = status.unwrap_or_default().trim().to_string();
     if status_trimmed == "??" {
@@ -4063,7 +4103,7 @@ async fn read_workspace_change_diff(
 
     let mut cmd = Command::new("git");
     cmd.current_dir(&workspace_root);
-    cmd.args(["diff", "--no-color", "HEAD", "--"]);
+    cmd.args(["diff", "--no-color", &compare_ref, "--"]);
     if let Some(old) = old_path.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
         cmd.arg(old);
     }
@@ -4799,10 +4839,20 @@ async fn handle_ws_commands(
             }
 
             ServerCommand::ListChanges { workspace_id, response_tx } => {
-                let workspace_root = {
+                let (workspace_root, default_branch) = {
                     let workspaces = state.workspaces.read();
                     match workspaces.get(&workspace_id) {
-                        Some(ws) => ws.worktree_path.clone(),
+                        Some(ws) => {
+                            let repos = state.repositories.read();
+                            match repos.get(&ws.repo_id) {
+                                Some(repo) => (ws.worktree_path.clone(), repo.default_branch.clone()),
+                                None => {
+                                    let response = WsResponse::Error { message: "Repository not found".to_string() };
+                                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                                    continue;
+                                }
+                            }
+                        }
                         None => {
                             let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
                             let _ = response_tx.send(serde_json::to_string(&response).unwrap());
@@ -4810,38 +4860,64 @@ async fn handle_ws_commands(
                         }
                     }
                 };
-                let output = match Command::new("git")
-                    .args(["status", "--porcelain=1", "--untracked-files=all"])
+                let compare_ref = format!("origin/{}", default_branch);
+                let mut changes = Vec::new();
+
+                // Get all changes relative to origin/<default_branch>
+                let diff_output = match Command::new("git")
+                    .args(["diff", "--name-status", &compare_ref])
                     .current_dir(&workspace_root)
                     .output()
                 {
                     Ok(o) => o,
                     Err(e) => {
-                        let response = WsResponse::Error { message: format!("Failed to run git status: {}", e) };
+                        let response = WsResponse::Error { message: format!("Failed to run git diff: {}", e) };
                         let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                         continue;
                     }
                 };
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let response = WsResponse::Error { message: format!("Git status failed: {}", stderr) };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut changes = Vec::new();
-                for line in stdout.lines() {
-                    if line.len() < 3 {
-                        continue;
+                if diff_output.status.success() {
+                    let stdout = String::from_utf8_lossy(&diff_output.stdout);
+                    for line in stdout.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                        if parts.len() >= 2 {
+                            let status_code = parts[0].to_string();
+                            if status_code.starts_with('R') && parts.len() == 3 {
+                                changes.push(ChangeInfo { status: "R ".to_string(), path: parts[2].to_string(), old_path: Some(parts[1].to_string()) });
+                            } else {
+                                let status = match status_code.as_str() {
+                                    "M" => " M".to_string(),
+                                    "A" => "A ".to_string(),
+                                    "D" => " D".to_string(),
+                                    other => format!("{: <2}", other),
+                                };
+                                changes.push(ChangeInfo { status, path: parts[1].to_string(), old_path: None });
+                            }
+                        }
                     }
-                    let status = line[0..2].to_string();
-                    let rest = line[3..].to_string();
-                    if let Some((old_path, new_path)) = rest.split_once(" -> ") {
-                        changes.push(ChangeInfo { status, path: new_path.to_string(), old_path: Some(old_path.to_string()) });
-                    } else {
-                        changes.push(ChangeInfo { status, path: rest, old_path: None });
+                }
+
+                // Also pick up untracked files
+                if let Ok(untracked_output) = Command::new("git")
+                    .args(["ls-files", "--others", "--exclude-standard"])
+                    .current_dir(&workspace_root)
+                    .output()
+                {
+                    if untracked_output.status.success() {
+                        let stdout = String::from_utf8_lossy(&untracked_output.stdout);
+                        for line in stdout.lines() {
+                            let path = line.trim().to_string();
+                            if !path.is_empty() && !changes.iter().any(|c| c.path == path) {
+                                changes.push(ChangeInfo { status: "??".to_string(), path, old_path: None });
+                            }
+                        }
                     }
                 }
+
                 let response = WsResponse::ChangesList { workspace_id, changes };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
