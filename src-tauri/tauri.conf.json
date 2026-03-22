@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.ron.claude-orchestrator",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "cd mcp-permission-bridge && npm install --prefer-offline && npm run build && cd .. && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build:web && npm run build",
+    "beforeBuildCommand": "cd mcp-permission-bridge && npm run build && cd .. && npm run build:web && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -39,7 +39,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../web/dist": "web-dist/"
+      "../web/dist": "web-dist/",
+      "../mcp-permission-bridge/dist": "mcp-permission-bridge/dist/"
     },
     "macOS": {
       "minimumSystemVersion": "11.0"
