@@ -55,6 +55,9 @@ jobs:
       - name: Build web client
         run: npm ci --prefix web && npm run build:web
 
+      - name: Build MCP permission bridge
+        run: cd mcp-permission-bridge && npm install && npm run build
+
       - name: Check Tauri backend
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
