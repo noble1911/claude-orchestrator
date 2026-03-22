@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, UdpSocket};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
@@ -55,6 +55,8 @@ pub struct AppState {
     agents: RwLock<HashMap<String, Agent>>,
     /// Tracks child process PIDs per agent so we can send SIGINT to interrupt.
     child_pids: RwLock<HashMap<String, u32>>,
+    /// Stdin handles for Claude CLI processes, used to send permission responses.
+    agent_stdin: RwLock<HashMap<String, Arc<Mutex<ChildStdin>>>>,
     ws_server: Option<Arc<WebSocketServer>>,
     http_server: Option<Arc<HttpServer>>,
     ws_server_running: RwLock<bool>,
@@ -71,6 +73,7 @@ impl AppState {
             workspaces: RwLock::new(HashMap::new()),
             agents: RwLock::new(HashMap::new()),
             child_pids: RwLock::new(HashMap::new()),
+            agent_stdin: RwLock::new(HashMap::new()),
             ws_server: None,
             http_server: None,
             ws_server_running: RwLock::new(false),
@@ -1134,6 +1137,10 @@ fn claude_supports_permission_mode(claude_path: &str) -> bool {
     claude_supports_option(claude_path, "--permission-mode")
 }
 
+fn claude_supports_permission_prompt_tool(claude_path: &str) -> bool {
+    claude_supports_option(claude_path, "--permission-prompt-tool")
+}
+
 fn claude_supports_model_option(claude_path: &str) -> bool {
     claude_supports_option(claude_path, "--model")
 }
@@ -1142,6 +1149,14 @@ fn claude_supports_resume_option(claude_path: &str) -> bool {
     claude_supports_option(claude_path, "--resume")
 }
 
+/// Permission modes that require interactive stdin for tool-approval control messages.
+fn needs_interactive_permissions(permission_mode: &str) -> bool {
+    matches!(permission_mode, "default" | "acceptEdits")
+}
+
+/// Build the CLI arguments for a Claude request.  Returns `true` when the
+/// caller must send the prompt via stdin (interactive permission mode) rather
+/// than as a `-p` CLI arg.
 fn append_claude_request_args(
     cmd: &mut Command,
     claude_path: &str,
@@ -1150,22 +1165,27 @@ fn append_claude_request_args(
     effort: Option<&str>,
     claude_session_id: Option<&str>,
     prompt: &str,
-) {
+) -> bool {
+    let interactive = needs_interactive_permissions(permission_mode)
+        && claude_supports_permission_prompt_tool(claude_path);
+
     cmd.arg("--print");
     if claude_supports_stream_json(claude_path) {
-        // Claude CLI requires --verbose when using --output-format=stream-json.
-        // Keep this coupled so we don't regress into runtime arg errors.
         cmd.arg("--verbose");
         cmd.args(["--output-format", "stream-json"]);
     }
-    if claude_supports_permission_mode(claude_path) {
+    if permission_mode == "dangerouslySkipPermissions" {
+        cmd.arg("--dangerously-skip-permissions");
+    } else if claude_supports_permission_mode(claude_path) {
         cmd.args(["--permission-mode", permission_mode]);
     }
-    // Always pass --model and --resume when values are present.
-    // These flags have been stable since Claude CLI ~2.0 and gating them
-    // behind `claude --help` feature detection is fragile: --help can fail
-    // in the Tauri subprocess environment (no TTY, restricted env), causing
-    // critical flags to be silently dropped.
+    if interactive {
+        // Enable bidirectional stream-json so we can receive control_request
+        // events (permission prompts) on stdout and send control_response
+        // replies on stdin.
+        cmd.args(["--permission-prompt-tool", "stdio"]);
+        cmd.args(["--input-format", "stream-json"]);
+    }
     if let Some(model) = model {
         cmd.args(["--model", model]);
     }
@@ -1175,7 +1195,52 @@ fn append_claude_request_args(
     if let Some(claude_sid) = claude_session_id {
         cmd.args(["--resume", claude_sid]);
     }
-    cmd.args(["-p", prompt]);
+    if !interactive {
+        cmd.args(["-p", prompt]);
+    }
+    interactive
+}
+
+/// Write a JSON user message to the Claude CLI stdin (for --input-format stream-json).
+fn write_stdin_user_message(stdin: &mut ChildStdin, prompt: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let msg = serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": prompt },
+    });
+    writeln!(stdin, "{}", msg)?;
+    stdin.flush()
+}
+
+/// Write a permission control_response to the Claude CLI stdin.
+fn write_stdin_permission_response(
+    stdin: &mut ChildStdin,
+    request_id: &str,
+    allow: bool,
+    original_input: Option<&Value>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let response_body = if allow {
+        let mut r = serde_json::json!({ "behavior": "allow" });
+        if let Some(input) = original_input {
+            r.as_object_mut()
+                .unwrap()
+                .insert("updatedInput".to_string(), input.clone());
+        }
+        r
+    } else {
+        serde_json::json!({ "behavior": "deny", "message": "User denied this action" })
+    };
+    let msg = serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": response_body,
+        }
+    });
+    writeln!(stdin, "{}", msg)?;
+    stdin.flush()
 }
 
 fn load_cli_shell_env() -> HashMap<String, String> {
@@ -1491,8 +1556,13 @@ fn auth_env_feedback(env_map: &HashMap<String, String>) -> (String, Option<Strin
 
 fn normalize_permission_mode(mode: Option<&str>) -> &'static str {
     match mode.map(|v| v.trim()) {
+        Some("dangerouslySkipPermissions") => "dangerouslySkipPermissions",
         Some("plan") => "plan",
-        _ => "bypassPermissions",
+        Some("default") => "default",
+        Some("acceptEdits") => "acceptEdits",
+        Some("dontAsk") => "dontAsk",
+        Some("auto") => "auto",
+        _ => "dangerouslySkipPermissions",
     }
 }
 
@@ -2410,6 +2480,57 @@ async fn interrupt_agent(
     }
 }
 
+/// Shared helper: send a permission control_response to the Claude CLI stdin.
+/// Used by both the Tauri command and the WebSocket handler.
+fn send_permission_response(
+    app_state: &AppState,
+    agent_id: &str,
+    request_id: &str,
+    allow: bool,
+    deny_message: Option<String>,
+) -> Result<(), String> {
+    let handle = {
+        let stdins = app_state.agent_stdin.read();
+        stdins.get(agent_id).cloned()
+    };
+    let handle = handle.ok_or("No active CLI process for this agent")?;
+
+    let response_body = if allow {
+        serde_json::json!({ "behavior": "allow" })
+    } else {
+        serde_json::json!({
+            "behavior": "deny",
+            "message": deny_message.unwrap_or_else(|| "User denied this action".to_string())
+        })
+    };
+    let msg = serde_json::json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": response_body,
+        }
+    });
+
+    let mut stdin = handle.lock().map_err(|e| format!("Stdin lock poisoned: {}", e))?;
+    use std::io::Write;
+    writeln!(stdin, "{}", msg).map_err(|e| format!("Failed to write to stdin: {}", e))?;
+    stdin.flush().map_err(|e| format!("Failed to flush stdin: {}", e))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn respond_to_permission(
+    agent_id: String,
+    request_id: String,
+    allow: bool,
+    deny_message: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    send_permission_response(&state, &agent_id, &request_id, allow, deny_message)
+}
+
 #[tauri::command]
 async fn send_message_to_agent(
     agent_id: String,
@@ -2511,7 +2632,7 @@ async fn send_message_to_agent(
         let mut cmd = Command::new(&claude_path);
         cmd.current_dir(&workspace_path);
         configure_cli_env(&mut cmd, &effective_env);
-        append_claude_request_args(
+        let interactive = append_claude_request_args(
             &mut cmd,
             &claude_path,
             permission_mode,
@@ -2535,6 +2656,7 @@ async fn send_message_to_agent(
         for (k, v) in &debug_env {
             eprintln!("[orchestrator] env: {}={}", k, v);
         }
+        cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -2590,6 +2712,43 @@ async fn send_message_to_agent(
         // Store child PID so we can send SIGINT to interrupt
         app_state_for_pids.child_pids.write().insert(agent_id_clone.clone(), child.id());
 
+        // Store stdin handle so we can write permission responses
+        let stdin_handle = child.stdin.take().map(|s| Arc::new(Mutex::new(s)));
+        if let Some(ref handle) = stdin_handle {
+            app_state_for_pids
+                .agent_stdin
+                .write()
+                .insert(agent_id_clone.clone(), handle.clone());
+        }
+
+        // In interactive permission mode, send the user message via stdin
+        // since we didn't pass it as a `-p` CLI argument.
+        if interactive {
+            if let Some(ref handle) = stdin_handle {
+                match handle.lock() {
+                    Ok(mut stdin) => {
+                        if let Err(e) = write_stdin_user_message(&mut stdin, &message_clone) {
+                            eprintln!("[orchestrator] Failed to write user message to stdin: {}", e);
+                            emit_agent_message(
+                                &app,
+                                &db,
+                                &session_id,
+                                &agent_id_clone,
+                                &workspace_id,
+                                &ws_server,
+                                format!("Error sending message to Claude: {}", e),
+                                true,
+                                "error",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[orchestrator] Stdin lock poisoned: {}", e);
+                    }
+                }
+            }
+        }
+
         let mut assistant_delta_text = String::new();
         let mut latest_assistant_snapshot: Option<String> = None;
         let mut result_text_fallback: Option<String> = None;
@@ -2640,6 +2799,43 @@ async fn send_message_to_agent(
 
                     // Keep-alive event; no UI action required.
                     if payload_type == "ping" {
+                        continue;
+                    }
+
+                    // Permission prompt: the CLI is blocked waiting for
+                    // a control_response on stdin.  Forward the request to
+                    // the frontend and continue reading the stream.
+                    if payload_type == "control_request" {
+                        let request = payload.get("request").cloned().unwrap_or(Value::Null);
+                        let tool_name = request.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                        let request_id = payload.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if request_id.is_empty() {
+                            eprintln!("[orchestrator] control_request missing request_id, skipping");
+                            continue;
+                        }
+                        let permission_event = PermissionRequestEvent {
+                            workspace_id: workspace_id.clone(),
+                            agent_id: agent_id_clone.clone(),
+                            request_id,
+                            tool_name: tool_name.clone(),
+                            tool_input: request.get("input").cloned().unwrap_or(Value::Null),
+                            tool_use_id: request.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        };
+                        let _ = app.emit("permission-request", &permission_event);
+                        if let Some(ws) = &ws_server {
+                            ws.broadcast_to_workspace(&workspace_id, &WsResponse::PermissionRequest(permission_event));
+                        }
+                        emit_agent_message(
+                            &app,
+                            &db,
+                            &session_id,
+                            &agent_id_clone,
+                            &workspace_id,
+                            &ws_server,
+                            format!("🔒 Permission requested: **{}**", tool_name),
+                            false,
+                            "system",
+                        );
                         continue;
                     }
 
@@ -2871,6 +3067,11 @@ async fn send_message_to_agent(
                 }
             }
         }
+
+        // Drop the stdin handle before wait() so the CLI sees EOF if it's
+        // reading stdin (prevents deadlock when process exits normally).
+        drop(stdin_handle);
+        app_state_for_pids.agent_stdin.write().remove(&agent_id_clone);
 
         let status = match child.wait() {
             Ok(s) => s,
@@ -5112,7 +5313,7 @@ async fn handle_ws_commands(
                                 let model = resolved_model.as_deref();
                                 let effort = requested_effort.as_deref();
                                 configure_cli_env(&mut cmd, &effective_env);
-                                append_claude_request_args(
+                                let interactive = append_claude_request_args(
                                     &mut cmd,
                                     &claude_path,
                                     permission_mode,
@@ -5122,6 +5323,7 @@ async fn handle_ws_commands(
                                     &message,
                                 );
 
+                                cmd.stdin(Stdio::piped());
                                 cmd.stdout(Stdio::piped());
                                 cmd.stderr(Stdio::piped());
                                 let mut child = match cmd.spawn() {
@@ -5175,6 +5377,31 @@ async fn handle_ws_commands(
 
                                 // Store child PID for interrupt support
                                 app_state_clone.child_pids.write().insert(agent_id_clone.clone(), child.id());
+
+                                // Store stdin handle for permission responses
+                                let stdin_handle = child.stdin.take().map(|s| Arc::new(Mutex::new(s)));
+                                if let Some(ref handle) = stdin_handle {
+                                    app_state_clone
+                                        .agent_stdin
+                                        .write()
+                                        .insert(agent_id_clone.clone(), handle.clone());
+                                }
+
+                                // In interactive permission mode, send the user message via stdin
+                                if interactive {
+                                    if let Some(ref handle) = stdin_handle {
+                                        match handle.lock() {
+                                            Ok(mut stdin) => {
+                                                if let Err(e) = write_stdin_user_message(&mut stdin, &message) {
+                                                    eprintln!("[orchestrator] Failed to write user message to stdin: {}", e);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[orchestrator] Stdin lock poisoned: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
 
                                 let mut assistant_delta_text = String::new();
                                 let mut latest_assistant_snapshot: Option<String> = None;
@@ -5233,6 +5460,40 @@ async fn handle_ws_commands(
                                                 .unwrap_or("");
 
                                             if payload_type == "ping" {
+                                                continue;
+                                            }
+
+                                            if payload_type == "control_request" {
+                                                let request = payload.get("request").cloned().unwrap_or(Value::Null);
+                                                let tool_name = request.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                                                let request_id = payload.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                if request_id.is_empty() {
+                                                    eprintln!("[orchestrator] control_request missing request_id, skipping");
+                                                    continue;
+                                                }
+                                                let permission_event = PermissionRequestEvent {
+                                                    workspace_id: workspace_id_clone.clone(),
+                                                    agent_id: agent_id_clone.clone(),
+                                                    request_id,
+                                                    tool_name: tool_name.clone(),
+                                                    tool_input: request.get("input").cloned().unwrap_or(Value::Null),
+                                                    tool_use_id: request.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                                };
+                                                let _ = app_clone.emit("permission-request", &permission_event);
+                                                if let Some(ws) = &ws_server {
+                                                    ws.broadcast_to_workspace(&workspace_id_clone, &WsResponse::PermissionRequest(permission_event));
+                                                }
+                                                emit_agent_message(
+                                                    &app_clone,
+                                                    &db,
+                                                    &session_id,
+                                                    &agent_id_clone,
+                                                    &workspace_id_clone,
+                                                    &ws_server,
+                                                    format!("🔒 Permission requested: **{}**", tool_name),
+                                                    false,
+                                                    "system",
+                                                );
                                                 continue;
                                             }
 
@@ -5482,6 +5743,10 @@ async fn handle_ws_commands(
                                         }
                                     }
                                 }
+
+                                // Drop stdin handle before wait() to prevent deadlock
+                                drop(stdin_handle);
+                                app_state_clone.agent_stdin.write().remove(&agent_id_clone);
 
                                 let status = match child.wait() {
                                     Ok(s) => s,
@@ -5965,6 +6230,30 @@ async fn handle_ws_commands(
                 }
             }
 
+            ServerCommand::RespondToPermission { workspace_id, request_id, allow, deny_message, response_tx } => {
+                let agent_id = {
+                    let agents = state.agents.read();
+                    agents.values()
+                        .find(|a| a.workspace_id == workspace_id)
+                        .map(|a| a.id.clone())
+                };
+                if let Some(agent_id) = agent_id {
+                    match send_permission_response(&state, &agent_id, &request_id, allow, deny_message) {
+                        Ok(()) => {
+                            let resp = serde_json::json!({ "type": "ok" });
+                            let _ = response_tx.send(serde_json::to_string(&resp).unwrap());
+                        }
+                        Err(e) => {
+                            let resp = WsResponse::Error { message: e };
+                            let _ = response_tx.send(serde_json::to_string(&resp).unwrap());
+                        }
+                    }
+                } else {
+                    let resp = WsResponse::Error { message: "No agent found for workspace".to_string() };
+                    let _ = response_tx.send(serde_json::to_string(&resp).unwrap());
+                }
+            }
+
             ServerCommand::SetWorkspaceStatus { workspace_id, status, response_tx } => {
                 let new_status = match status.as_str() {
                     "idle" => WorkspaceStatus::Idle,
@@ -6271,6 +6560,7 @@ pub fn run() {
             start_agent,
             stop_agent,
             interrupt_agent,
+            respond_to_permission,
             send_message_to_agent,
             get_agent_messages,
             open_workspace_in_editor,
@@ -6301,13 +6591,21 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn normalize_permission_mode_defaults_to_bypass() {
-        assert_eq!(normalize_permission_mode(None), "bypassPermissions");
+    fn normalize_permission_mode_defaults_to_skip() {
+        assert_eq!(normalize_permission_mode(None), "dangerouslySkipPermissions");
+        assert_eq!(
+            normalize_permission_mode(Some("dangerouslySkipPermissions")),
+            "dangerouslySkipPermissions"
+        );
         assert_eq!(
             normalize_permission_mode(Some("bypassPermissions")),
             "bypassPermissions"
         );
         assert_eq!(normalize_permission_mode(Some("plan")), "plan");
+        assert_eq!(normalize_permission_mode(Some("default")), "default");
+        assert_eq!(normalize_permission_mode(Some("acceptEdits")), "acceptEdits");
+        assert_eq!(normalize_permission_mode(Some("dontAsk")), "dontAsk");
+        assert_eq!(normalize_permission_mode(Some("auto")), "auto");
     }
 
     #[test]

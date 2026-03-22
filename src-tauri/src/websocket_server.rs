@@ -62,6 +62,12 @@ pub enum WsMessage {
     ToggleWorkspacePin { workspace_id: String },
     UpdateWorkspaceNotes { workspace_id: String, notes: String },
     UpdateWorkspaceOrder { workspace_id: String, display_order: i32 },
+    RespondToPermission {
+        workspace_id: String,
+        request_id: String,
+        allow: bool,
+        deny_message: Option<String>,
+    },
     ReadChangeDiff { workspace_id: String, file_path: String },
     RunTerminalCommand { workspace_id: String, command: String },
 }
@@ -165,6 +171,7 @@ pub enum WsResponse {
         stderr: String,
         exit_code: Option<i32>,
     },
+    PermissionRequest(crate::types::PermissionRequestEvent),
     Error {
         message: String,
     },
@@ -256,6 +263,7 @@ pub enum ServerCommand {
     UpdateWorkspaceNotes { workspace_id: String, notes: String, response_tx: mpsc::UnboundedSender<String> },
     UpdateWorkspaceOrder { workspace_id: String, display_order: i32, response_tx: mpsc::UnboundedSender<String> },
     ReadChangeDiff { workspace_id: String, file_path: String, response_tx: mpsc::UnboundedSender<String> },
+    RespondToPermission { workspace_id: String, request_id: String, allow: bool, deny_message: Option<String>, response_tx: mpsc::UnboundedSender<String> },
     RunTerminalCommand { workspace_id: String, command: String, response_tx: mpsc::UnboundedSender<String> },
     ClientCountChanged { connected_clients: usize },
 }
@@ -685,6 +693,21 @@ async fn handle_connection(
                             let (response_tx, mut response_rx) = mpsc::unbounded_channel();
                             if message_tx.send(ServerCommand::InterruptAgent {
                                 workspace_id,
+                                response_tx,
+                            }).is_ok() {
+                                if let Some(response) = response_rx.recv().await {
+                                    let _ = tx.send(response);
+                                }
+                            }
+                        }
+
+                        WsMessage::RespondToPermission { workspace_id, request_id, allow, deny_message } => {
+                            let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                            if message_tx.send(ServerCommand::RespondToPermission {
+                                workspace_id,
+                                request_id,
+                                allow,
+                                deny_message,
                                 response_tx,
                             }).is_ok() {
                                 if let Some(response) = response_rx.recv().await {

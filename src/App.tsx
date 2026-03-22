@@ -54,7 +54,6 @@ import {
   DEFAULT_MODEL_ID,
   PROMPT_SHORTCUTS_STORAGE_KEY,
   ENV_OVERRIDES_STORAGE_KEY,
-  CLAUDE_MODE_STORAGE_KEY,
   MODEL_STORAGE_KEY,
   MODEL_BY_WORKSPACE_STORAGE_KEY,
   THINKING_MODE_STORAGE_KEY,
@@ -72,6 +71,8 @@ import {
   CHAT_FONT_SIZE_DEFAULT,
   V2_CHAT_STORAGE_KEY,
   THINKING_MODE_OPTIONS,
+  PERMISSION_MODE_OPTIONS,
+  PERMISSION_MODE_STORAGE_KEY,
   CUSTOM_CHECKS_STORAGE_KEY,
 } from "./constants";
 import {
@@ -123,7 +124,6 @@ import type {
   SkillShortcut,
   SkillCatalogResponse,
   CenterTab,
-  ClaudeMode,
   EditorKind,
   WorkspaceOpenTarget,
   SkillScope,
@@ -132,10 +132,12 @@ import type {
   ChatRow,
   WorkspaceGroup,
   ShortcutKeys,
+  PermissionRequestEvent,
 } from "./types";
 import LinkifiedInlineText from "./components/LinkifiedInlineText";
 import MarkdownMessage from "./components/MarkdownMessage";
 import QuestionCard from "./components/QuestionCard";
+import PermissionCard from "./components/PermissionCard";
 import SortableWorkspaceItem from "./components/SortableWorkspaceItem";
 import GroupDropZone from "./components/GroupDropZone";
 import ThinkingTimer from "./components/ThinkingTimer";
@@ -164,6 +166,7 @@ function App() {
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
+  const [pendingPermissions, setPendingPermissions] = useState<Record<string, PermissionRequestEvent[]>>({});
   const [inputMessageByWorkspace, setInputMessageByWorkspace] = useState<Record<string, string>>({});
   const [activeRightTab, setActiveRightTab] = useState<"prompts" | "files" | "changes" | "checks">("prompts");
   const [workspaceFilesByPath, setWorkspaceFilesByPath] = useState<Record<string, WorkspaceFileEntry[]>>({});
@@ -225,11 +228,10 @@ function App() {
     return createThemeDraftFromTheme(baseTheme);
   });
   const [envOverridesText, setEnvOverridesText] = useState("");
-  const [defaultClaudeMode, setDefaultClaudeMode] = useState<ClaudeMode>("normal");
-  const [claudeModeByWorkspace, setClaudeModeByWorkspace] = useState<Record<string, ClaudeMode>>({});
   const [defaultModel, setDefaultModel] = useState(DEFAULT_MODEL_ID);
   const [selectedModelByWorkspace, setSelectedModelByWorkspace] = useState<Record<string, string>>({});
   const [thinkingMode, setThinkingMode] = useState<"off" | "low" | "medium" | "high">("off");
+  const [permissionMode, setPermissionMode] = useState<string>("dangerouslySkipPermissions");
   const [workspaceGroupConfig, setWorkspaceGroupConfig] = useState<WorkspaceGroup[]>(DEFAULT_WORKSPACE_GROUPS);
   const [workspaceGroupOverrides, setWorkspaceGroupOverrides] = useState<Record<string, string>>({});
   const [showGroupSettings, setShowGroupSettings] = useState(false);
@@ -315,9 +317,6 @@ function App() {
   const availableThemes = useMemo(() => getAllThemes(customThemes), [customThemes]);
   const themeOptions = useMemo(() => getThemeOptions(availableThemes), [availableThemes]);
   const inputMessage = selectedWorkspace ? (inputMessageByWorkspace[selectedWorkspace] ?? "") : "";
-  const claudeMode = selectedWorkspace
-    ? (claudeModeByWorkspace[selectedWorkspace] ?? defaultClaudeMode)
-    : defaultClaudeMode;
   const selectedModel = selectedWorkspace
     ? (selectedModelByWorkspace[selectedWorkspace] ?? defaultModel)
     : defaultModel;
@@ -482,6 +481,14 @@ function App() {
         return;
       }
 
+      // Clear any pending permission requests when agent stops
+      setPendingPermissions((prev) => {
+        if (!prev[workspaceId]) return prev;
+        const next = { ...prev };
+        delete next[workspaceId];
+        return next;
+      });
+
       // Drain the next queued message for this workspace
       const queue = queuedMessagesByWorkspaceRef.current[workspaceId];
       if (queue && queue.length > 0) {
@@ -521,6 +528,15 @@ function App() {
         });
       }
     });
+    const unlistenPermission = listen<PermissionRequestEvent>("permission-request", (event) => {
+      const req = event.payload;
+      if (req.workspaceId) {
+        setPendingPermissions((prev) => ({
+          ...prev,
+          [req.workspaceId]: [...(prev[req.workspaceId] || []), req],
+        }));
+      }
+    });
     const unlistenClients = listen<number>("remote-clients-updated", (event) => {
       setServerStatus((prev) => {
         if (!prev) return prev;
@@ -535,6 +551,7 @@ function App() {
     return () => {
       unlisten.then(fn => fn());
       unlistenRunState.then(fn => fn());
+      unlistenPermission.then(fn => fn());
       unlistenClients.then(fn => fn());
       unlistenSettings.then(fn => fn());
       clearInterval(updateInterval);
@@ -650,8 +667,8 @@ function App() {
       }
       return changed ? next : prev;
     });
-    // Note: selectedModelByWorkspace and claudeModeByWorkspace are intentionally
-    // NOT cleaned up here. They are user preferences keyed by workspace UUID —
+    // Note: selectedModelByWorkspace is intentionally
+    // NOT cleaned up here. These are user preferences keyed by workspace UUID —
     // stale entries are harmless and cleaning them here causes selections to be
     // lost when switching repos (loadWorkspaces replaces the list with only the
     // current repo's workspaces, purging other repo entries).
@@ -862,25 +879,6 @@ function App() {
   }, [chatFontSize]);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(CLAUDE_MODE_STORAGE_KEY);
-      if (raw === "plan" || raw === "normal") {
-        setDefaultClaudeMode(raw);
-      }
-    } catch (err) {
-      console.error("Failed to load Claude mode:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(CLAUDE_MODE_STORAGE_KEY, defaultClaudeMode);
-    } catch (err) {
-      console.error("Failed to persist Claude mode:", err);
-    }
-  }, [defaultClaudeMode]);
-
-  useEffect(() => {
     // Don't persist responsive closes — only save user-initiated toggles
     if (!isBelowLg.current) localStorage.setItem(LEFT_PANEL_OPEN_STORAGE_KEY, String(isLeftPanelOpen));
   }, [isLeftPanelOpen]);
@@ -960,6 +958,26 @@ function App() {
       console.error("Failed to persist thinking mode:", err);
     }
   }, [thinkingMode]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(PERMISSION_MODE_STORAGE_KEY);
+      const validModes = ["dangerouslySkipPermissions", "bypassPermissions", "auto", "acceptEdits", "default", "dontAsk", "plan"];
+      if (raw && validModes.includes(raw)) {
+        setPermissionMode(raw);
+      }
+    } catch (err) {
+      console.error("Failed to load permission mode:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PERMISSION_MODE_STORAGE_KEY, permissionMode);
+    } catch (err) {
+      console.error("Failed to persist permission mode:", err);
+    }
+  }, [permissionMode]);
 
   useEffect(() => {
     try {
@@ -1516,12 +1534,6 @@ function App() {
         delete next[tempId];
         return next;
       });
-      setClaudeModeByWorkspace((prev) => {
-        if (!(tempId in prev)) return prev;
-        const next = { ...prev, [workspace.id]: prev[tempId] };
-        delete next[tempId];
-        return next;
-      });
 
       // Handle auto-run prompts with real workspace ID
       if (autoRunPrompts.length > 0) {
@@ -1560,12 +1572,6 @@ function App() {
         return next;
       });
       setSelectedModelByWorkspace((prev) => {
-        if (!(workspaceId in prev)) return prev;
-        const next = { ...prev };
-        delete next[workspaceId];
-        return next;
-      });
-      setClaudeModeByWorkspace((prev) => {
         if (!(workspaceId in prev)) return prev;
         const next = { ...prev };
         delete next[workspaceId];
@@ -1926,14 +1932,6 @@ function App() {
     setSelectedModelByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: nextValue }));
   }
 
-  function toggleWorkspaceClaudeMode() {
-    const nextMode: ClaudeMode = claudeMode === "plan" ? "normal" : "plan";
-    if (!selectedWorkspace) {
-      setDefaultClaudeMode(nextMode);
-      return;
-    }
-    setClaudeModeByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: nextMode }));
-  }
 
   function setBedrockEnabled(enabled: boolean) {
     setEnvOverridesText((current) => upsertEnvOverrideLine(current, BEDROCK_ENV_KEY, enabled ? "1" : null));
@@ -1944,6 +1942,32 @@ function App() {
       const next = new Set(prev);
       next.delete(workspaceId);
       return next;
+    });
+  }
+
+  async function handlePermissionResponse(
+    wsId: string,
+    requestId: string,
+    agentId: string,
+    allow: boolean,
+    denyMessage?: string,
+  ) {
+    try {
+      await invoke("respond_to_permission", { agentId, requestId, allow, denyMessage });
+    } catch (err) {
+      console.error("Failed to respond to permission:", err);
+      setError(String(err));
+    }
+    setPendingPermissions((prev) => {
+      const list = prev[wsId];
+      if (!list) return prev;
+      const next = list.filter((p) => p.requestId !== requestId);
+      if (next.length === 0) {
+        const result = { ...prev };
+        delete result[wsId];
+        return result;
+      }
+      return { ...prev, [wsId]: next };
     });
   }
 
@@ -2061,7 +2085,7 @@ function App() {
         agentId: agent.id,
         message: messageToSend,
         envOverrides: parseEnvOverrides(envOverridesText),
-        permissionMode: claudeMode === "plan" ? "plan" : "bypassPermissions",
+        permissionMode,
         model: selectedModel,
         effort: thinkingMode === "off" ? null : thinkingMode,
       });
@@ -3432,7 +3456,17 @@ function App() {
                       )}
                     </div>
                   ) : activeCenterTab.type === "chat" ? (
-                    renderedChatRows
+                    <>
+                      {selectedWorkspace && (pendingPermissions[selectedWorkspace] || []).map((req) => (
+                        <PermissionCard
+                          key={req.requestId}
+                          request={req}
+                          onAllow={() => void handlePermissionResponse(req.workspaceId, req.requestId, req.agentId, true)}
+                          onDeny={() => void handlePermissionResponse(req.workspaceId, req.requestId, req.agentId, false)}
+                        />
+                      ))}
+                      {renderedChatRows}
+                    </>
                   ) : activeCenterTab.type === "file" ? (
                     <div className="flex h-full flex-col">
                       <div className="mb-2 flex items-center gap-2">
@@ -3713,19 +3747,15 @@ function App() {
                           icon="psychology"
                           ariaLabel="Thinking mode"
                         />
+                        <ToolbarDropdown
+                          value={permissionMode}
+                          options={PERMISSION_MODE_OPTIONS}
+                          onChange={setPermissionMode}
+                          icon="shield"
+                          ariaLabel="Permission mode"
+                        />
 
                         <div className="ml-auto flex items-center gap-1">
-                          <button
-                            onClick={toggleWorkspaceClaudeMode}
-                            className={`md-icon-plain !h-7 !w-7 ${claudeMode === "plan" ? "text-violet-300" : ""}`}
-                            title={claudeMode === "plan" ? "Planning mode (click for normal)" : "Normal mode (click for plan)"}
-                            aria-label={claudeMode === "plan" ? "Switch to normal mode" : "Switch to planning mode"}
-                          >
-                            <span className="material-symbols-rounded !text-[18px]">
-                              {claudeMode === "plan" ? "schema" : "bolt"}
-                            </span>
-                          </button>
-
                           {isThinkingCurrentWorkspace && workspaceAgents.length > 0 && (
                             <button
                               onClick={() => interruptAgent(workspaceAgents[0].id)}

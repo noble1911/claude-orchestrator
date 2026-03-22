@@ -36,12 +36,23 @@ export const THINKING_MODE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "high", label: "High" },
 ];
 
+export const PERMISSION_MODE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "dangerouslySkipPermissions", label: "Skip All" },
+  { value: "bypassPermissions", label: "Bypass" },
+  { value: "auto", label: "Auto" },
+  { value: "acceptEdits", label: "Accept Edits" },
+  { value: "default", label: "Default" },
+  { value: "dontAsk", label: "Don't Ask" },
+  { value: "plan", label: "Plan" },
+];
+
 export const PROMPT_SHORTCUTS_STORAGE_KEY = "claude_orchestrator_prompt_shortcuts";
 export const ENV_OVERRIDES_STORAGE_KEY = "claude_orchestrator_env_overrides";
 export const CLAUDE_MODE_STORAGE_KEY = "claude_orchestrator_mode";
 export const MODEL_STORAGE_KEY = "claude_orchestrator_model";
 export const MODEL_BY_WORKSPACE_STORAGE_KEY = "claude_orchestrator_model_by_workspace";
 export const THINKING_MODE_STORAGE_KEY = "claude_orchestrator_thinking_mode";
+export const PERMISSION_MODE_STORAGE_KEY = "claude_orchestrator_permission_mode";
 export const DEFAULT_REPOSITORY_STORAGE_KEY = "claude_orchestrator_default_repository";
 export const BEDROCK_ENV_KEY = "CLAUDE_CODE_USE_BEDROCK";
 export const WORKSPACE_GROUPS_STORAGE_KEY = "claude_orchestrator_workspace_groups";

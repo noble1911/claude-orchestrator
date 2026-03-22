@@ -149,6 +149,17 @@ pub struct AgentRunStateEvent {
     pub timestamp: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRequestEvent {
+    pub workspace_id: String,
+    pub agent_id: String,
+    pub request_id: String,
+    pub tool_name: String,
+    pub tool_input: serde_json::Value,
+    pub tool_use_id: String,
+}
+
 // ─── File & Change Entries ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,3 +236,4 @@ pub struct TerminalCommandResult {
     pub exit_code: Option<i32>,
     pub duration_ms: u128,
 }
+
