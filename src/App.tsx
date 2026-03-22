@@ -28,20 +28,15 @@ import {
   arrayMove,
 } from "@dnd-kit/sortable";
 import {
-  COLOR_TOKEN_KEYS,
   DEFAULT_THEME_ID,
   THEME_STORAGE_KEY,
-  THEME_COLOR_FIELDS,
-  type ThemeColorTokenKey,
   type ThemeDefinition,
   type ThemeMap,
   applyTheme,
-  createThemeId,
   getAllThemes,
   getStoredThemeId,
   getThemeOptions,
   isBuiltInTheme,
-  isHexColor,
   loadCustomThemes,
   normalizeThemeId,
   saveCustomThemes,
@@ -79,7 +74,6 @@ import {
   shortText,
   toWorkspaceRelativePath,
   statusForGroup,
-  cloneThemeColors,
   createThemeDraftFromTheme,
   isTruthyEnvValue,
   upsertEnvOverrideLine,
@@ -92,7 +86,6 @@ import {
   normalizeUpdateErrorMessage,
   normalizePromptName,
   normalizeSkillCommand,
-  sanitizeSkillDirName,
   formatSkillExecutionPrompt,
   parseEnvOverrides,
   normalizeChangeStatus,
@@ -136,9 +129,16 @@ import PermissionCard from "./components/PermissionCard";
 import SortableWorkspaceItem from "./components/SortableWorkspaceItem";
 import GroupDropZone from "./components/GroupDropZone";
 import ThinkingTimer from "./components/ThinkingTimer";
-import SortableGroupItem from "./components/SortableGroupItem";
 import SettingsModal, { type SettingsTab } from "./components/SettingsModal";
 import ToolbarDropdown from "./components/ToolbarDropdown";
+import SkillSidebarCard from "./components/SkillSidebarCard";
+import FileTree from "./components/FileTree";
+import CreateWorkspaceDialog from "./components/dialogs/CreateWorkspaceDialog";
+import RenameWorkspaceDialog from "./components/dialogs/RenameWorkspaceDialog";
+import PromptShortcutDialog from "./components/dialogs/PromptShortcutDialog";
+import SkillDialog from "./components/dialogs/SkillDialog";
+import ThemeDialog from "./components/dialogs/ThemeDialog";
+import GroupSettingsDialog from "./components/dialogs/GroupSettingsDialog";
 import { usePersistedState } from "./hooks/usePersistedState";
 import { usePanelResize } from "./hooks/usePanelResize";
 import { useTauriListener } from "./hooks/useTauriListener";
@@ -153,9 +153,9 @@ function App() {
   const [defaultRepoId, setDefaultRepoId] = useState<string | null>(null);
   const [defaultRepoInitialized, setDefaultRepoInitialized] = useState(false);
   const [selectedWorkspace, setSelectedWorkspace] = useState<string | null>(null);
-  const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
+  const [createFormInitialName, setCreateFormInitialName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [availableUpdate, setAvailableUpdate] = useState<UpdateInfo | null>(null);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
@@ -221,11 +221,7 @@ function App() {
         .filter((item) => item.name.trim() && item.prompt.trim());
     },
   );
-  const [showAddPromptForm, setShowAddPromptForm] = useState(false);
-  const [editingPromptId, setEditingPromptId] = useState<string | null>(null);
-  const [newPromptName, setNewPromptName] = useState("");
-  const [newPromptBody, setNewPromptBody] = useState("");
-  const [newPromptAutoRunOnCreate, setNewPromptAutoRunOnCreate] = useState(false);
+  const [editingPromptForDialog, setEditingPromptForDialog] = useState<PromptShortcut | null | undefined>(undefined);
   const [projectSkills, setProjectSkills] = useState<SkillShortcut[]>([]);
   const [userSkills, setUserSkills] = useState<SkillShortcut[]>([]);
   const [projectSkillsRoot, setProjectSkillsRoot] = useState<string | null>(null);
@@ -234,24 +230,13 @@ function App() {
   const [promptsExpanded, setPromptsExpanded] = useState(true);
   const [projectSkillsExpanded, setProjectSkillsExpanded] = useState(false);
   const [userSkillsExpanded, setUserSkillsExpanded] = useState(false);
-  const [showSkillForm, setShowSkillForm] = useState(false);
-  const [editingSkillId, setEditingSkillId] = useState<string | null>(null);
-  const [skillScopeDraft, setSkillScopeDraft] = useState<SkillScope>("project");
-  const [skillRelativePathDraft, setSkillRelativePathDraft] = useState<string | null>(null);
-  const [skillNameDraft, setSkillNameDraft] = useState("");
-  const [skillBodyDraft, setSkillBodyDraft] = useState("");
+  const [skillDialogState, setSkillDialogState] = useState<{ skill: SkillShortcut | null; scope: SkillScope } | null>(null);
   const [customThemes, setCustomThemes] = useState<ThemeMap>(() => loadCustomThemes());
   const [selectedTheme, setSelectedTheme] = useState<string>(() => {
     const themes = getAllThemes(loadCustomThemes());
     return getStoredThemeId(themes);
   });
-  const [showThemeForm, setShowThemeForm] = useState(false);
-  const [editingThemeId, setEditingThemeId] = useState<string | null>(null);
-  const [themeDraft, setThemeDraft] = useState<ThemeDraft>(() => {
-    const themes = getAllThemes(loadCustomThemes());
-    const baseTheme = themes[DEFAULT_THEME_ID];
-    return createThemeDraftFromTheme(baseTheme);
-  });
+  const [themeDialogState, setThemeDialogState] = useState<{ editingId: string | null; draft: ThemeDraft } | null>(null);
   const [envOverridesText, setEnvOverridesText] = usePersistedState(
     ENV_OVERRIDES_STORAGE_KEY, "", (v) => v, (v) => v,
   );
@@ -303,9 +288,7 @@ function App() {
   const [credentialErrorWorkspaces, setCredentialErrorWorkspaces] = useState<Set<string>>(new Set());
   const [answeredQuestionTimestamps, setAnsweredQuestionTimestamps] = useState<Set<string>>(new Set());
   const [thinkingSinceByWorkspace, setThinkingSinceByWorkspace] = useState<Record<string, number | null>>({});
-  const [showRenameForm, setShowRenameForm] = useState(false);
-  const [renameWorkspaceId, setRenameWorkspaceId] = useState<string | null>(null);
-  const [renameWorkspaceName, setRenameWorkspaceName] = useState("");
+  const [renameDialogWorkspace, setRenameDialogWorkspace] = useState<{ id: string; name: string } | null>(null);
   const [shortcutOverrides, setShortcutOverrides] = useState<Record<string, ShortcutKeys>>(() => loadCustomShortcuts());
   const [initialSettingsTab, setInitialSettingsTab] = useState<SettingsTab | undefined>(undefined);
   const [workspaceOpenTarget, setWorkspaceOpenTarget] = useState<WorkspaceOpenTarget>("");
@@ -434,17 +417,13 @@ function App() {
       const closeKeys = getKeys("closeDialog");
       if (closeKeys && shortcutMatchesEvent(closeKeys, e)) {
         if (showSettingsModal) { setShowSettingsModal(false); setInitialSettingsTab(undefined); }
-        else if (showGroupSettings) setShowGroupSettings(false);
-        else if (showCreateForm) setShowCreateForm(false);
-        else if (showRenameForm) setShowRenameForm(false);
-        else if (showThemeForm) setShowThemeForm(false);
         return;
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [showSettingsModal, showGroupSettings, showCreateForm, showRenameForm, showThemeForm, resolvedShortcuts]);
+  }, [showSettingsModal, resolvedShortcuts]);
 
   useAgentEvents({
     selectedWorkspaceRef,
@@ -1149,8 +1128,8 @@ function App() {
     }
   }
 
-  async function createWorkspace() {
-    if (!newWorkspaceName.trim() || !selectedRepo) return;
+  async function createWorkspace(inputName: string) {
+    if (!inputName.trim() || !selectedRepo) return;
 
     // Check if git is busy (Conductor pattern: git-busy-check)
     try {
@@ -1166,7 +1145,7 @@ function App() {
 
     // Generate optimistic workspace immediately for instant UI feedback
     const tempId = crypto.randomUUID();
-    const workspaceName = newWorkspaceName.trim();
+    const workspaceName = inputName.trim();
     const optimisticWorkspace: Workspace = {
       id: tempId,
       repoId: selectedRepo,
@@ -1183,7 +1162,6 @@ function App() {
     // Update UI immediately - user sees workspace appear instantly
     const autoRunPrompts = promptShortcuts.filter((shortcut) => shortcut.autoRunOnCreate);
     setWorkspaces(prev => [...prev, optimisticWorkspace]);
-    setNewWorkspaceName("");
     setShowCreateForm(false);
     setSelectedWorkspace(tempId);
     if (window.innerWidth < 1024) setIsLeftPanelOpen(false);
@@ -1261,10 +1239,8 @@ function App() {
         setSelectedWorkspace(next);
         if (!next) setMessages([]);
       }
-      if (renameWorkspaceId === workspaceId) {
-        setShowRenameForm(false);
-        setRenameWorkspaceId(null);
-        setRenameWorkspaceName("");
+      if (renameDialogWorkspace?.id === workspaceId) {
+        setRenameDialogWorkspace(null);
       }
     } catch (err) {
       console.error("Failed to remove workspace:", err);
@@ -1276,22 +1252,18 @@ function App() {
   }, []);
 
   const openRenameWorkspaceForm = useCallback((workspace: Workspace) => {
-    setRenameWorkspaceId(workspace.id);
-    setRenameWorkspaceName(workspace.name);
-    setShowRenameForm(true);
+    setRenameDialogWorkspace({ id: workspace.id, name: workspace.name });
   }, []);
 
-  async function renameWorkspace() {
-    if (!renameWorkspaceId || !renameWorkspaceName.trim()) return;
+  async function handleRenameWorkspace(newName: string) {
+    if (!renameDialogWorkspace || !newName.trim()) return;
     try {
       const updated = await invoke<Workspace>("rename_workspace", {
-        workspaceId: renameWorkspaceId,
-        name: renameWorkspaceName.trim(),
+        workspaceId: renameDialogWorkspace.id,
+        name: newName.trim(),
       });
       setWorkspaces((prev) => prev.map((workspace) => (workspace.id === updated.id ? updated : workspace)));
-      setShowRenameForm(false);
-      setRenameWorkspaceId(null);
-      setRenameWorkspaceName("");
+      setRenameDialogWorkspace(null);
     } catch (err) {
       console.error("Failed to rename workspace:", err);
       setError(String(err));
@@ -1441,42 +1413,28 @@ function App() {
   }
 
   function openAddSkillForm(scope: SkillScope) {
-    setEditingSkillId(null);
-    setSkillScopeDraft(scope);
-    setSkillRelativePathDraft(null);
-    setSkillNameDraft("");
-    setSkillBodyDraft("");
-    setShowSkillForm(true);
+    setSkillDialogState({ skill: null, scope });
   }
 
   function openEditSkillForm(skill: SkillShortcut) {
-    setEditingSkillId(skill.id);
-    setSkillScopeDraft(skill.scope);
-    setSkillRelativePathDraft(skill.relativePath);
-    setSkillNameDraft(skill.name);
-    setSkillBodyDraft(skill.content);
-    setShowSkillForm(true);
+    setSkillDialogState({ skill, scope: skill.scope });
   }
 
-  async function saveSkillDraft() {
-    const name = skillNameDraft.trim();
-    const body = skillBodyDraft.trim();
-    if (!name || !body) return;
-    if (skillScopeDraft === "project" && !selectedRepo) {
+  async function handleSaveSkill(draft: { scope: SkillScope; relativePath: string | null; name: string; content: string }) {
+    if (draft.scope === "project" && !selectedRepo) {
       setError("Select a repository before saving a project skill.");
       return;
     }
 
     try {
       await invoke<SkillShortcut>("save_skill", {
-        scope: skillScopeDraft,
-        repoId: skillScopeDraft === "project" ? selectedRepo : null,
-        relativePath: skillRelativePathDraft,
-        name,
-        content: body,
+        scope: draft.scope,
+        repoId: draft.scope === "project" ? selectedRepo : null,
+        relativePath: draft.relativePath,
+        name: draft.name,
+        content: draft.content,
       });
-      setShowSkillForm(false);
-      setEditingSkillId(null);
+      setSkillDialogState(null);
       await loadSkills(selectedRepo);
     } catch (err) {
       console.error("Failed to save skill:", err);
@@ -1509,13 +1467,14 @@ function App() {
   function openCreateThemeForm() {
     const baseTheme = availableThemes[selectedTheme] ?? availableThemes[DEFAULT_THEME_ID];
     if (!baseTheme) return;
-    setEditingThemeId(null);
-    setThemeDraft({
-      ...createThemeDraftFromTheme(baseTheme),
-      label: `${baseTheme.label} copy`,
-      description: `Custom theme based on ${baseTheme.label}.`,
+    setThemeDialogState({
+      editingId: null,
+      draft: {
+        ...createThemeDraftFromTheme(baseTheme),
+        label: `${baseTheme.label} copy`,
+        description: `Custom theme based on ${baseTheme.label}.`,
+      },
     });
-    setShowThemeForm(true);
   }
 
   function openEditThemeForm() {
@@ -1523,59 +1482,19 @@ function App() {
     if (!currentTheme || isBuiltInTheme(currentTheme.id)) {
       return;
     }
-    setEditingThemeId(currentTheme.id);
-    setThemeDraft(createThemeDraftFromTheme(currentTheme));
-    setShowThemeForm(true);
+    setThemeDialogState({
+      editingId: currentTheme.id,
+      draft: createThemeDraftFromTheme(currentTheme),
+    });
   }
 
-  function closeThemeForm() {
-    setShowThemeForm(false);
-    setEditingThemeId(null);
-  }
-
-  function updateThemeDraftColor(token: ThemeColorTokenKey, value: string) {
-    setThemeDraft((prev) => ({
-      ...prev,
-      colors: {
-        ...prev.colors,
-        [token]: value,
-      },
-    }));
-  }
-
-  function saveThemeDraft() {
-    const label = themeDraft.label.trim();
-    if (!label) {
-      setError("Theme name is required.");
-      return;
-    }
-    if (!isHexColor(themeDraft.rootText) || !isHexColor(themeDraft.rootBackground)) {
-      setError("Root colors must be valid hex values like #1a2b3c.");
-      return;
-    }
-    for (const token of COLOR_TOKEN_KEYS) {
-      if (!isHexColor(themeDraft.colors[token])) {
-        setError(`Invalid color for ${token}. Use hex format like #1a2b3c.`);
-        return;
-      }
-    }
-
-    const id = editingThemeId ?? createThemeId(label, availableThemes);
-    const nextTheme: ThemeDefinition = {
-      id,
-      label,
-      description: themeDraft.description.trim() || `Custom theme: ${label}`,
-      rootText: themeDraft.rootText,
-      rootBackground: themeDraft.rootBackground,
-      colors: cloneThemeColors(themeDraft.colors),
-    };
-
+  function handleSaveTheme(theme: ThemeDefinition) {
     setCustomThemes((prev) => ({
       ...prev,
-      [id]: nextTheme,
+      [theme.id]: theme,
     }));
-    setSelectedTheme(id);
-    closeThemeForm();
+    setSelectedTheme(theme.id);
+    setThemeDialogState(null);
   }
 
   function deleteSelectedCustomTheme() {
@@ -1796,7 +1715,7 @@ function App() {
   }
 
   function openCreateWorkspaceForm() {
-    setNewWorkspaceName(generateWorkspaceName());
+    setCreateFormInitialName(generateWorkspaceName());
     setShowCreateForm(true);
   }
 
@@ -1896,66 +1815,29 @@ function App() {
   }
 
   function openAddPromptForm() {
-    setEditingPromptId(null);
-    setNewPromptName("");
-    setNewPromptBody("");
-    setNewPromptAutoRunOnCreate(false);
-    setShowAddPromptForm(true);
+    setEditingPromptForDialog(null);
   }
 
   function openEditPromptForm(shortcut: PromptShortcut) {
-    setEditingPromptId(shortcut.id);
-    setNewPromptName(shortcut.name);
-    setNewPromptBody(shortcut.prompt);
-    setNewPromptAutoRunOnCreate(shortcut.autoRunOnCreate === true);
-    setShowAddPromptForm(true);
+    setEditingPromptForDialog(shortcut);
   }
 
   function deletePromptShortcut(promptId: string) {
     setPromptShortcuts((prev) => prev.filter((shortcut) => shortcut.id !== promptId));
   }
 
-  function addPromptShortcut() {
-    const name = newPromptName.trim();
-    const prompt = newPromptBody.trim();
-    if (!name || !prompt) return;
-
-    const normalized = normalizePromptName(name);
-    const hasDuplicate = promptShortcuts.some(
-      (shortcut) =>
-        shortcut.id !== editingPromptId && normalizePromptName(shortcut.name) === normalized,
-    );
-    if (hasDuplicate) {
-      setError(`Prompt name already exists: ${name}`);
-      return;
-    }
-
-    if (editingPromptId) {
+  function handleSavePrompt(saved: { id: string; name: string; prompt: string; autoRunOnCreate: boolean }) {
+    const isEditing = editingPromptForDialog && editingPromptForDialog.id === saved.id;
+    if (isEditing) {
       setPromptShortcuts((prev) =>
         prev.map((shortcut) =>
-          shortcut.id === editingPromptId
-            ? {
-                ...shortcut,
-                name,
-                prompt,
-                autoRunOnCreate: newPromptAutoRunOnCreate,
-              }
-            : shortcut,
+          shortcut.id === saved.id ? { ...shortcut, ...saved } : shortcut,
         ),
       );
     } else {
-      setPromptShortcuts((prev) => [
-        ...prev,
-        {
-          id: `${Date.now()}-${Math.floor(Math.random() * 100000)}`,
-          name,
-          prompt,
-          autoRunOnCreate: newPromptAutoRunOnCreate,
-        },
-      ]);
+      setPromptShortcuts((prev) => [...prev, saved]);
     }
-    setEditingPromptId(null);
-    setShowAddPromptForm(false);
+    setEditingPromptForDialog(undefined);
   }
 
   async function runPromptShortcut(shortcut: PromptShortcut) {
@@ -2367,62 +2249,6 @@ function App() {
       return;
     }
     await openCurrentWorkspaceInEditor(target);
-  }
-
-  function renderFileTree(path: string, depth: number) {
-    const entries = workspaceFilesByPath[path] || [];
-
-    return entries.map((entry) => {
-      const isExpanded = expandedPaths.has(entry.path);
-      const isLoading = loadingPaths.has(entry.path);
-      const childrenLoaded = workspaceFilesByPath[entry.path] !== undefined;
-
-      return (
-        <div key={entry.path}>
-          <button
-            onClick={() => {
-              if (entry.isDir) {
-                toggleDirectory(entry.path);
-              } else {
-                openFile(entry.path);
-              }
-            }}
-            className={`flex w-full items-center gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition ${
-              activeCenterTabId === `file:${entry.path}`
-                ? "md-surface-strong md-text-strong"
-                : entry.isDir
-                  ? "hover:md-surface-subtle"
-                  : "hover:md-surface-subtle md-text-secondary"
-            }`}
-            style={{ paddingLeft: `${depth * 14 + 8}px` }}
-          >
-            <span className="w-3 md-text-muted">{entry.isDir ? (isExpanded ? "▾" : "▸") : " "}</span>
-            <span
-              className={`material-symbols-rounded !text-base ${
-                entry.isDir ? "md-text-primary" : "md-text-dim"
-              }`}
-            >
-              {entry.isDir ? (isExpanded ? "folder_open" : "folder") : "description"}
-            </span>
-            <span className="truncate">{entry.name}</span>
-          </button>
-
-          {entry.isDir && isExpanded && (
-            <>
-              {isLoading && (
-                <div
-                  className="md-px-2 md-py-1 text-xs md-text-muted"
-                  style={{ paddingLeft: `${(depth + 1) * 14 + 14}px` }}
-                >
-                  Loading...
-                </div>
-              )}
-              {!isLoading && childrenLoaded && renderFileTree(entry.path, depth + 1)}
-            </>
-          )}
-        </div>
-      );
-    });
   }
 
   const workspaceGroups = useMemo(
@@ -3669,57 +3495,14 @@ function App() {
                     )}
                     {!isSkillsLoading &&
                       projectSkills.map((skill) => (
-                        <div
+                        <SkillSidebarCard
                           key={skill.id}
-                          className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
-                          onClick={() => {
-                            void runSkillShortcut(skill);
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              void runSkillShortcut(skill);
-                            }
-                          }}
-                          role="button"
-                          tabIndex={0}
-                          aria-label={`Run skill ${skill.name}`}
-                          title={skill.filePath}
-                        >
-                          <div className="flex min-w-0 items-center gap-2">
-                            <span className="material-symbols-rounded !text-base md-text-muted">code_blocks</span>
-                            <div className="min-w-0">
-                              <p className="truncate md-text-primary">{skill.name}</p>
-                              <p className="truncate text-[11px] md-text-muted">/{skill.commandName}</p>
-                            </div>
-                          </div>
-                          <div className="flex items-center">
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                openEditSkillForm(skill);
-                              }}
-                              className="md-icon-plain !h-6 !w-6"
-                              title="Edit skill"
-                              aria-label={`Edit ${skill.name}`}
-                            >
-                              <span className="material-symbols-rounded !text-[14px]">edit</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                void deleteSkill(skill);
-                              }}
-                              className="md-icon-plain md-icon-plain-danger !h-6 !w-6"
-                              title="Delete skill"
-                              aria-label={`Delete ${skill.name}`}
-                            >
-                              <span className="material-symbols-rounded !text-[14px]">delete</span>
-                            </button>
-                          </div>
-                        </div>
+                          skill={skill}
+                          icon="code_blocks"
+                          onRun={(s) => { void runSkillShortcut(s); }}
+                          onEdit={openEditSkillForm}
+                          onDelete={(s) => { void deleteSkill(s); }}
+                        />
                       ))}
                     {projectSkillsRoot && (
                       <p className="mt-1 truncate text-[11px] md-text-muted" title={projectSkillsRoot}>
@@ -3773,57 +3556,14 @@ function App() {
                     )}
                     {!isSkillsLoading &&
                       userSkills.map((skill) => (
-                        <div
+                        <SkillSidebarCard
                           key={skill.id}
-                          className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
-                          onClick={() => {
-                            void runSkillShortcut(skill);
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" || e.key === " ") {
-                              e.preventDefault();
-                              void runSkillShortcut(skill);
-                            }
-                          }}
-                          role="button"
-                          tabIndex={0}
-                          aria-label={`Run skill ${skill.name}`}
-                          title={skill.filePath}
-                        >
-                          <div className="flex min-w-0 items-center gap-2">
-                            <span className="material-symbols-rounded !text-base md-text-muted">person</span>
-                            <div className="min-w-0">
-                              <p className="truncate md-text-primary">{skill.name}</p>
-                              <p className="truncate text-[11px] md-text-muted">/{skill.commandName}</p>
-                            </div>
-                          </div>
-                          <div className="flex items-center">
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                openEditSkillForm(skill);
-                              }}
-                              className="md-icon-plain !h-6 !w-6"
-                              title="Edit skill"
-                              aria-label={`Edit ${skill.name}`}
-                            >
-                              <span className="material-symbols-rounded !text-[14px]">edit</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                void deleteSkill(skill);
-                              }}
-                              className="md-icon-plain md-icon-plain-danger !h-6 !w-6"
-                              title="Delete skill"
-                              aria-label={`Delete ${skill.name}`}
-                            >
-                              <span className="material-symbols-rounded !text-[14px]">delete</span>
-                            </button>
-                          </div>
-                        </div>
+                          skill={skill}
+                          icon="person"
+                          onRun={(s) => { void runSkillShortcut(s); }}
+                          onEdit={openEditSkillForm}
+                          onDelete={(s) => { void deleteSkill(s); }}
+                        />
                       ))}
                     {userSkillsRoot && (
                       <p className="mt-1 truncate text-[11px] md-text-muted" title={userSkillsRoot}>
@@ -3891,7 +3631,16 @@ function App() {
                 )}
 
               {selectedWorkspace && workspaceFilesByPath[""] && (
-                <div className="mt-3">{renderFileTree("", 0)}</div>
+                <div className="mt-3">
+                  <FileTree
+                    filesByPath={workspaceFilesByPath}
+                    expandedPaths={expandedPaths}
+                    loadingPaths={loadingPaths}
+                    activeCenterTabId={activeCenterTabId}
+                    onToggleDirectory={toggleDirectory}
+                    onOpenFile={openFile}
+                  />
+                </div>
               )}
             </div>
           )}
@@ -4502,243 +4251,40 @@ function App() {
       </aside>
 
       {showCreateForm && (
-        <div className="md-dialog-scrim fixed inset-0 z-40 flex items-center justify-center">
-          <div className="md-dialog w-full max-w-md p-4">
-            <p className="mb-2 text-sm font-medium md-text-primary">Create New Workspace</p>
-            <input
-              type="text"
-              value={newWorkspaceName}
-              onChange={(e) => setNewWorkspaceName(e.target.value)}
-              placeholder="Feature name"
-              className="md-field"
-              onKeyDown={(e) => e.key === "Enter" && createWorkspace()}
-              autoFocus
-            />
-            <div className="mt-3 flex gap-2">
-              <button
-                onClick={() => {
-                  setShowCreateForm(false);
-                  setNewWorkspaceName("");
-                }}
-                className="md-btn flex-1"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={createWorkspace}
-                className="md-btn md-btn-tonal flex-1"
-              >
-                Create
-              </button>
-            </div>
-          </div>
-        </div>
+        <CreateWorkspaceDialog
+          initialName={createFormInitialName}
+          onClose={() => setShowCreateForm(false)}
+          onSubmit={(name) => { void createWorkspace(name); }}
+        />
       )}
 
-      {showRenameForm && (
-        <div className="md-dialog-scrim fixed inset-0 z-40 flex items-center justify-center">
-          <div className="md-dialog w-full max-w-md p-4">
-            <p className="mb-2 text-sm font-medium md-text-primary">Rename Workspace</p>
-            <input
-              type="text"
-              value={renameWorkspaceName}
-              onChange={(e) => setRenameWorkspaceName(e.target.value)}
-              placeholder="Workspace name"
-              className="md-field"
-              onKeyDown={(e) => e.key === "Enter" && renameWorkspace()}
-              autoFocus
-            />
-            <div className="mt-3 flex gap-2">
-              <button
-                onClick={() => {
-                  setShowRenameForm(false);
-                  setRenameWorkspaceId(null);
-                  setRenameWorkspaceName("");
-                }}
-                className="md-btn flex-1"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={renameWorkspace}
-                disabled={!renameWorkspaceName.trim()}
-                className="md-btn md-btn-tonal flex-1 disabled:opacity-50"
-              >
-                Save
-              </button>
-            </div>
-          </div>
-        </div>
+      {renameDialogWorkspace && (
+        <RenameWorkspaceDialog
+          initialName={renameDialogWorkspace.name}
+          onClose={() => setRenameDialogWorkspace(null)}
+          onSubmit={(newName) => { void handleRenameWorkspace(newName); }}
+        />
       )}
 
-      {showAddPromptForm && (
-        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
-          <div className="md-dialog mx-4 w-full max-w-lg">
-            <div className="border-b md-outline p-4">
-              <h3 className="text-lg font-semibold md-text-strong">
-                {editingPromptId ? "Edit Prompt Shortcut" : "Add Prompt Shortcut"}
-              </h3>
-              <p className="mt-1 text-sm md-text-muted">
-                {editingPromptId
-                  ? "Update a reusable prompt button and slash command."
-                  : "Create a reusable prompt button and slash command."}
-              </p>
-            </div>
-
-            <div className="space-y-4 p-4">
-              <div>
-                <label className="mb-1 block text-sm font-medium md-text-secondary">Name</label>
-                <input
-                  type="text"
-                  value={newPromptName}
-                  onChange={(e) => setNewPromptName(e.target.value)}
-                  className="md-field"
-                  placeholder="e.g. Code review"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium md-text-secondary">Prompt</label>
-                <textarea
-                  value={newPromptBody}
-                  onChange={(e) => setNewPromptBody(e.target.value)}
-                  rows={6}
-                  className="md-field font-mono"
-                  placeholder="Write the full prompt to execute"
-                />
-              </div>
-              <label className="flex items-start gap-2 rounded-lg border md-outline p-3 text-sm">
-                <input
-                  type="checkbox"
-                  checked={newPromptAutoRunOnCreate}
-                  onChange={(e) => setNewPromptAutoRunOnCreate(e.target.checked)}
-                  className="mt-0.5 h-4 w-4"
-                />
-                <span>
-                  <span className="block md-text-secondary">Auto-run on workspace creation</span>
-                  <span className="block text-xs md-text-muted">
-                    Execute this prompt automatically after a new workspace is created and its agent is ready.
-                  </span>
-                </span>
-              </label>
-            </div>
-
-            <div className="flex justify-end gap-2 border-t md-outline p-4">
-              <button
-                onClick={() => {
-                  setShowAddPromptForm(false);
-                  setEditingPromptId(null);
-                }}
-                className="md-btn"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={addPromptShortcut}
-                disabled={!newPromptName.trim() || !newPromptBody.trim()}
-                className="md-btn md-btn-tonal disabled:opacity-50"
-              >
-                {editingPromptId ? "Save Prompt" : "Add Prompt"}
-              </button>
-            </div>
-          </div>
-        </div>
+      {editingPromptForDialog !== undefined && (
+        <PromptShortcutDialog
+          editingPrompt={editingPromptForDialog}
+          existingPrompts={promptShortcuts}
+          onClose={() => setEditingPromptForDialog(undefined)}
+          onSave={handleSavePrompt}
+          onError={setError}
+        />
       )}
 
-      {showSkillForm && (
-        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
-          <div className="md-dialog mx-4 w-full max-w-2xl">
-            <div className="border-b md-outline p-4">
-              <h3 className="text-lg font-semibold md-text-strong">
-                {editingSkillId ? "Edit Skill" : "Add Skill"}
-              </h3>
-              <p className="mt-1 text-sm md-text-muted">
-                {editingSkillId
-                  ? "Update this skill's instructions."
-                  : "Create a reusable project or user skill."}
-              </p>
-            </div>
-            <div className="space-y-4 p-4">
-              <div>
-                <label className="mb-1 block text-sm font-medium md-text-secondary">Scope</label>
-                <select
-                  value={skillScopeDraft}
-                  onChange={(e) => setSkillScopeDraft(e.target.value as SkillScope)}
-                  className="md-select"
-                  disabled={editingSkillId !== null}
-                >
-                  <option value="project">Project</option>
-                  <option value="user">User</option>
-                </select>
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium md-text-secondary">Name</label>
-                <input
-                  type="text"
-                  value={skillNameDraft}
-                  onChange={(e) => setSkillNameDraft(e.target.value)}
-                  className="md-field"
-                  placeholder="e.g. release-engineer"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium md-text-secondary">Skill Content (SKILL.md)</label>
-                <textarea
-                  value={skillBodyDraft}
-                  onChange={(e) => setSkillBodyDraft(e.target.value)}
-                  rows={14}
-                  className="md-field font-mono"
-                  placeholder="# Skill name&#10;&#10;Write the skill instructions here."
-                />
-              </div>
-              <div className="space-y-1 rounded-lg border md-outline p-3 text-xs md-text-muted">
-                {skillRelativePathDraft && (
-                  <p>
-                    Path: <span className="font-mono md-text-secondary">{skillRelativePathDraft}/SKILL.md</span>
-                  </p>
-                )}
-                <p>
-                  Command preview:{" "}
-                  <span className="font-mono md-text-secondary">
-                    /
-                    {skillScopeDraft}
-                    :
-                    {skillRelativePathDraft || sanitizeSkillDirName(skillNameDraft.trim() || "skill")}
-                  </span>
-                </p>
-                {skillScopeDraft === "project" && projectSkillsRoot && (
-                  <p>
-                    Project root: <span className="font-mono md-text-secondary">{projectSkillsRoot}</span>
-                  </p>
-                )}
-                {skillScopeDraft === "user" && userSkillsRoot && (
-                  <p>
-                    User root: <span className="font-mono md-text-secondary">{userSkillsRoot}</span>
-                  </p>
-                )}
-              </div>
-            </div>
-            <div className="flex justify-end gap-2 border-t md-outline p-4">
-              <button
-                onClick={() => {
-                  setShowSkillForm(false);
-                  setEditingSkillId(null);
-                }}
-                className="md-btn"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  void saveSkillDraft();
-                }}
-                disabled={!skillNameDraft.trim() || !skillBodyDraft.trim()}
-                className="md-btn md-btn-tonal disabled:opacity-50"
-              >
-                {editingSkillId ? "Save Skill" : "Add Skill"}
-              </button>
-            </div>
-          </div>
-        </div>
+      {skillDialogState && (
+        <SkillDialog
+          editingSkill={skillDialogState.skill}
+          initialScope={skillDialogState.scope}
+          projectSkillsRoot={projectSkillsRoot}
+          userSkillsRoot={userSkillsRoot}
+          onClose={() => setSkillDialogState(null)}
+          onSave={(draft) => { void handleSaveSkill(draft); }}
+        />
       )}
 
       {showSettingsModal && (
@@ -4771,185 +4317,23 @@ function App() {
         />
       )}
 
-      {showThemeForm && (
-        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
-          <div className="md-dialog mx-4 w-full max-w-2xl">
-            <div className="border-b md-outline p-4">
-              <h3 className="text-lg font-semibold md-text-strong">
-                {editingThemeId ? "Edit Theme" : "Create Theme"}
-              </h3>
-              <p className="mt-1 text-sm md-text-muted">
-                Configure palette colors and save as a reusable custom theme.
-              </p>
-            </div>
-
-            <div className="space-y-4 p-4">
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div>
-                  <label className="mb-1 block text-sm font-medium md-text-secondary">Theme name</label>
-                  <input
-                    type="text"
-                    value={themeDraft.label}
-                    onChange={(event) => setThemeDraft((prev) => ({ ...prev, label: event.target.value }))}
-                    className="md-field"
-                    placeholder="e.g. Solarized Dark"
-                  />
-                </div>
-                <div>
-                  <label className="mb-1 block text-sm font-medium md-text-secondary">Description</label>
-                  <input
-                    type="text"
-                    value={themeDraft.description}
-                    onChange={(event) => setThemeDraft((prev) => ({ ...prev, description: event.target.value }))}
-                    className="md-field"
-                    placeholder="Short note shown in theme picker"
-                  />
-                </div>
-              </div>
-
-              <div className="rounded-lg border md-outline p-3">
-                <p className="mb-2 text-xs font-medium uppercase tracking-wide md-text-muted">Root Colors</p>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  <label className="flex items-center gap-2 text-xs md-text-muted">
-                    <span className="w-28">Root text</span>
-                    <input
-                      type="color"
-                      value={themeDraft.rootText}
-                      onChange={(event) => setThemeDraft((prev) => ({ ...prev, rootText: event.target.value }))}
-                      className="h-8 w-10 rounded border md-outline bg-transparent p-0"
-                    />
-                    <input
-                      type="text"
-                      value={themeDraft.rootText}
-                      onChange={(event) => setThemeDraft((prev) => ({ ...prev, rootText: event.target.value }))}
-                      className="md-field !min-h-0 h-8 font-mono text-xs"
-                    />
-                  </label>
-                  <label className="flex items-center gap-2 text-xs md-text-muted">
-                    <span className="w-28">Root background</span>
-                    <input
-                      type="color"
-                      value={themeDraft.rootBackground}
-                      onChange={(event) =>
-                        setThemeDraft((prev) => ({ ...prev, rootBackground: event.target.value }))
-                      }
-                      className="h-8 w-10 rounded border md-outline bg-transparent p-0"
-                    />
-                    <input
-                      type="text"
-                      value={themeDraft.rootBackground}
-                      onChange={(event) =>
-                        setThemeDraft((prev) => ({ ...prev, rootBackground: event.target.value }))
-                      }
-                      className="md-field !min-h-0 h-8 font-mono text-xs"
-                    />
-                  </label>
-                </div>
-              </div>
-
-              <div className="rounded-lg border md-outline p-3">
-                <p className="mb-2 text-xs font-medium uppercase tracking-wide md-text-muted">Material Tokens</p>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  {THEME_COLOR_FIELDS.map((field) => (
-                    <label key={field.key} className="flex items-center gap-2 text-xs md-text-muted">
-                      <span className="w-36 truncate">{field.label}</span>
-                      <input
-                        type="color"
-                        value={themeDraft.colors[field.key]}
-                        onChange={(event) => updateThemeDraftColor(field.key, event.target.value)}
-                        className="h-8 w-10 rounded border md-outline bg-transparent p-0"
-                      />
-                      <input
-                        type="text"
-                        value={themeDraft.colors[field.key]}
-                        onChange={(event) => updateThemeDraftColor(field.key, event.target.value)}
-                        className="md-field !min-h-0 h-8 font-mono text-xs"
-                      />
-                    </label>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 border-t md-outline p-4">
-              <button onClick={closeThemeForm} className="md-btn">
-                Cancel
-              </button>
-              <button onClick={saveThemeDraft} className="md-btn md-btn-tonal">
-                {editingThemeId ? "Save Theme" : "Create Theme"}
-              </button>
-            </div>
-          </div>
-        </div>
+      {themeDialogState && (
+        <ThemeDialog
+          editingThemeId={themeDialogState.editingId}
+          initialDraft={themeDialogState.draft}
+          availableThemes={availableThemes}
+          onClose={() => setThemeDialogState(null)}
+          onSave={handleSaveTheme}
+          onError={setError}
+        />
       )}
 
-      {/* Keyboard Shortcuts Dialog (Conductor pattern: Cmd+/) */}
       {showGroupSettings && (
-        <div className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center">
-          <div className="md-dialog mx-4 w-full max-w-md">
-            <div className="border-b md-outline p-4">
-              <h3 className="text-lg font-semibold md-text-strong">Workspace Groups</h3>
-              <p className="mt-1 text-sm md-text-muted">
-                Customize sidebar columns. Drag workspaces between groups to change their status.
-              </p>
-            </div>
-            <div className="max-h-[60vh] overflow-y-auto p-4 space-y-3">
-              <DndContext
-                sensors={dndSensors}
-                collisionDetection={closestCenter}
-                onDragEnd={(e) => {
-                  const { active, over } = e;
-                  if (over && active.id !== over.id) {
-                    setWorkspaceGroupConfig((prev) => {
-                      const oldIdx = prev.findIndex((g) => g.id === active.id);
-                      const newIdx = prev.findIndex((g) => g.id === over.id);
-                      return arrayMove(prev, oldIdx, newIdx);
-                    });
-                  }
-                }}
-              >
-                <SortableContext
-                  items={workspaceGroupConfig.map((g) => g.id)}
-                  strategy={verticalListSortingStrategy}
-                >
-                  {workspaceGroupConfig.map((group, idx) => (
-                    <SortableGroupItem
-                      key={group.id}
-                      group={group}
-                      idx={idx}
-                      workspaceGroupConfig={workspaceGroupConfig}
-                      setWorkspaceGroupConfig={setWorkspaceGroupConfig}
-                    />
-                  ))}
-                </SortableContext>
-              </DndContext>
-            </div>
-            <div className="flex items-center justify-between border-t md-outline p-4">
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const id = `custom-${Date.now()}`;
-                    setWorkspaceGroupConfig((prev) => [...prev, { id, label: "New group", statuses: [] }]);
-                  }}
-                  className="md-btn md-btn-tonal text-sm"
-                >
-                  Add group
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setWorkspaceGroupConfig(DEFAULT_WORKSPACE_GROUPS)}
-                  className="md-btn text-sm"
-                >
-                  Reset defaults
-                </button>
-              </div>
-              <button onClick={() => setShowGroupSettings(false)} className="md-btn md-btn-tonal">
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
+        <GroupSettingsDialog
+          groupConfig={workspaceGroupConfig}
+          onConfigChange={setWorkspaceGroupConfig}
+          onClose={() => setShowGroupSettings(false)}
+        />
       )}
 
     </div>
