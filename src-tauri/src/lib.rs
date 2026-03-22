@@ -21,7 +21,7 @@ mod websocket_server;
 
 use database::Database;
 use helpers::*;
-use http_server::HttpServer;
+use http_server::{HttpServer, PendingPermissions};
 pub use types::*;
 use websocket_server::{
     ChangeInfo, CheckInfo, FileEntryInfo, MessageInfo, RepositoryInfo, ServerCommand, WebSocketServer,
@@ -43,6 +43,10 @@ pub struct AppState {
     child_pids: RwLock<HashMap<String, u32>>,
     /// Stdin handles for Claude CLI processes, used to send permission responses.
     agent_stdin: RwLock<HashMap<String, Arc<Mutex<ChildStdin>>>>,
+    /// Pending permission requests from the MCP bridge, keyed by request_id.
+    /// Shared with the HTTP server; the oneshot sender is resolved when the user
+    /// allows/denies via the UI.
+    pending_permission_requests: PendingPermissions,
     ws_server: Option<Arc<WebSocketServer>>,
     http_server: Option<Arc<HttpServer>>,
     ws_server_running: RwLock<bool>,
@@ -60,6 +64,7 @@ impl AppState {
             agents: RwLock::new(HashMap::new()),
             child_pids: RwLock::new(HashMap::new()),
             agent_stdin: RwLock::new(HashMap::new()),
+            pending_permission_requests: Arc::new(RwLock::new(HashMap::new())),
             ws_server: None,
             http_server: None,
             ws_server_running: RwLock::new(false),
@@ -408,12 +413,8 @@ async fn start_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerSt
     *state.ws_server_running.write() = true;
     *state.ws_connected_clients.write() = server.client_count();
 
-    // Start HTTP server for web client
-    if let Some(http) = &state.http_server {
-        if let Err(e) = http.start().await {
-            tracing::warn!("Failed to start HTTP server: {}", e);
-        }
-    }
+    // HTTP server is auto-started on app init (needed for MCP permission bridge).
+    // No need to start it here — just report status.
 
     Ok(build_server_status(state.inner().as_ref()))
 }
@@ -1123,6 +1124,10 @@ fn claude_supports_permission_mode(claude_path: &str) -> bool {
     claude_supports_option(claude_path, "--permission-mode")
 }
 
+fn claude_supports_permission_prompt_tool(claude_path: &str) -> bool {
+    claude_supports_option(claude_path, "--permission-prompt-tool")
+}
+
 fn claude_supports_model_option(claude_path: &str) -> bool {
     claude_supports_option(claude_path, "--model")
 }
@@ -1149,9 +1154,24 @@ fn append_claude_request_args(
     effort: Option<&str>,
     claude_session_id: Option<&str>,
     prompt: &str,
+    workspace_id: &str,
+    agent_id: &str,
 ) -> bool {
     let supports_stream = claude_supports_stream_json(claude_path);
-    let interactive = needs_interactive_permissions(permission_mode) && supports_stream;
+    let has_permission_prompt_tool = claude_supports_permission_prompt_tool(claude_path);
+    let wants_interactive = needs_interactive_permissions(permission_mode) && supports_stream;
+
+    // When --permission-prompt-tool is available AND the bridge script exists,
+    // delegate permission handling to the MCP bridge (HTTP-based) instead of
+    // using stdin control_request/control_response.
+    let bridge_path = if wants_interactive && has_permission_prompt_tool {
+        find_permission_bridge_path()
+    } else {
+        None
+    };
+    let use_mcp_bridge = bridge_path.is_some();
+    // Fall back to stdin interactive mode when the bridge is unavailable.
+    let interactive = wants_interactive && !use_mcp_bridge;
 
     cmd.arg("--print");
     if supports_stream {
@@ -1163,10 +1183,25 @@ fn append_claude_request_args(
     } else if claude_supports_permission_mode(claude_path) {
         cmd.args(["--permission-mode", permission_mode]);
     }
+    if let Some(bridge_path) = bridge_path {
+        let mcp_config = serde_json::json!({
+            "mcpServers": {
+                "perm_bridge": {
+                    "command": "node",
+                    "args": [bridge_path],
+                    "env": {
+                        "ORCHESTRATOR_HTTP_PORT": HTTP_SERVER_PORT.to_string(),
+                        "ORCHESTRATOR_WORKSPACE_ID": workspace_id,
+                        "ORCHESTRATOR_AGENT_ID": agent_id
+                    }
+                }
+            }
+        });
+        cmd.args(["--mcp-config", &mcp_config.to_string()]);
+        cmd.args(["--permission-prompt-tool", "mcp__perm_bridge__check_permission"]);
+    }
     if interactive {
-        // Enable bidirectional stream-json so we can receive control_request
-        // events (permission prompts) on stdout and send control_response
-        // replies on stdin.
+        // Legacy fallback: bidirectional stream-json for control_request/control_response.
         cmd.args(["--input-format", "stream-json"]);
     }
     if let Some(model) = model {
@@ -1182,6 +1217,30 @@ fn append_claude_request_args(
         cmd.args(["-p", prompt]);
     }
     interactive
+}
+
+/// Locate the bundled MCP permission bridge script.
+/// Returns the path to `mcp-permission-bridge/dist/index.js` in dev,
+/// or from the Tauri resource bundle in production.
+fn find_permission_bridge_path() -> Option<String> {
+    // Dev: relative to Cargo manifest dir
+    let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../mcp-permission-bridge/dist/index.js");
+    if dev_path.exists() {
+        return Some(dev_path.to_string_lossy().to_string());
+    }
+    // Prod: resolve from macOS bundle -> Contents/Resources/
+    if let Ok(exe_path) = std::env::current_exe() {
+        let prod_path = exe_path
+            .parent()
+            .unwrap_or(&exe_path)
+            .join("../Resources/mcp-permission-bridge/dist/index.js");
+        if prod_path.exists() {
+            return Some(prod_path.to_string_lossy().to_string());
+        }
+    }
+    tracing::warn!("MCP permission bridge not found — interactive permissions unavailable");
+    None
 }
 
 /// Write a JSON user message to the Claude CLI stdin (for --input-format stream-json).
@@ -2512,6 +2571,21 @@ async fn respond_to_permission(
     deny_message: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    // Try the MCP bridge path first (permission requested via HTTP long-poll).
+    let pending_tx = state.pending_permission_requests.write().remove(&request_id);
+    if let Some(tx) = pending_tx {
+        let response = if allow {
+            serde_json::json!({ "behavior": "allow" })
+        } else {
+            serde_json::json!({
+                "behavior": "deny",
+                "message": deny_message.as_deref().unwrap_or("User denied this action")
+            })
+        };
+        let _ = tx.send(response);
+        return Ok(());
+    }
+    // Fall back to stdin control_response (for legacy/forward-compat control_request support).
     send_permission_response(&state, &agent_id, &request_id, allow, deny_message)
 }
 
@@ -2624,6 +2698,8 @@ async fn send_message_to_agent(
             effort,
             claude_session_id.as_deref(),
             &message_clone,
+            &workspace_id,
+            &agent_id_clone,
         );
         eprintln!(
             "[orchestrator] CLI: path={} model={:?} effort={:?} resume={:?}",
@@ -5309,6 +5385,8 @@ async fn handle_ws_commands(
                                     effort,
                                     claude_session_id.as_deref(),
                                     &message,
+                                    &workspace_id_clone,
+                                    &agent_id_clone,
                                 );
 
                                 if interactive {
@@ -6515,6 +6593,19 @@ pub fn run() {
             // WebSocket server is started manually by the user via start_remote_server command.
             // Drop unused clones to avoid resource leaks.
             drop(ws_server_clone);
+
+            // Auto-start the HTTP server so the MCP permission bridge can reach
+            // POST /api/permission even before the user starts the remote server.
+            if let Some(http) = &startup_state.http_server {
+                let pending = startup_state.pending_permission_requests.clone();
+                let http_app_handle = app_handle.clone();
+                let http = http.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = http.start(pending, http_app_handle).await {
+                        tracing::warn!("Failed to auto-start HTTP server: {}", e);
+                    }
+                });
+            }
             drop(startup_state);
 
             // Start command handler
