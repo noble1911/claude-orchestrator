@@ -3778,6 +3778,51 @@ async fn save_skill(
 }
 
 #[tauri::command]
+async fn delete_skill(
+    scope: String,
+    repo_id: Option<String>,
+    relative_path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let scope = scope.trim().to_lowercase();
+    if scope != "project" && scope != "user" {
+        return Err("Unsupported skill scope. Use 'project' or 'user'.".to_string());
+    }
+
+    let root = if scope == "project" {
+        let repo_id = repo_id.ok_or("Repository is required for project skills.")?;
+        resolve_project_skills_root(&repo_id, &state)?
+    } else {
+        resolve_user_skills_root()?
+    };
+
+    let skill_dir = root.join(&relative_path);
+    if !skill_dir.exists() {
+        return Err("Skill not found.".to_string());
+    }
+
+    // Canonicalize both paths to prevent directory traversal
+    let canonical_root = root.canonicalize().map_err(|e| {
+        format!("Failed to resolve skills root: {}", e)
+    })?;
+    let canonical_dir = skill_dir.canonicalize().map_err(|e| {
+        format!("Failed to resolve skill path: {}", e)
+    })?;
+    if !canonical_dir.starts_with(&canonical_root) {
+        return Err("Invalid skill path.".to_string());
+    }
+
+    std::fs::remove_dir_all(&canonical_dir).map_err(|e| {
+        format!(
+            "Failed to delete skill directory '{}': {}",
+            skill_dir.to_string_lossy(),
+            e
+        )
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn list_workspace_files(
     workspace_id: String,
     relative_path: Option<String>,
@@ -6234,6 +6279,7 @@ pub fn run() {
             sync_pr_statuses,
             list_skills,
             save_skill,
+            delete_skill,
             list_workspace_files,
             read_workspace_file,
             write_workspace_file,
