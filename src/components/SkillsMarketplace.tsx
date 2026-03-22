@@ -90,46 +90,74 @@ async function fetchManifest(
   return null;
 }
 
-/** Fetch skills using the manifest's plugin list */
+/**
+ * Fetch skills using the manifest's plugin list.
+ * Each manifest plugin may be a leaf skill (has SKILL.md directly) or a
+ * package containing sub-skill directories. We expand packages into
+ * individual skills so users can install them granularly.
+ */
 async function fetchSkillsFromManifest(
   repo: string,
   branch: string,
   plugins: ManifestPlugin[],
 ): Promise<MarketplaceSkill[]> {
+  const allSkills: MarketplaceSkill[] = [];
+
   const results = await Promise.allSettled(
     plugins.map(async (plugin) => {
       const sourcePath = plugin.source.replace(/^\.\//, "");
+
+      // Check if this plugin directory contains sub-skill directories
+      const subSkills = await scanDirectoryForSkills(repo, branch, sourcePath);
+      if (subSkills.length > 0) {
+        // This is a package — return expanded sub-skills
+        return subSkills;
+      }
+
+      // Leaf skill — fetch its own SKILL.md
       const skillUrl = `https://raw.githubusercontent.com/${repo}/${branch}/${sourcePath}/SKILL.md`;
       const res = await fetch(skillUrl);
       if (!res.ok) {
-        // Manifest provides name+description directly, use those even without SKILL.md
-        return {
-          dirName: sourcePath,
-          name: plugin.name,
-          description: plugin.description || "",
-          content: "",
-          repoSource: repo,
-        } as MarketplaceSkill;
+        // Use manifest metadata as fallback
+        return [
+          {
+            dirName: sourcePath,
+            name: plugin.name,
+            description: plugin.description || "",
+            content: "",
+            repoSource: repo,
+          } as MarketplaceSkill,
+        ];
       }
       const raw = await res.text();
       const { name, description, body } = parseFrontmatter(raw);
-      return {
-        dirName: sourcePath,
-        name: name || plugin.name,
-        description: description || plugin.description || "",
-        content: body,
-        repoSource: repo,
-      } as MarketplaceSkill;
+      return [
+        {
+          dirName: sourcePath,
+          name: name || plugin.name,
+          description: description || plugin.description || "",
+          content: body,
+          repoSource: repo,
+        } as MarketplaceSkill,
+      ];
     }),
   );
 
-  return results
-    .filter(
-      (r): r is PromiseFulfilledResult<MarketplaceSkill> =>
-        r.status === "fulfilled",
-    )
-    .map((r) => r.value)
-    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const r of results) {
+    if (r.status === "fulfilled") {
+      allSkills.push(...r.value);
+    }
+  }
+
+  // Deduplicate by dirName (a sub-skill may appear in multiple manifest entries)
+  const seen = new Set<string>();
+  const deduped = allSkills.filter((s) => {
+    if (seen.has(s.dirName)) return false;
+    seen.add(s.dirName);
+    return true;
+  });
+
+  return deduped.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Scan a directory for subdirs containing SKILL.md (one level deep) */
@@ -187,9 +215,13 @@ async function fetchSkillsFromRepo(
   const branch = await fetchDefaultBranch(repo);
 
   // Strategy 1: Check for .claude-plugin/marketplace.json
+  // Filter out root-level entries (source: "./") which are repo metadata, not skill pointers
   const manifest = await fetchManifest(repo, branch);
-  if (manifest && manifest.length > 0) {
-    return fetchSkillsFromManifest(repo, branch, manifest);
+  const skillPlugins = manifest?.filter(
+    (p) => p.source !== "./" && p.source !== ".",
+  );
+  if (skillPlugins && skillPlugins.length > 0) {
+    return fetchSkillsFromManifest(repo, branch, skillPlugins);
   }
 
   // Strategy 2: Scan specified path for SKILL.md in subdirectories
@@ -255,6 +287,44 @@ function loadCustomRepos(): CustomSkillRepo[] {
 
 function saveCustomRepos(repos: CustomSkillRepo[]) {
   localStorage.setItem(CUSTOM_SKILL_REPOS_STORAGE_KEY, JSON.stringify(repos));
+}
+
+/**
+ * Group skills by their top-level directory (category).
+ * Skills with paths like "engineering/agent-designer" → category "engineering".
+ * Flat skills like "frontend-design" → category "" (ungrouped).
+ */
+function groupSkillsByCategory(
+  skills: MarketplaceSkill[],
+): { category: string; label: string; skills: MarketplaceSkill[] }[] {
+  const groups = new Map<string, MarketplaceSkill[]>();
+  for (const skill of skills) {
+    const slashIdx = skill.dirName.indexOf("/");
+    const category = slashIdx !== -1 ? skill.dirName.slice(0, slashIdx) : "";
+    const list = groups.get(category);
+    if (list) {
+      list.push(skill);
+    } else {
+      groups.set(category, [skill]);
+    }
+  }
+
+  return Array.from(groups.entries())
+    .map(([category, catSkills]) => ({
+      category,
+      label: category
+        ? category
+            .replace(/[-_]/g, " ")
+            .replace(/\b\w/g, (c) => c.toUpperCase())
+        : "",
+      skills: catSkills.sort((a, b) => a.name.localeCompare(b.name)),
+    }))
+    .sort((a, b) => {
+      // Ungrouped skills first, then alphabetical
+      if (!a.category) return -1;
+      if (!b.category) return 1;
+      return a.label.localeCompare(b.label);
+    });
 }
 
 // ─── Skill Card ──────────────────────────────────────────────────────────────
@@ -392,6 +462,9 @@ export default function SkillsMarketplace() {
     new Set(),
   );
   const [expandedSkill, setExpandedSkill] = useState<string | null>(null);
+  const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(
+    new Set(),
+  );
   const [globalError, setGlobalError] = useState<string | null>(null);
 
   // Add-repo form state
@@ -726,29 +799,135 @@ export default function SkillsMarketplace() {
                 </div>
               )}
 
-              {/* Section skills grid */}
-              {!section.loading && section.skills.length > 0 && (
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  {section.skills.map((skill) => {
-                    const key = `${skill.repoSource || "official"}/${skill.dirName}`;
-                    return (
-                      <SkillCard
-                        key={key}
-                        skill={skill}
-                        isInstalled={installedSkills.has(key)}
-                        isInstalling={installingSkill === key}
-                        isExpanded={expandedSkill === key}
-                        onInstall={() => void installSkill(skill)}
-                        onToggleExpand={() =>
-                          setExpandedSkill(
-                            expandedSkill === key ? null : key,
-                          )
-                        }
-                      />
-                    );
-                  })}
-                </div>
-              )}
+              {/* Section skills — grouped by category when applicable */}
+              {!section.loading && section.skills.length > 0 && (() => {
+                const groups = groupSkillsByCategory(section.skills);
+                const hasCategories = groups.some((g) => g.category !== "");
+                // Default to collapsed when section has many skills
+                const defaultCollapsed = section.skills.length > 12;
+
+                // No category structure — flat grid (e.g., official repo)
+                if (!hasCategories) {
+                  return (
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      {section.skills.map((skill) => {
+                        const key = `${skill.repoSource || "official"}/${skill.dirName}`;
+                        return (
+                          <SkillCard
+                            key={key}
+                            skill={skill}
+                            isInstalled={installedSkills.has(key)}
+                            isInstalling={installingSkill === key}
+                            isExpanded={expandedSkill === key}
+                            onInstall={() => void installSkill(skill)}
+                            onToggleExpand={() =>
+                              setExpandedSkill(
+                                expandedSkill === key ? null : key,
+                              )
+                            }
+                          />
+                        );
+                      })}
+                    </div>
+                  );
+                }
+
+                // Grouped by category with collapsible headers
+                return (
+                  <div className="space-y-3">
+                    {groups.map((group) => {
+                      const catKey = `${section.id}/${group.category}`;
+                      const isCollapsed = collapsedCategories.has(catKey)
+                        ? true
+                        : defaultCollapsed && !collapsedCategories.has(`${catKey}:expanded`);
+
+                      const toggleCategory = () => {
+                        setCollapsedCategories((prev) => {
+                          const next = new Set(prev);
+                          if (isCollapsed) {
+                            next.delete(catKey);
+                            next.add(`${catKey}:expanded`);
+                          } else {
+                            next.add(catKey);
+                            next.delete(`${catKey}:expanded`);
+                          }
+                          return next;
+                        });
+                      };
+
+                      // Ungrouped skills (no category) render flat
+                      if (!group.category) {
+                        return (
+                          <div key="__ungrouped__" className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                            {group.skills.map((skill) => {
+                              const key = `${skill.repoSource || "official"}/${skill.dirName}`;
+                              return (
+                                <SkillCard
+                                  key={key}
+                                  skill={skill}
+                                  isInstalled={installedSkills.has(key)}
+                                  isInstalling={installingSkill === key}
+                                  isExpanded={expandedSkill === key}
+                                  onInstall={() => void installSkill(skill)}
+                                  onToggleExpand={() =>
+                                    setExpandedSkill(
+                                      expandedSkill === key ? null : key,
+                                    )
+                                  }
+                                />
+                              );
+                            })}
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div key={group.category} className="rounded-lg border md-outline">
+                          <button
+                            type="button"
+                            onClick={toggleCategory}
+                            className="flex w-full items-center justify-between px-3 py-2 text-left transition hover:md-surface-container-high"
+                          >
+                            <div className="flex items-center gap-2">
+                              <span className="material-symbols-rounded !text-[16px] md-text-muted">
+                                {isCollapsed ? "expand_more" : "expand_less"}
+                              </span>
+                              <span className="text-xs font-semibold md-text-primary">
+                                {group.label}
+                              </span>
+                            </div>
+                            <span className="rounded-full px-2 py-0.5 text-[10px] font-medium md-surface-container-high md-text-muted">
+                              {group.skills.length} skill{group.skills.length !== 1 ? "s" : ""}
+                            </span>
+                          </button>
+                          {!isCollapsed && (
+                            <div className="grid grid-cols-1 gap-3 border-t px-3 py-3 md-outline sm:grid-cols-2">
+                              {group.skills.map((skill) => {
+                                const key = `${skill.repoSource || "official"}/${skill.dirName}`;
+                                return (
+                                  <SkillCard
+                                    key={key}
+                                    skill={skill}
+                                    isInstalled={installedSkills.has(key)}
+                                    isInstalling={installingSkill === key}
+                                    isExpanded={expandedSkill === key}
+                                    onInstall={() => void installSkill(skill)}
+                                    onToggleExpand={() =>
+                                      setExpandedSkill(
+                                        expandedSkill === key ? null : key,
+                                      )
+                                    }
+                                  />
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
 
               {/* Section empty (no error) */}
               {!section.loading &&
