@@ -1150,8 +1150,10 @@ fn claude_supports_resume_option(claude_path: &str) -> bool {
 }
 
 /// Permission modes that require interactive stdin for tool-approval control messages.
+/// All modes can produce permission prompts except those that explicitly skip or
+/// auto-approve everything.
 fn needs_interactive_permissions(permission_mode: &str) -> bool {
-    matches!(permission_mode, "default" | "acceptEdits")
+    !matches!(permission_mode, "dangerouslySkipPermissions" | "bypassPermissions" | "dontAsk")
 }
 
 /// Build the CLI arguments for a Claude request.  Returns `true` when the
