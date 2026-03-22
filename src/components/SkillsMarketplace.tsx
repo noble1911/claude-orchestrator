@@ -90,46 +90,74 @@ async function fetchManifest(
   return null;
 }
 
-/** Fetch skills using the manifest's plugin list */
+/**
+ * Fetch skills using the manifest's plugin list.
+ * Each manifest plugin may be a leaf skill (has SKILL.md directly) or a
+ * package containing sub-skill directories. We expand packages into
+ * individual skills so users can install them granularly.
+ */
 async function fetchSkillsFromManifest(
   repo: string,
   branch: string,
   plugins: ManifestPlugin[],
 ): Promise<MarketplaceSkill[]> {
+  const allSkills: MarketplaceSkill[] = [];
+
   const results = await Promise.allSettled(
     plugins.map(async (plugin) => {
       const sourcePath = plugin.source.replace(/^\.\//, "");
+
+      // Check if this plugin directory contains sub-skill directories
+      const subSkills = await scanDirectoryForSkills(repo, branch, sourcePath);
+      if (subSkills.length > 0) {
+        // This is a package — return expanded sub-skills
+        return subSkills;
+      }
+
+      // Leaf skill — fetch its own SKILL.md
       const skillUrl = `https://raw.githubusercontent.com/${repo}/${branch}/${sourcePath}/SKILL.md`;
       const res = await fetch(skillUrl);
       if (!res.ok) {
-        // Manifest provides name+description directly, use those even without SKILL.md
-        return {
-          dirName: sourcePath,
-          name: plugin.name,
-          description: plugin.description || "",
-          content: "",
-          repoSource: repo,
-        } as MarketplaceSkill;
+        // Use manifest metadata as fallback
+        return [
+          {
+            dirName: sourcePath,
+            name: plugin.name,
+            description: plugin.description || "",
+            content: "",
+            repoSource: repo,
+          } as MarketplaceSkill,
+        ];
       }
       const raw = await res.text();
       const { name, description, body } = parseFrontmatter(raw);
-      return {
-        dirName: sourcePath,
-        name: name || plugin.name,
-        description: description || plugin.description || "",
-        content: body,
-        repoSource: repo,
-      } as MarketplaceSkill;
+      return [
+        {
+          dirName: sourcePath,
+          name: name || plugin.name,
+          description: description || plugin.description || "",
+          content: body,
+          repoSource: repo,
+        } as MarketplaceSkill,
+      ];
     }),
   );
 
-  return results
-    .filter(
-      (r): r is PromiseFulfilledResult<MarketplaceSkill> =>
-        r.status === "fulfilled",
-    )
-    .map((r) => r.value)
-    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const r of results) {
+    if (r.status === "fulfilled") {
+      allSkills.push(...r.value);
+    }
+  }
+
+  // Deduplicate by dirName (a sub-skill may appear in multiple manifest entries)
+  const seen = new Set<string>();
+  const deduped = allSkills.filter((s) => {
+    if (seen.has(s.dirName)) return false;
+    seen.add(s.dirName);
+    return true;
+  });
+
+  return deduped.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Scan a directory for subdirs containing SKILL.md (one level deep) */
@@ -187,9 +215,13 @@ async function fetchSkillsFromRepo(
   const branch = await fetchDefaultBranch(repo);
 
   // Strategy 1: Check for .claude-plugin/marketplace.json
+  // Filter out root-level entries (source: "./") which are repo metadata, not skill pointers
   const manifest = await fetchManifest(repo, branch);
-  if (manifest && manifest.length > 0) {
-    return fetchSkillsFromManifest(repo, branch, manifest);
+  const skillPlugins = manifest?.filter(
+    (p) => p.source !== "./" && p.source !== ".",
+  );
+  if (skillPlugins && skillPlugins.length > 0) {
+    return fetchSkillsFromManifest(repo, branch, skillPlugins);
   }
 
   // Strategy 2: Scan specified path for SKILL.md in subdirectories
