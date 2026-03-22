@@ -188,8 +188,9 @@ function App() {
   const [projectSkillsRoot, setProjectSkillsRoot] = useState<string | null>(null);
   const [userSkillsRoot, setUserSkillsRoot] = useState<string | null>(null);
   const [isSkillsLoading, setIsSkillsLoading] = useState(false);
-  const [projectSkillsExpanded, setProjectSkillsExpanded] = useState(true);
-  const [userSkillsExpanded, setUserSkillsExpanded] = useState(true);
+  const [promptsExpanded, setPromptsExpanded] = useState(true);
+  const [projectSkillsExpanded, setProjectSkillsExpanded] = useState(false);
+  const [userSkillsExpanded, setUserSkillsExpanded] = useState(false);
   const [showSkillForm, setShowSkillForm] = useState(false);
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null);
   const [skillScopeDraft, setSkillScopeDraft] = useState<SkillScope>("project");
@@ -3121,22 +3122,22 @@ function App() {
           </div>
           <div className="flex items-center gap-1">
             {currentWorkspace && (
-              <select
+              <ToolbarDropdown
                 value={workspaceOpenTarget}
-                onChange={(e) => {
-                  const target = e.target.value as WorkspaceOpenTarget;
+                options={[
+                  { value: "vscode", label: "VS Code" },
+                  { value: "intellij", label: "IntelliJ" },
+                  { value: "terminal", label: "Terminal" },
+                ]}
+                onChange={(v) => {
                   setWorkspaceOpenTarget("");
-                  void openCurrentWorkspaceTarget(target);
+                  void openCurrentWorkspaceTarget(v as WorkspaceOpenTarget);
                 }}
-                className="md-select !w-auto !min-h-0 h-7 py-0 pl-2 pr-7 text-[11px]"
-                title="Open current workspace"
-                aria-label="Open current workspace"
-              >
-                <option value="">Open</option>
-                <option value="vscode">VS Code</option>
-                <option value="intellij">IntelliJ</option>
-                <option value="terminal">Terminal</option>
-              </select>
+                icon="open_in_new"
+                placeholder="Open"
+                direction="down"
+                ariaLabel="Open current workspace"
+              />
             )}
             {currentWorkspace && workspaceAgents.length > 0 && (
               <button
@@ -3562,36 +3563,59 @@ function App() {
 
         <div className="min-h-0 flex-1 overflow-y-auto md-px-4 md-py-4" style={{ zoom: sidebarFontSize / 12 }}>
           {activeRightTab === "prompts" && (
-            <div className="space-y-3 text-sm">
-              <p className="md-label-medium">Prompt Library</p>
-              <div className="md-card p-3 md-text-secondary">
-                {promptShortcuts.length === 0 ? (
-                  <p className="text-xs md-text-muted">No prompt shortcuts yet.</p>
-                ) : (
-                  <div className="space-y-2">
-                    {promptShortcuts.map((shortcut) => (
-                      <div
-                        key={shortcut.id}
-                        className="md-card cursor-pointer md-px-2 md-py-2 transition hover:md-surface-subtle"
-                        onClick={() => {
-                          void runPromptShortcut(shortcut);
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" || e.key === " ") {
-                            e.preventDefault();
+            <div className="text-sm">
+              {/* Prompts section */}
+              <div>
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    className="flex min-w-0 items-center gap-1 text-left"
+                    onClick={() => setPromptsExpanded((prev) => !prev)}
+                    aria-expanded={promptsExpanded}
+                  >
+                    <span className="material-symbols-rounded !text-[16px] md-text-muted">
+                      {promptsExpanded ? "expand_more" : "chevron_right"}
+                    </span>
+                    <span className="md-label-medium">Prompts ({promptShortcuts.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={openAddPromptForm}
+                    className="md-icon-plain !h-6 !w-6"
+                    title="Add prompt shortcut"
+                    aria-label="Add prompt shortcut"
+                  >
+                    <span className="material-symbols-rounded !text-[16px]">add</span>
+                  </button>
+                </div>
+                {promptsExpanded && (
+                  <div>
+                    {promptShortcuts.length === 0 ? (
+                      <p className="py-1 text-xs md-text-muted">No prompt shortcuts yet.</p>
+                    ) : (
+                      promptShortcuts.map((shortcut) => (
+                        <div
+                          key={shortcut.id}
+                          className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
+                          onClick={() => {
                             void runPromptShortcut(shortcut);
-                          }
-                        }}
-                        role="button"
-                        tabIndex={0}
-                        aria-label={`Run prompt ${shortcut.name}`}
-                        title={shortcut.prompt}
-                      >
-                        <div className="flex items-center justify-between gap-2">
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              void runPromptShortcut(shortcut);
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                          aria-label={`Run prompt ${shortcut.name}`}
+                          title={shortcut.prompt}
+                        >
                           <div className="flex min-w-0 items-center gap-2">
-                            <span className="truncate text-sm md-text-strong">{shortcut.name}</span>
+                            <span className="material-symbols-rounded !text-base md-text-muted">terminal</span>
+                            <span className="truncate md-text-primary">{shortcut.name}</span>
                             {shortcut.autoRunOnCreate && (
-                              <span className="md-chip !px-2 !py-0 text-[10px]">Auto-run on create</span>
+                              <span className="md-chip !px-2 !py-0 text-[10px]">Auto</span>
                             )}
                           </div>
                           <div className="flex items-center gap-1">
@@ -3601,11 +3625,11 @@ function App() {
                                 e.stopPropagation();
                                 openEditPromptForm(shortcut);
                               }}
-                              className="md-icon-plain"
+                              className="md-icon-plain !h-6 !w-6"
                               title="Edit prompt"
                               aria-label={`Edit ${shortcut.name}`}
                             >
-                              <span className="material-symbols-rounded !text-[16px]">edit</span>
+                              <span className="material-symbols-rounded !text-[14px]">edit</span>
                             </button>
                             <button
                               type="button"
@@ -3613,32 +3637,23 @@ function App() {
                                 e.stopPropagation();
                                 deletePromptShortcut(shortcut.id);
                               }}
-                              className="md-icon-plain md-icon-plain-danger"
+                              className="md-icon-plain md-icon-plain-danger !h-6 !w-6"
                               title="Delete prompt"
                               aria-label={`Delete ${shortcut.name}`}
                             >
-                              <span className="material-symbols-rounded !text-[16px]">delete</span>
+                              <span className="material-symbols-rounded !text-[14px]">delete</span>
                             </button>
                           </div>
                         </div>
-                      </div>
-                    ))}
+                      ))
+                    )}
                   </div>
                 )}
-                <div className="mt-3 flex justify-center">
-                  <button
-                    type="button"
-                    onClick={openAddPromptForm}
-                    className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle"
-                    title="Add prompt shortcut"
-                    aria-label="Add prompt shortcut"
-                  >
-                    <span className="material-symbols-rounded !text-[18px]">add</span>
-                  </button>
-                </div>
               </div>
-              <div className="md-card p-3 md-text-secondary">
-                <div className="flex items-center justify-between gap-2">
+
+              {/* Project Skills section */}
+              <div className="mt-3 border-t md-outline pt-3">
+                <div className="mb-1 flex items-center justify-between gap-2">
                   <button
                     type="button"
                     className="flex min-w-0 items-center gap-1 text-left"
@@ -3648,30 +3663,30 @@ function App() {
                     <span className="material-symbols-rounded !text-[16px] md-text-muted">
                       {projectSkillsExpanded ? "expand_more" : "chevron_right"}
                     </span>
-                    <span className="truncate text-sm md-text-strong">Project Skills ({projectSkills.length})</span>
+                    <span className="md-label-medium">Project Skills ({projectSkills.length})</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => openAddSkillForm("project")}
                     disabled={!selectedRepo}
-                    className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle disabled:cursor-not-allowed disabled:opacity-40"
+                    className="md-icon-plain !h-6 !w-6 disabled:cursor-not-allowed disabled:opacity-40"
                     title={selectedRepo ? "Add project skill" : "Select a repository to add project skills"}
                     aria-label="Add project skill"
                   >
-                    <span className="material-symbols-rounded !text-[18px]">add</span>
+                    <span className="material-symbols-rounded !text-[16px]">add</span>
                   </button>
                 </div>
                 {projectSkillsExpanded && (
-                  <div className="mt-2 space-y-2">
-                    {isSkillsLoading && <p className="text-xs md-text-muted">Loading project skills...</p>}
+                  <div>
+                    {isSkillsLoading && <p className="py-1 text-xs md-text-muted">Loading project skills...</p>}
                     {!isSkillsLoading && projectSkills.length === 0 && (
-                      <p className="text-xs md-text-muted">No project skills found.</p>
+                      <p className="py-1 text-xs md-text-muted">No project skills found.</p>
                     )}
                     {!isSkillsLoading &&
                       projectSkills.map((skill) => (
                         <div
                           key={skill.id}
-                          className="md-card cursor-pointer md-px-2 md-py-2 transition hover:md-surface-subtle"
+                          className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
                           onClick={() => {
                             void runSkillShortcut(skill);
                           }}
@@ -3686,36 +3701,39 @@ function App() {
                           aria-label={`Run skill ${skill.name}`}
                           title={skill.filePath}
                         >
-                          <div className="flex items-center justify-between gap-2">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="material-symbols-rounded !text-base md-text-muted">code_blocks</span>
                             <div className="min-w-0">
-                              <p className="truncate text-sm md-text-strong">{skill.name}</p>
+                              <p className="truncate md-text-primary">{skill.name}</p>
                               <p className="truncate text-[11px] md-text-muted">/{skill.commandName}</p>
                             </div>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                openEditSkillForm(skill);
-                              }}
-                              className="md-icon-plain"
-                              title="Edit skill"
-                              aria-label={`Edit ${skill.name}`}
-                            >
-                              <span className="material-symbols-rounded !text-[16px]">edit</span>
-                            </button>
                           </div>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openEditSkillForm(skill);
+                            }}
+                            className="md-icon-plain !h-6 !w-6"
+                            title="Edit skill"
+                            aria-label={`Edit ${skill.name}`}
+                          >
+                            <span className="material-symbols-rounded !text-[14px]">edit</span>
+                          </button>
                         </div>
                       ))}
+                    {projectSkillsRoot && (
+                      <p className="mt-1 truncate text-[11px] md-text-muted" title={projectSkillsRoot}>
+                        {projectSkillsRoot}
+                      </p>
+                    )}
                   </div>
                 )}
-                {projectSkillsRoot && (
-                  <p className="mt-2 truncate text-[11px] md-text-muted" title={projectSkillsRoot}>
-                    {projectSkillsRoot}
-                  </p>
-                )}
               </div>
-              <div className="md-card p-3 md-text-secondary">
-                <div className="flex items-center justify-between gap-2">
+
+              {/* User Skills section */}
+              <div className="mt-3 border-t md-outline pt-3">
+                <div className="mb-1 flex items-center justify-between gap-2">
                   <button
                     type="button"
                     className="flex min-w-0 items-center gap-1 text-left"
@@ -3725,29 +3743,29 @@ function App() {
                     <span className="material-symbols-rounded !text-[16px] md-text-muted">
                       {userSkillsExpanded ? "expand_more" : "chevron_right"}
                     </span>
-                    <span className="truncate text-sm md-text-strong">User Skills ({userSkills.length})</span>
+                    <span className="md-label-medium">User Skills ({userSkills.length})</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => openAddSkillForm("user")}
-                    className="md-icon-plain !h-8 !w-8 rounded-full border md-outline hover:md-surface-subtle"
+                    className="md-icon-plain !h-6 !w-6"
                     title="Add user skill"
                     aria-label="Add user skill"
                   >
-                    <span className="material-symbols-rounded !text-[18px]">add</span>
+                    <span className="material-symbols-rounded !text-[16px]">add</span>
                   </button>
                 </div>
                 {userSkillsExpanded && (
-                  <div className="mt-2 space-y-2">
-                    {isSkillsLoading && <p className="text-xs md-text-muted">Loading user skills...</p>}
+                  <div>
+                    {isSkillsLoading && <p className="py-1 text-xs md-text-muted">Loading user skills...</p>}
                     {!isSkillsLoading && userSkills.length === 0 && (
-                      <p className="text-xs md-text-muted">No user skills found.</p>
+                      <p className="py-1 text-xs md-text-muted">No user skills found.</p>
                     )}
                     {!isSkillsLoading &&
                       userSkills.map((skill) => (
                         <div
                           key={skill.id}
-                          className="md-card cursor-pointer md-px-2 md-py-2 transition hover:md-surface-subtle"
+                          className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
                           onClick={() => {
                             void runSkillShortcut(skill);
                           }}
@@ -3762,36 +3780,38 @@ function App() {
                           aria-label={`Run skill ${skill.name}`}
                           title={skill.filePath}
                         >
-                          <div className="flex items-center justify-between gap-2">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="material-symbols-rounded !text-base md-text-muted">person</span>
                             <div className="min-w-0">
-                              <p className="truncate text-sm md-text-strong">{skill.name}</p>
+                              <p className="truncate md-text-primary">{skill.name}</p>
                               <p className="truncate text-[11px] md-text-muted">/{skill.commandName}</p>
                             </div>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                openEditSkillForm(skill);
-                              }}
-                              className="md-icon-plain"
-                              title="Edit skill"
-                              aria-label={`Edit ${skill.name}`}
-                            >
-                              <span className="material-symbols-rounded !text-[16px]">edit</span>
-                            </button>
                           </div>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openEditSkillForm(skill);
+                            }}
+                            className="md-icon-plain !h-6 !w-6"
+                            title="Edit skill"
+                            aria-label={`Edit ${skill.name}`}
+                          >
+                            <span className="material-symbols-rounded !text-[14px]">edit</span>
+                          </button>
                         </div>
                       ))}
+                    {userSkillsRoot && (
+                      <p className="mt-1 truncate text-[11px] md-text-muted" title={userSkillsRoot}>
+                        {userSkillsRoot}
+                      </p>
+                    )}
                   </div>
                 )}
-                {userSkillsRoot && (
-                  <p className="mt-2 truncate text-[11px] md-text-muted" title={userSkillsRoot}>
-                    {userSkillsRoot}
-                  </p>
-                )}
               </div>
-              <p className="text-xs md-text-muted">
-                Click to run. Use `/prompt name`, `/project:skill-path`, `/user:skill-path`, or `/skill-path` when unique.
+
+              <p className="mt-3 text-xs md-text-muted">
+                Click to run. Type <code className="text-[11px]">/name</code> in chat.
               </p>
 
               {currentWorkspace && (

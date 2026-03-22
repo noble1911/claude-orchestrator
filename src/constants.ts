@@ -23,17 +23,17 @@ export const NAME_NOUNS = [
 ];
 
 export const MODEL_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: "opus", label: "Opus" },
-  { value: "sonnet", label: "Sonnet" },
-  { value: "haiku", label: "Haiku" },
+  { value: "opus", label: "Opus 4.6" },
+  { value: "sonnet", label: "Sonnet 4.6" },
+  { value: "haiku", label: "Haiku 4.5" },
 ];
 export const DEFAULT_MODEL_ID = "opus";
 
 export const THINKING_MODE_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: "off", label: "Think off" },
-  { value: "low", label: "Think low" },
-  { value: "medium", label: "Think med" },
-  { value: "high", label: "Think high" },
+  { value: "off", label: "Off" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
 ];
 
 export const PROMPT_SHORTCUTS_STORAGE_KEY = "claude_orchestrator_prompt_shortcuts";
