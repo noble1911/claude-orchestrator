@@ -12,14 +12,15 @@ use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 mod database;
+pub mod helpers;
 mod http_server;
 pub mod types;
 mod websocket_server;
 
 use database::Database;
+use helpers::*;
 use http_server::HttpServer;
 pub use types::*;
 use websocket_server::{
@@ -31,21 +32,6 @@ static CLAUDE_HELP_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::n
 const REMOTE_SERVER_PORT: u16 = 3001;
 const HTTP_SERVER_PORT: u16 = 3002;
 
-/// Maximum number of bytes to read from a workspace file.
-const MAX_FILE_READ_BYTES: usize = 200_000;
-
-/// Error message returned when a workspace ID is not found in state.
-const ERR_WORKSPACE_NOT_FOUND: &str = "Workspace not found";
-
-/// Generate a new RFC 3339 timestamp string for the current instant.
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
-
-/// Generate a new random UUID string.
-fn new_id() -> String {
-    Uuid::new_v4().to_string()
-}
 
 // Application State
 pub struct AppState {
