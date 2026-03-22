@@ -1123,10 +1123,6 @@ fn claude_supports_permission_mode(claude_path: &str) -> bool {
     claude_supports_option(claude_path, "--permission-mode")
 }
 
-fn claude_supports_permission_prompt_tool(claude_path: &str) -> bool {
-    claude_supports_option(claude_path, "--permission-prompt-tool")
-}
-
 fn claude_supports_model_option(claude_path: &str) -> bool {
     claude_supports_option(claude_path, "--model")
 }
@@ -1154,11 +1150,11 @@ fn append_claude_request_args(
     claude_session_id: Option<&str>,
     prompt: &str,
 ) -> bool {
-    let interactive = needs_interactive_permissions(permission_mode)
-        && claude_supports_permission_prompt_tool(claude_path);
+    let supports_stream = claude_supports_stream_json(claude_path);
+    let interactive = needs_interactive_permissions(permission_mode) && supports_stream;
 
     cmd.arg("--print");
-    if claude_supports_stream_json(claude_path) {
+    if supports_stream {
         cmd.arg("--verbose");
         cmd.args(["--output-format", "stream-json"]);
     }
@@ -1171,7 +1167,6 @@ fn append_claude_request_args(
         // Enable bidirectional stream-json so we can receive control_request
         // events (permission prompts) on stdout and send control_response
         // replies on stdin.
-        cmd.args(["--permission-prompt-tool", "stdio"]);
         cmd.args(["--input-format", "stream-json"]);
     }
     if let Some(model) = model {
