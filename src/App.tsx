@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   DndContext,
   DragOverlay,
@@ -543,6 +544,15 @@ function App() {
 
   useEffect(() => {
     void loadSkills(selectedRepo);
+  }, [selectedRepo]);
+
+  useEffect(() => {
+    const unlisten = listen("skills-changed", () => {
+      void loadSkills(selectedRepo);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
   }, [selectedRepo]);
 
   useEffect(() => {
@@ -1726,6 +1736,25 @@ function App() {
     } finally {
       setIsSkillsLoading(false);
     }
+  }
+
+  async function openSkillsMarketplace(scope: SkillScope) {
+    const repoParam =
+      scope === "project" && selectedRepo ? `&repoId=${selectedRepo}` : "";
+    const url = `index.html?view=marketplace&scope=${scope}${repoParam}`;
+    const existing = await WebviewWindow.getByLabel("skills-marketplace");
+    if (existing) {
+      await existing.setFocus();
+      return;
+    }
+    new WebviewWindow("skills-marketplace", {
+      url,
+      title: "Skills Marketplace",
+      width: 720,
+      height: 600,
+      resizable: true,
+      center: true,
+    });
   }
 
   function openAddSkillForm(scope: SkillScope) {
@@ -3887,16 +3916,28 @@ function App() {
                     </span>
                     <span className="md-label-medium">Project Skills ({projectSkills.length})</span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => openAddSkillForm("project")}
-                    disabled={!selectedRepo}
-                    className="md-icon-plain !h-6 !w-6 disabled:cursor-not-allowed disabled:opacity-40"
-                    title={selectedRepo ? "Add project skill" : "Select a repository to add project skills"}
-                    aria-label="Add project skill"
-                  >
-                    <span className="material-symbols-rounded !text-[16px]">add</span>
-                  </button>
+                  <div className="flex items-center">
+                    <button
+                      type="button"
+                      onClick={() => openSkillsMarketplace("project")}
+                      disabled={!selectedRepo}
+                      className="md-icon-plain !h-6 !w-6 disabled:cursor-not-allowed disabled:opacity-40"
+                      title="Browse skills marketplace"
+                      aria-label="Browse skills marketplace"
+                    >
+                      <span className="material-symbols-rounded !text-[16px]">storefront</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openAddSkillForm("project")}
+                      disabled={!selectedRepo}
+                      className="md-icon-plain !h-6 !w-6 disabled:cursor-not-allowed disabled:opacity-40"
+                      title={selectedRepo ? "Add project skill" : "Select a repository to add project skills"}
+                      aria-label="Add project skill"
+                    >
+                      <span className="material-symbols-rounded !text-[16px]">add</span>
+                    </button>
+                  </div>
                 </div>
                 {projectSkillsExpanded && (
                   <div>
@@ -3967,15 +4008,26 @@ function App() {
                     </span>
                     <span className="md-label-medium">User Skills ({userSkills.length})</span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => openAddSkillForm("user")}
-                    className="md-icon-plain !h-6 !w-6"
-                    title="Add user skill"
-                    aria-label="Add user skill"
-                  >
-                    <span className="material-symbols-rounded !text-[16px]">add</span>
-                  </button>
+                  <div className="flex items-center">
+                    <button
+                      type="button"
+                      onClick={() => openSkillsMarketplace("user")}
+                      className="md-icon-plain !h-6 !w-6"
+                      title="Browse skills marketplace"
+                      aria-label="Browse skills marketplace"
+                    >
+                      <span className="material-symbols-rounded !text-[16px]">storefront</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openAddSkillForm("user")}
+                      className="md-icon-plain !h-6 !w-6"
+                      title="Add user skill"
+                      aria-label="Add user skill"
+                    >
+                      <span className="material-symbols-rounded !text-[16px]">add</span>
+                    </button>
+                  </div>
                 </div>
                 {userSkillsExpanded && (
                   <div>
