@@ -112,6 +112,12 @@ export interface WorkspaceCheckDefinition {
   description: string;
 }
 
+export interface CustomCheck {
+  id: string;
+  name: string;
+  command: string;
+}
+
 export interface TerminalCommandResult {
   command: string;
   cwd: string;

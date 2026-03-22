@@ -4202,6 +4202,50 @@ async fn run_workspace_checks(
     Ok(results)
 }
 
+#[tauri::command]
+async fn run_single_workspace_check(
+    workspace_id: String,
+    check_name: String,
+    check_command: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<WorkspaceCheckResult, String> {
+    let workspace_root = {
+        let workspaces = state.workspaces.read();
+        let workspace = workspaces
+            .get(&workspace_id)
+            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
+        workspace.worktree_path.clone()
+    };
+
+    let mut parts = check_command.split_whitespace();
+    let bin = parts.next().ok_or("Invalid check command")?;
+    let args: Vec<String> = parts.map(|arg| arg.to_string()).collect();
+    let started = Instant::now();
+
+    match Command::new(bin).args(&args).current_dir(&workspace_root).output() {
+        Ok(output) => Ok(WorkspaceCheckResult {
+            name: check_name,
+            command: check_command,
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            duration_ms: started.elapsed().as_millis(),
+            skipped: false,
+        }),
+        Err(e) => Ok(WorkspaceCheckResult {
+            name: check_name,
+            command: check_command,
+            success: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("Failed to execute check: {}", e),
+            duration_ms: started.elapsed().as_millis(),
+            skipped: false,
+        }),
+    }
+}
+
 // WebSocket command handler
 async fn handle_ws_commands(
     mut rx: mpsc::UnboundedReceiver<ServerCommand>,
@@ -6085,6 +6129,7 @@ pub fn run() {
             read_workspace_change_diff,
             list_workspace_checks,
             run_workspace_checks,
+            run_single_workspace_check,
             run_workspace_terminal_command,
         ])
         .run(tauri::generate_context!())

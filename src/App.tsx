@@ -70,6 +70,7 @@ import {
   CHAT_FONT_SIZE_DEFAULT,
   V2_CHAT_STORAGE_KEY,
   THINKING_MODE_OPTIONS,
+  CUSTOM_CHECKS_STORAGE_KEY,
 } from "./constants";
 import {
   compactActivityLines,
@@ -113,6 +114,7 @@ import type {
   WorkspaceChangeEntry,
   WorkspaceCheckResult,
   WorkspaceCheckDefinition,
+  CustomCheck,
   TerminalCommandResult,
   TerminalLine,
   PromptShortcut,
@@ -173,10 +175,18 @@ function App() {
   const [activeCenterTabId, setActiveCenterTabId] = useState("chat");
   const [workspaceChanges, setWorkspaceChanges] = useState<WorkspaceChangeEntry[]>([]);
   const [isLoadingChanges, setIsLoadingChanges] = useState(false);
-  const [checkResults, setCheckResults] = useState<WorkspaceCheckResult[]>([]);
   const [detectedChecks, setDetectedChecks] = useState<WorkspaceCheckDefinition[]>([]);
   const [isLoadingDetectedChecks, setIsLoadingDetectedChecks] = useState(false);
   const [isRunningChecks, setIsRunningChecks] = useState(false);
+  const [customChecks, setCustomChecks] = useState<CustomCheck[]>([]);
+  const [detectedChecksExpanded, setDetectedChecksExpanded] = useState(true);
+  const [customChecksExpanded, setCustomChecksExpanded] = useState(true);
+  const [showAddCheckForm, setShowAddCheckForm] = useState(false);
+  const [editingCheckId, setEditingCheckId] = useState<string | null>(null);
+  const [newCheckName, setNewCheckName] = useState("");
+  const [newCheckCommand, setNewCheckCommand] = useState("");
+  const [runningCheckKey, setRunningCheckKey] = useState<string | null>(null);
+  const [checkResultByKey, setCheckResultByKey] = useState<Record<string, WorkspaceCheckResult>>({});
   const [promptShortcuts, setPromptShortcuts] = useState<PromptShortcut[]>([]);
   const [showAddPromptForm, setShowAddPromptForm] = useState(false);
   const [editingPromptId, setEditingPromptId] = useState<string | null>(null);
@@ -764,6 +774,32 @@ function App() {
   }, [promptShortcuts]);
 
   useEffect(() => {
+    try {
+      const raw = localStorage.getItem(CUSTOM_CHECKS_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        setCustomChecks(
+          parsed.filter(
+            (item): item is CustomCheck =>
+              !!item && typeof item === "object" && typeof item.id === "string" && typeof item.name === "string" && typeof item.command === "string",
+          ),
+        );
+      }
+    } catch (err) {
+      console.error("Failed to load custom checks:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(CUSTOM_CHECKS_STORAGE_KEY, JSON.stringify(customChecks));
+    } catch (err) {
+      console.error("Failed to persist custom checks:", err);
+    }
+  }, [customChecks]);
+
+  useEffect(() => {
     saveCustomThemes(customThemes);
   }, [customThemes]);
 
@@ -967,7 +1003,7 @@ function App() {
       setCenterTabs([{ id: "chat", type: "chat", title: "Chat" }]);
       setActiveCenterTabId("chat");
       setWorkspaceChanges([]);
-      setCheckResults([]);
+      setCheckResultByKey({});
       setDetectedChecks([]);
       setTerminalInput("");
       setAttachedFiles([]);
@@ -984,7 +1020,7 @@ function App() {
     setCenterTabs([{ id: "chat", type: "chat", title: "Chat" }]);
     setActiveCenterTabId("chat");
     setWorkspaceChanges([]);
-    setCheckResults([]);
+    setCheckResultByKey({});
     setDetectedChecks([]);
     setTerminalInput("");
     setAttachedFiles([]);
@@ -2303,7 +2339,11 @@ function App() {
       const results = await invoke<WorkspaceCheckResult[]>("run_workspace_checks", {
         workspaceId,
       });
-      setCheckResults(results);
+      const newResults: Record<string, WorkspaceCheckResult> = {};
+      for (const r of results) {
+        newResults[`${r.name}::${r.command}`] = r;
+      }
+      setCheckResultByKey((prev) => ({ ...prev, ...newResults }));
       let passCount = 0;
       for (const result of results) {
         appendTerminalLine(workspaceId, "command", `$ ${result.command}`);
@@ -2334,6 +2374,70 @@ function App() {
     } finally {
       setIsRunningChecks(false);
     }
+  }
+
+  async function runSingleCheck(checkName: string, checkCommand: string) {
+    if (!selectedWorkspace) return;
+    const key = `${checkName}::${checkCommand}`;
+    setRunningCheckKey(key);
+    try {
+      const result = await invoke<WorkspaceCheckResult>("run_single_workspace_check", {
+        workspaceId: selectedWorkspace,
+        checkName,
+        checkCommand,
+      });
+      setCheckResultByKey((prev) => ({ ...prev, [key]: result }));
+      appendTerminalLine(selectedWorkspace, "command", `$ ${result.command}`);
+      appendTerminalLine(
+        selectedWorkspace,
+        "meta",
+        `${result.success ? "PASS" : "FAIL"} ${result.name} · exit ${result.exitCode ?? "?"} · ${result.durationMs}ms`,
+      );
+      if (result.stdout.trim()) {
+        appendTerminalLine(selectedWorkspace, "stdout", result.stdout.trimEnd());
+      }
+      if (result.stderr.trim()) {
+        appendTerminalLine(selectedWorkspace, "stderr", result.stderr.trimEnd());
+      }
+    } catch (err) {
+      console.error("Failed to run check:", err);
+      setError(String(err));
+    } finally {
+      setRunningCheckKey(null);
+    }
+  }
+
+  function saveCustomCheck() {
+    const name = newCheckName.trim();
+    const command = newCheckCommand.trim();
+    if (!name || !command) return;
+    if (editingCheckId) {
+      setCustomChecks((prev) => prev.map((c) => (c.id === editingCheckId ? { ...c, name, command } : c)));
+    } else {
+      setCustomChecks((prev) => [...prev, { id: `${Date.now()}-${Math.floor(Math.random() * 100000)}`, name, command }]);
+    }
+    setNewCheckName("");
+    setNewCheckCommand("");
+    setShowAddCheckForm(false);
+    setEditingCheckId(null);
+  }
+
+  function deleteCustomCheck(id: string) {
+    setCustomChecks((prev) => prev.filter((c) => c.id !== id));
+  }
+
+  function openEditCheckForm(check: CustomCheck) {
+    setEditingCheckId(check.id);
+    setNewCheckName(check.name);
+    setNewCheckCommand(check.command);
+    setShowAddCheckForm(true);
+  }
+
+  function openAddCheckForm() {
+    setEditingCheckId(null);
+    setNewCheckName("");
+    setNewCheckCommand("");
+    setShowAddCheckForm(true);
   }
 
   const currentTerminalLines = selectedWorkspace ? terminalLinesByWorkspace[selectedWorkspace] || [] : [];
@@ -3929,68 +4033,257 @@ function App() {
           )}
 
           {activeRightTab === "checks" && (
-            <div className="md-card p-3 text-xs">
-              <div className="mb-2 flex items-center justify-between">
-                <span className="md-text-secondary">Workspace checks</span>
+            <div className="text-sm">
+              {/* Run All button */}
+              <div className="mb-3 flex items-center justify-end">
                 <button
                   onClick={runWorkspaceChecks}
                   disabled={!selectedWorkspace || isRunningChecks}
                   className="md-btn md-btn-tonal disabled:opacity-50"
                 >
-                  {isRunningChecks ? "Running..." : "Run checks"}
+                  {isRunningChecks ? "Running all..." : "Run all"}
                 </button>
               </div>
 
-              <div className="mb-3 border-b pb-3 md-outline">
-                <p className="mb-2 md-text-dim">Detected checks</p>
-                {isLoadingDetectedChecks && <p className="md-text-muted">Detecting checks...</p>}
-                {!isLoadingDetectedChecks && detectedChecks.length === 0 && (
-                  <p className="md-text-muted">No checks detected for this workspace.</p>
-                )}
-                {!isLoadingDetectedChecks && detectedChecks.length > 0 && (
-                  <div className="space-y-2">
-                    {detectedChecks.map((check) => (
-                      <div key={`${check.name}-${check.command}`} className="md-card p-2">
-                        <div className="mb-1 flex items-center justify-between gap-2">
-                          <span className="md-text-secondary">{check.name}</span>
-                        </div>
-                        <p className="truncate font-mono text-[11px] md-text-muted">{check.command}</p>
-                        <p className="mt-1 text-[11px] md-text-muted">{check.description}</p>
-                      </div>
-                    ))}
+              {/* Detected Checks section */}
+              <div>
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    className="flex min-w-0 items-center gap-1 text-left"
+                    onClick={() => setDetectedChecksExpanded((prev) => !prev)}
+                    aria-expanded={detectedChecksExpanded}
+                  >
+                    <span className="material-symbols-rounded !text-[16px] md-text-muted">
+                      {detectedChecksExpanded ? "expand_more" : "chevron_right"}
+                    </span>
+                    <span className="md-label-medium">Detected Checks ({detectedChecks.length})</span>
+                  </button>
+                </div>
+                {detectedChecksExpanded && (
+                  <div>
+                    {isLoadingDetectedChecks && <p className="py-1 text-xs md-text-muted">Detecting checks...</p>}
+                    {!isLoadingDetectedChecks && detectedChecks.length === 0 && (
+                      <p className="py-1 text-xs md-text-muted">No checks detected for this workspace.</p>
+                    )}
+                    {!isLoadingDetectedChecks &&
+                      detectedChecks.map((check) => {
+                        const key = `${check.name}::${check.command}`;
+                        const result = checkResultByKey[key];
+                        const isRunning = runningCheckKey === key;
+                        return (
+                          <div key={key}>
+                            <div
+                              className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
+                              onClick={() => {
+                                if (!isRunning) void runSingleCheck(check.name, check.command);
+                              }}
+                              onKeyDown={(e) => {
+                                if ((e.key === "Enter" || e.key === " ") && !isRunning) {
+                                  e.preventDefault();
+                                  void runSingleCheck(check.name, check.command);
+                                }
+                              }}
+                              role="button"
+                              tabIndex={0}
+                              aria-label={`Run check ${check.name}`}
+                              title={check.command}
+                            >
+                              <div className="flex min-w-0 items-center gap-2">
+                                <span className="material-symbols-rounded !text-base md-text-muted">
+                                  {isRunning ? "progress_activity" : result ? (result.success ? "check_circle" : "cancel") : "play_circle"}
+                                </span>
+                                <span className="min-w-0">
+                                  <span className={`block truncate ${result ? (result.success ? "text-emerald-300" : "text-rose-300") : "md-text-primary"}`}>
+                                    {check.name}
+                                  </span>
+                                  <span className="block truncate font-mono text-[11px] md-text-muted">{check.command}</span>
+                                </span>
+                              </div>
+                              {result && (
+                                <span className="flex-none text-[11px] md-text-muted">{result.durationMs}ms</span>
+                              )}
+                            </div>
+                            {result && (result.stdout || result.stderr) && (
+                              <div className="mb-1 ml-7 mr-2">
+                                {!!result.stdout && (
+                                  <pre className="max-h-24 overflow-auto whitespace-pre-wrap rounded px-2 py-1 text-[11px] text-emerald-200 md-surface-subtle">
+                                    {result.stdout}
+                                  </pre>
+                                )}
+                                {!!result.stderr && (
+                                  <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap rounded px-2 py-1 text-[11px] text-rose-300 md-surface-subtle">
+                                    {result.stderr}
+                                  </pre>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
                   </div>
                 )}
               </div>
 
-              {!isRunningChecks && checkResults.length === 0 && (
-                <p className="md-text-muted">Run checks to see summary results.</p>
-              )}
-
-              {checkResults.length > 0 && (
-                <div className="space-y-2">
-                  {checkResults.map((check, index) => (
-                    <div key={`${check.name}-${index}`} className="md-card p-2">
-                      <div className="mb-1 flex items-center justify-between">
-                        <span className={check.success ? "text-emerald-300" : "text-rose-300"}>
-                          {check.success ? "PASS" : "FAIL"} {check.name}
-                        </span>
-                        <span className="text-[11px] md-text-muted">{check.durationMs}ms</span>
-                      </div>
-                      <p className="truncate font-mono text-[11px] md-text-muted">{check.command}</p>
-                      {!!check.stdout && (
-                        <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap text-[11px] text-emerald-200">
-                          {check.stdout}
-                        </pre>
-                      )}
-                      {!!check.stderr && (
-                        <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap text-[11px] text-rose-300">
-                          {check.stderr}
-                        </pre>
-                      )}
-                    </div>
-                  ))}
+              {/* Custom Checks section */}
+              <div className="mt-3 border-t md-outline pt-3">
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    className="flex min-w-0 items-center gap-1 text-left"
+                    onClick={() => setCustomChecksExpanded((prev) => !prev)}
+                    aria-expanded={customChecksExpanded}
+                  >
+                    <span className="material-symbols-rounded !text-[16px] md-text-muted">
+                      {customChecksExpanded ? "expand_more" : "chevron_right"}
+                    </span>
+                    <span className="md-label-medium">Custom Checks ({customChecks.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={openAddCheckForm}
+                    className="md-icon-plain !h-6 !w-6"
+                    title="Add custom check"
+                    aria-label="Add custom check"
+                  >
+                    <span className="material-symbols-rounded !text-[16px]">add</span>
+                  </button>
                 </div>
-              )}
+                {customChecksExpanded && (
+                  <div>
+                    {showAddCheckForm && (
+                      <div className="mb-2 space-y-2 rounded-md p-2 md-surface-subtle">
+                        <input
+                          type="text"
+                          value={newCheckName}
+                          onChange={(e) => setNewCheckName(e.target.value)}
+                          placeholder="Check name"
+                          className="md-input w-full"
+                          autoFocus
+                        />
+                        <input
+                          type="text"
+                          value={newCheckCommand}
+                          onChange={(e) => setNewCheckCommand(e.target.value)}
+                          placeholder="Command (e.g. npm run lint)"
+                          className="md-input w-full font-mono"
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              saveCustomCheck();
+                            }
+                          }}
+                        />
+                        <div className="flex justify-end gap-2">
+                          <button
+                            type="button"
+                            className="md-btn md-btn-text"
+                            onClick={() => {
+                              setShowAddCheckForm(false);
+                              setEditingCheckId(null);
+                              setNewCheckName("");
+                              setNewCheckCommand("");
+                            }}
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            className="md-btn md-btn-tonal"
+                            onClick={saveCustomCheck}
+                            disabled={!newCheckName.trim() || !newCheckCommand.trim()}
+                          >
+                            {editingCheckId ? "Save" : "Add"}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {customChecks.length === 0 && !showAddCheckForm && (
+                      <p className="py-1 text-xs md-text-muted">No custom checks yet.</p>
+                    )}
+                    {customChecks.map((check) => {
+                      const key = `${check.name}::${check.command}`;
+                      const result = checkResultByKey[key];
+                      const isRunning = runningCheckKey === key;
+                      return (
+                        <div key={check.id}>
+                          <div
+                            className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md md-px-2 md-py-1.5 text-left text-xs transition hover:md-surface-subtle"
+                            onClick={() => {
+                              if (!isRunning) void runSingleCheck(check.name, check.command);
+                            }}
+                            onKeyDown={(e) => {
+                              if ((e.key === "Enter" || e.key === " ") && !isRunning) {
+                                e.preventDefault();
+                                void runSingleCheck(check.name, check.command);
+                              }
+                            }}
+                            role="button"
+                            tabIndex={0}
+                            aria-label={`Run check ${check.name}`}
+                            title={check.command}
+                          >
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="material-symbols-rounded !text-base md-text-muted">
+                                {isRunning ? "progress_activity" : result ? (result.success ? "check_circle" : "cancel") : "play_circle"}
+                              </span>
+                              <span className="min-w-0">
+                                <span className={`block truncate ${result ? (result.success ? "text-emerald-300" : "text-rose-300") : "md-text-primary"}`}>
+                                  {check.name}
+                                </span>
+                                <span className="block truncate font-mono text-[11px] md-text-muted">{check.command}</span>
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              {result && (
+                                <span className="flex-none text-[11px] md-text-muted">{result.durationMs}ms</span>
+                              )}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openEditCheckForm(check);
+                                }}
+                                className="md-icon-plain !h-6 !w-6"
+                                title="Edit check"
+                                aria-label={`Edit ${check.name}`}
+                              >
+                                <span className="material-symbols-rounded !text-[14px]">edit</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  deleteCustomCheck(check.id);
+                                }}
+                                className="md-icon-plain md-icon-plain-danger !h-6 !w-6"
+                                title="Delete check"
+                                aria-label={`Delete ${check.name}`}
+                              >
+                                <span className="material-symbols-rounded !text-[14px]">delete</span>
+                              </button>
+                            </div>
+                          </div>
+                          {result && (result.stdout || result.stderr) && (
+                            <div className="mb-1 ml-7 mr-2">
+                              {!!result.stdout && (
+                                <pre className="max-h-24 overflow-auto whitespace-pre-wrap rounded px-2 py-1 text-[11px] text-emerald-200 md-surface-subtle">
+                                  {result.stdout}
+                                </pre>
+                              )}
+                              {!!result.stderr && (
+                                <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap rounded px-2 py-1 text-[11px] text-rose-300 md-surface-subtle">
+                                  {result.stderr}
+                                </pre>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
