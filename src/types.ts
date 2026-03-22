@@ -151,6 +151,17 @@ export interface SkillCatalogResponse {
   userSkills: SkillShortcut[];
 }
 
+export interface MarketplaceSkill {
+  /** Directory name in the GitHub repo (e.g., "frontend-design") */
+  dirName: string;
+  /** Display name from SKILL.md frontmatter */
+  name: string;
+  /** Description from SKILL.md frontmatter */
+  description: string;
+  /** Full SKILL.md content (body without frontmatter) */
+  content: string;
+}
+
 export interface CenterTab {
   id: string;
   type: "chat" | "file" | "diff";
