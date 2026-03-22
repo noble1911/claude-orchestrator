@@ -1806,6 +1806,21 @@ function App() {
     }
   }
 
+  async function deleteSkill(skill: SkillShortcut) {
+    if (!window.confirm(`Delete skill "${skill.name}"?`)) return;
+    try {
+      await invoke("delete_skill", {
+        scope: skill.scope,
+        repoId: skill.scope === "project" ? selectedRepo : null,
+        relativePath: skill.relativePath,
+      });
+      await loadSkills(selectedRepo);
+    } catch (err) {
+      console.error("Failed to delete skill:", err);
+      setError(String(err));
+    }
+  }
+
   async function runSkillShortcut(skill: SkillShortcut, args?: string) {
     const trimmedArgs = args?.trim();
     const command = trimmedArgs ? `/${skill.commandName} ${trimmedArgs}` : `/${skill.commandName}`;
@@ -3976,18 +3991,32 @@ function App() {
                               <p className="truncate text-[11px] md-text-muted">/{skill.commandName}</p>
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              openEditSkillForm(skill);
-                            }}
-                            className="md-icon-plain !h-6 !w-6"
-                            title="Edit skill"
-                            aria-label={`Edit ${skill.name}`}
-                          >
-                            <span className="material-symbols-rounded !text-[14px]">edit</span>
-                          </button>
+                          <div className="flex items-center">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openEditSkillForm(skill);
+                              }}
+                              className="md-icon-plain !h-6 !w-6"
+                              title="Edit skill"
+                              aria-label={`Edit ${skill.name}`}
+                            >
+                              <span className="material-symbols-rounded !text-[14px]">edit</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void deleteSkill(skill);
+                              }}
+                              className="md-icon-plain md-icon-plain-danger !h-6 !w-6"
+                              title="Delete skill"
+                              aria-label={`Delete ${skill.name}`}
+                            >
+                              <span className="material-symbols-rounded !text-[14px]">delete</span>
+                            </button>
+                          </div>
                         </div>
                       ))}
                     {projectSkillsRoot && (
@@ -4066,18 +4095,32 @@ function App() {
                               <p className="truncate text-[11px] md-text-muted">/{skill.commandName}</p>
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              openEditSkillForm(skill);
-                            }}
-                            className="md-icon-plain !h-6 !w-6"
-                            title="Edit skill"
-                            aria-label={`Edit ${skill.name}`}
-                          >
-                            <span className="material-symbols-rounded !text-[14px]">edit</span>
-                          </button>
+                          <div className="flex items-center">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openEditSkillForm(skill);
+                              }}
+                              className="md-icon-plain !h-6 !w-6"
+                              title="Edit skill"
+                              aria-label={`Edit ${skill.name}`}
+                            >
+                              <span className="material-symbols-rounded !text-[14px]">edit</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void deleteSkill(skill);
+                              }}
+                              className="md-icon-plain md-icon-plain-danger !h-6 !w-6"
+                              title="Delete skill"
+                              aria-label={`Delete ${skill.name}`}
+                            >
+                              <span className="material-symbols-rounded !text-[14px]">delete</span>
+                            </button>
+                          </div>
                         </div>
                       ))}
                     {userSkillsRoot && (
