@@ -7,11 +7,14 @@ import { useState, useEffect, type Dispatch, type SetStateAction } from "react";
  *
  * Defaults to JSON.stringify / JSON.parse for non-string types.
  * For simple string values, pass identity functions.
+ *
+ * If `serialize` returns `null`, the key is removed from localStorage
+ * (useful for cleaning up empty objects/arrays).
  */
 export function usePersistedState<T>(
   key: string,
   defaultValue: T,
-  serialize: (v: T) => string = JSON.stringify,
+  serialize: (v: T) => string | null = JSON.stringify,
   deserialize: (raw: string) => T = JSON.parse,
 ): [T, Dispatch<SetStateAction<T>>] {
   const [value, setValue] = useState<T>(() => {
@@ -24,7 +27,12 @@ export function usePersistedState<T>(
   });
 
   useEffect(() => {
-    localStorage.setItem(key, serialize(value));
+    const serialized = serialize(value);
+    if (serialized === null) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, serialized);
+    }
   }, [key, serialize, value]);
 
   return [value, setValue];

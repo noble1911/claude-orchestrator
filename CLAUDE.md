@@ -17,9 +17,10 @@ claude-orchestrator/
 ├── src-tauri/                    # Rust backend
 │   ├── src/
 │   │   ├── lib.rs               # Tauri commands, app state, Claude CLI execution
+│   │   ├── types.rs             # Shared structs/enums (extracted Phase 1)
+│   │   ├── helpers.rs           # Shared helpers: now_rfc3339(), new_id(), constants
 │   │   ├── database.rs          # SQLite schema & CRUD operations
-│   │   ├── websocket_server.rs  # WebSocket server for mobile/web clients
-│   │   └── process_manager.rs   # (Legacy) Claude CLI process management
+│   │   └── websocket_server.rs  # WebSocket server for mobile/web clients
 │   ├── Cargo.toml
 │   └── tauri.conf.json
 │
@@ -30,12 +31,24 @@ claude-orchestrator/
 │   ├── themes.ts                # Theme system (built-in + custom themes)
 │   ├── App.tsx                  # Main orchestrator component (state, effects, layout)
 │   ├── main.tsx                 # Entry point
+│   ├── hooks/
+│   │   ├── usePersistedState.ts # localStorage persistence hook (Phase 2, broadly adopted)
+│   │   ├── useTauriListener.ts  # Generic Tauri event subscribe/cleanup
+│   │   ├── useAgentEvents.ts    # Agent message, run-state, permission listeners
+│   │   └── usePanelResize.ts    # 3-panel resize logic (left, right, terminal)
 │   └── components/
+│       ├── GroupDropZone.tsx        # Kanban group drop target
 │       ├── LinkifiedInlineText.tsx  # Auto-links URLs in plain text
 │       ├── MarkdownCodeBlock.tsx    # Code block with copy button
 │       ├── MarkdownMessage.tsx      # Full markdown renderer for agent responses
+│       ├── PermissionCard.tsx       # Agent permission request UI
 │       ├── QuestionCard.tsx         # Agent question UI with option selection
-│       └── SortableWorkspaceItem.tsx # Drag-and-drop workspace sidebar entry
+│       ├── SettingsModal.tsx        # App settings dialog
+│       ├── SkillsMarketplace.tsx    # Skills browsing & management
+│       ├── SortableGroupItem.tsx    # Drag-and-drop group entry
+│       ├── SortableWorkspaceItem.tsx # Drag-and-drop workspace sidebar entry
+│       ├── ThinkingTimer.tsx        # Agent thinking duration indicator
+│       └── ToolbarDropdown.tsx      # Reusable toolbar dropdown menu
 │
 ├── package.json
 ├── vite.config.ts
@@ -81,20 +94,34 @@ Pure functions with no React dependencies (except `ReactNode` for `extractTextFr
 Complete theme system: built-in theme definitions, custom theme CRUD, CSS variable application. Themes are stored in localStorage.
 
 ### `src/App.tsx` (main orchestrator)
-Still the largest file (~4,500 lines). Contains:
-- **State management**: ~120 useState hooks for all app state
+Still the largest file (~4,950 lines). Contains:
+- **State management**: ~36 useState hooks for app state (reduced from ~47 via hook extractions)
 - **Event listeners**: Tauri event subscriptions (agent-message, agent-run-state, remote-clients)
 - **Effect hooks**: localStorage persistence, polling, keyboard shortcuts, panel resizing
 - **Handler functions**: CRUD for workspaces/repos, agent control, file browsing, terminal, checks
 - **JSX layout**: Three-panel layout (left sidebar, center chat/file viewer, right tools panel)
 
+### `src/hooks/`
+Custom React hooks extracted from App.tsx:
+- **usePersistedState**: Generic localStorage persistence hook (broadly adopted — 11 of ~15 pairs migrated)
+- **useTauriListener**: Generic Tauri event subscribe/cleanup wrapper
+- **useAgentEvents**: Agent message, run-state, and permission-request event handlers
+- **usePanelResize**: 3-panel resize logic with configurable min/max constraints
+
 ### `src/components/`
 Extracted UI components that are self-contained (no dependency on App state):
-- **MarkdownMessage**: Renders agent responses with full GFM support, code highlighting, link handling
-- **QuestionCard**: Handles agent questions with single/multi-select options and bundled answers
-- **SortableWorkspaceItem**: DnD-enabled workspace entry with status indicator, pin, rename, delete
+- **GroupDropZone**: Kanban group drop target for workspace drag-and-drop
 - **LinkifiedInlineText**: Auto-detects and linkifies URLs in plain text
 - **MarkdownCodeBlock**: Code block with copy-to-clipboard button
+- **MarkdownMessage**: Renders agent responses with full GFM support, code highlighting, link handling
+- **PermissionCard**: Agent permission request UI with approve/deny actions
+- **QuestionCard**: Handles agent questions with single/multi-select options and bundled answers
+- **SettingsModal**: App-wide settings dialog (497 lines)
+- **SkillsMarketplace**: Skills browsing, installation, and management
+- **SortableGroupItem**: DnD-enabled Kanban group entry
+- **SortableWorkspaceItem**: DnD-enabled workspace sidebar entry with status indicator, pin, rename, delete
+- **ThinkingTimer**: Agent thinking duration indicator
+- **ToolbarDropdown**: Reusable dropdown menu for toolbar actions
 
 ## Key Features
 
@@ -134,15 +161,18 @@ When an agent is busy (thinking), new messages are queued and sent automatically
 
 | File | Purpose |
 |------|---------|
-| `src-tauri/src/lib.rs` | All Tauri commands, state management, Claude CLI execution |
+| `src-tauri/src/lib.rs` | All Tauri commands, state management, Claude CLI execution (~6,840 lines) |
+| `src-tauri/src/types.rs` | Shared structs/enums (extracted Phase 1) |
+| `src-tauri/src/helpers.rs` | Shared helpers: `now_rfc3339()`, `new_id()`, constants |
 | `src-tauri/src/database.rs` | SQLite schema and CRUD operations |
 | `src-tauri/src/websocket_server.rs` | WebSocket server for remote clients |
 | `src/types.ts` | All shared TypeScript interfaces & type aliases |
 | `src/constants.ts` | Storage keys, defaults, model options |
 | `src/utils.ts` | Pure utility functions (message handling, URL parsing, etc.) |
 | `src/themes.ts` | Theme definitions & management |
-| `src/App.tsx` | Main React component (state, effects, handlers, layout) |
-| `src/components/*.tsx` | Extracted UI components (Markdown, QuestionCard, etc.) |
+| `src/App.tsx` | Main React component (state, effects, handlers, layout) (~4,950 lines) |
+| `src/hooks/*.ts` | Custom React hooks (usePersistedState, useTauriListener, useAgentEvents, usePanelResize) |
+| `src/components/*.tsx` | 12 extracted UI components |
 
 ## Development Commands
 
@@ -225,7 +255,7 @@ Mobile clients connect to `ws://localhost:3001` and can send:
 - Don't add pure utility functions to `App.tsx` - put them in `utils.ts`
 - Don't add new components inline in `App.tsx` - create files in `components/`
 - Don't duplicate logic between Tauri commands and WebSocket handlers — have WS handlers call the shared function
-- Don't add new `useEffect` pairs for localStorage — use `usePersistedState` hook (once extracted)
+- Don't add new `useEffect` pairs for localStorage — use `usePersistedState` hook in `src/hooks/usePersistedState.ts`
 - Don't add new modal dialogs inline in `App.tsx` — use `<Modal>` component in `components/dialogs/`
 - Don't hardcode magic numbers — define named constants (e.g., `MAX_FILE_READ_BYTES`, `WORKTREES_DIR`)
 - Don't add new `setError(String(err))` catch blocks — use `wrapCommand()` helper (once extracted)
@@ -233,10 +263,13 @@ Mobile clients connect to `ws://localhost:3001` and can send:
 ## Refactoring Roadmap
 
 ### Current State
-- `src-tauri/src/lib.rs` is ~6,300 lines — all Tauri commands, Claude CLI execution, stream parsing, env management live in one file
+- `src-tauri/src/lib.rs` is ~6,840 lines — all Tauri commands, Claude CLI execution, stream parsing, env management live in one file
 - `src-tauri/src/types.rs` — all shared structs/enums extracted (Phase 1 complete)
-- `src/App.tsx` is ~4,700 lines — all state (~120 useState hooks), effects, handlers, and JSX layout in one component
+- `src-tauri/src/helpers.rs` — shared helpers (`now_rfc3339`, `new_id`, constants) extracted to public module (Phase 1 complete)
+- `src/App.tsx` is ~4,950 lines — ~36 useState hooks, effects, handlers, and JSX layout in one component
+- `src/hooks/` — 4 hooks extracted (Phase 2 complete): `usePersistedState` (broadly adopted, 11 pairs), `useTauriListener`, `useAgentEvents`, `usePanelResize`
 - `src-tauri/src/process_manager.rs` — deleted (confirmed unused, Phase 1 complete)
+- 7 components extracted outside roadmap: `SettingsModal`, `SkillsMarketplace`, `ToolbarDropdown`, `ThinkingTimer`, `PermissionCard`, `GroupDropZone`, `SortableGroupItem`
 - The Claude execution loop (~700 lines) is **duplicated verbatim** between `send_message_to_agent` and `handle_ws_commands::SendMessage`
 - Multiple WS command handlers duplicate their corresponding Tauri commands (remove_workspace, remove_repository, run_checks, list_files, etc.)
 
@@ -245,19 +278,19 @@ Mobile clients connect to `ws://localhost:3001` and can send:
 **Rust (`lib.rs`)**
 - ~~`chrono::Utc::now().to_rfc3339()` — 25 occurrences~~ → resolved: `fn now_rfc3339()` (Phase 1)
 - ~~`Uuid::new_v4().to_string()` — 8 occurrences~~ → resolved: `fn new_id()` (Phase 1)
-- `response_tx.send(serde_json::to_string(&resp).unwrap())` — 66 occurrences, needs helper/macro
+- `response_tx.send(serde_json::to_string(&resp).unwrap())` — 69 occurrences, needs helper/macro
 - ~~`"Workspace not found"` error string — 10+ occurrences~~ → resolved: `ERR_WORKSPACE_NOT_FOUND` (Phase 1)
 - ~~`200_000` file read limit — 3 occurrences~~ → resolved: `const MAX_FILE_READ_BYTES` (Phase 1)
 - `WorkspaceCheckResult` and `CheckInfo` are identical structs — unify
 - String-to-`WorkspaceStatus` parsing duplicated — needs `impl FromStr`
 
 **TypeScript (`App.tsx`)**
-- localStorage load/persist effect pairs — 10 pairs (~160 lines), needs `usePersistedState<T>` hook
-- `setError(String(err))` catch blocks — 24 occurrences, needs `wrapCommand()` helper
-- Modal dialog scaffolding — 5 identical wrappers, needs `<Modal>` component
+- ~~localStorage load/persist effect pairs — ~15 raw pairs~~ → resolved: 11 pairs migrated to `usePersistedState` (Phase 2); 4 remain (left/right panel with `isBelowLg` guard, theme with `applyTheme` side-effect, shortcuts with utility fns)
+- `setError(String(err))` catch blocks — 28 occurrences, needs `wrapCommand()` helper
+- Modal dialog scaffolding — 8 `show*` boolean state vars, needs `<Modal>` component
 - Skill card JSX duplicated verbatim — needs `<SkillCard>` component
-- `delete next[workspaceId]` record cleanup — 16 occurrences, needs `deleteFromRecord()` updater
-- `prev.map(w => w.id === updated.id ? updated : w)` — 4 occurrences, needs `replaceById()` utility
+- `delete next[workspaceId]` record cleanup — 20 occurrences, needs `deleteFromRecord()` updater
+- `prev.map(w => w.id === updated.id ? updated : w)` — 2 occurrences, needs `replaceById()` utility
 - ~~Pure functions defined inside component~~ → resolved: moved to `utils.ts` (Phase 1)
 
 ### Target Architecture — Rust Backend
@@ -292,18 +325,29 @@ src-tauri/src/
 ```
 src/
 ├── hooks/
-│   ├── usePersistedState.ts    # Replaces localStorage effect pairs
-│   ├── useAgentEvents.ts       # Tauri event listeners
-│   ├── usePanelResize.ts       # 3-panel resize logic
-│   ├── useKeyboardShortcuts.ts # Global hotkeys
-│   └── useTauriListener.ts     # Generic Tauri listen/unlisten
+│   ├── usePersistedState.ts    # ✓ Replaces localStorage effect pairs (11 adopted)
+│   ├── useAgentEvents.ts       # ✓ Agent event listeners (message, run-state, permission)
+│   ├── usePanelResize.ts       # ✓ 3-panel resize logic
+│   ├── useKeyboardShortcuts.ts # Global hotkeys (not yet created)
+│   └── useTauriListener.ts     # ✓ Generic Tauri listen/unlisten
 ├── components/
-│   ├── Modal.tsx               # Shared modal shell
-│   ├── SkillCard.tsx           # Skill card (deduplicated)
-│   ├── FileTree.tsx            # Recursive file browser
-│   ├── ChatComposer.tsx        # Input area + toolbar
-│   ├── (existing components)
-│   └── dialogs/                # All modal dialogs extracted from App.tsx
+│   ├── Modal.tsx               # Shared modal shell (not yet created)
+│   ├── SkillCard.tsx           # Skill card (not yet created)
+│   ├── FileTree.tsx            # Recursive file browser (not yet created)
+│   ├── ChatComposer.tsx        # Input area + toolbar (not yet created)
+│   ├── GroupDropZone.tsx        # ✓ Already extracted
+│   ├── LinkifiedInlineText.tsx  # ✓ Already extracted
+│   ├── MarkdownCodeBlock.tsx    # ✓ Already extracted
+│   ├── MarkdownMessage.tsx      # ✓ Already extracted
+│   ├── PermissionCard.tsx       # ✓ Already extracted
+│   ├── QuestionCard.tsx         # ✓ Already extracted
+│   ├── SettingsModal.tsx        # ✓ Already extracted
+│   ├── SkillsMarketplace.tsx    # ✓ Already extracted
+│   ├── SortableGroupItem.tsx    # ✓ Already extracted
+│   ├── SortableWorkspaceItem.tsx # ✓ Already extracted
+│   ├── ThinkingTimer.tsx        # ✓ Already extracted
+│   ├── ToolbarDropdown.tsx      # ✓ Already extracted
+│   └── dialogs/                # All modal dialogs extracted from App.tsx (not yet created)
 ├── utils/
 │   ├── workspace.ts            # replaceById, deleteFromRecord, statusForGroup
 │   └── commands.ts             # wrapCommand (error-handling invoke wrapper)
@@ -319,11 +363,11 @@ src/
 3. Extract Rust `types.rs` module
 4. Delete `process_manager.rs` if confirmed unused
 
-**Phase 2 — Custom hooks (big line-count wins)**
-5. `usePersistedState` hook (~160 lines eliminated)
-6. `useTauriListener` wrapper
-7. `useAgentEvents` hook (splits the mega-effect)
-8. `usePanelResize` hook
+**Phase 2 — Custom hooks (big line-count wins)** ✓ Complete
+5. ~~`usePersistedState` hook~~ → created and broadly adopted (11 of 15 pairs migrated; 4 intentionally skipped)
+6. ~~`useTauriListener` wrapper~~ → created at `src/hooks/useTauriListener.ts`
+7. ~~`useAgentEvents` hook~~ → created at `src/hooks/useAgentEvents.ts` (agent-message, agent-run-state, permission-request)
+8. ~~`usePanelResize` hook~~ → created at `src/hooks/usePanelResize.ts` (6 state vars + resize effect extracted)
 
 **Phase 3 — Component extraction**
 9. `<Modal>` component (prerequisite for dialog extraction)

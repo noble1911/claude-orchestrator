@@ -7,7 +7,6 @@ import {
   useRef,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
@@ -77,7 +76,6 @@ import {
 } from "./constants";
 import {
   compactActivityLines,
-  upsertMessageByIdentity,
   shortText,
   toWorkspaceRelativePath,
   statusForGroup,
@@ -92,8 +90,6 @@ import {
   shortcutMatchesEvent,
   getStatusColor,
   normalizeUpdateErrorMessage,
-  isUnreadCandidateMessage,
-  extractPullRequestUrl,
   normalizePromptName,
   normalizeSkillCommand,
   sanitizeSkillDirName,
@@ -108,7 +104,6 @@ import type {
   Workspace,
   Agent,
   AgentMessage,
-  AgentRunStateEvent,
   ServerStatus,
   AppStatus,
   UpdateInfo,
@@ -145,6 +140,9 @@ import SortableGroupItem from "./components/SortableGroupItem";
 import SettingsModal, { type SettingsTab } from "./components/SettingsModal";
 import ToolbarDropdown from "./components/ToolbarDropdown";
 import { usePersistedState } from "./hooks/usePersistedState";
+import { usePanelResize } from "./hooks/usePanelResize";
+import { useTauriListener } from "./hooks/useTauriListener";
+import { useAgentEvents } from "./hooks/useAgentEvents";
 
 function App() {
   const [repositories, setRepositories] = useState<Repository[]>([]);
@@ -186,7 +184,17 @@ function App() {
   const [detectedChecks, setDetectedChecks] = useState<WorkspaceCheckDefinition[]>([]);
   const [isLoadingDetectedChecks, setIsLoadingDetectedChecks] = useState(false);
   const [isRunningChecks, setIsRunningChecks] = useState(false);
-  const [customChecks, setCustomChecks] = useState<CustomCheck[]>([]);
+  const [customChecks, setCustomChecks] = usePersistedState<CustomCheck[]>(
+    CUSTOM_CHECKS_STORAGE_KEY, [], JSON.stringify,
+    (raw) => {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (item): item is CustomCheck =>
+          !!item && typeof item === "object" && typeof item.id === "string" && typeof item.name === "string" && typeof item.command === "string",
+      );
+    },
+  );
   const [detectedChecksExpanded, setDetectedChecksExpanded] = useState(true);
   const [customChecksExpanded, setCustomChecksExpanded] = useState(true);
   const [showAddCheckForm, setShowAddCheckForm] = useState(false);
@@ -195,7 +203,24 @@ function App() {
   const [newCheckCommand, setNewCheckCommand] = useState("");
   const [runningCheckKey, setRunningCheckKey] = useState<string | null>(null);
   const [checkResultByKey, setCheckResultByKey] = useState<Record<string, WorkspaceCheckResult>>({});
-  const [promptShortcuts, setPromptShortcuts] = useState<PromptShortcut[]>([]);
+  const [promptShortcuts, setPromptShortcuts] = usePersistedState<PromptShortcut[]>(
+    PROMPT_SHORTCUTS_STORAGE_KEY, [], JSON.stringify,
+    (raw) => {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+        .map((item, index) => ({
+          id: typeof item.id === "string" && item.id.trim()
+            ? item.id
+            : `${Date.now()}-${index}-${Math.floor(Math.random() * 100000)}`,
+          name: typeof item.name === "string" ? item.name : "",
+          prompt: typeof item.prompt === "string" ? item.prompt : "",
+          autoRunOnCreate: item.autoRunOnCreate === true,
+        }))
+        .filter((item) => item.name.trim() && item.prompt.trim());
+    },
+  );
   const [showAddPromptForm, setShowAddPromptForm] = useState(false);
   const [editingPromptId, setEditingPromptId] = useState<string | null>(null);
   const [newPromptName, setNewPromptName] = useState("");
@@ -227,13 +252,39 @@ function App() {
     const baseTheme = themes[DEFAULT_THEME_ID];
     return createThemeDraftFromTheme(baseTheme);
   });
-  const [envOverridesText, setEnvOverridesText] = useState("");
-  const [defaultModel, setDefaultModel] = useState(DEFAULT_MODEL_ID);
-  const [selectedModelByWorkspace, setSelectedModelByWorkspace] = useState<Record<string, string>>({});
-  const [thinkingMode, setThinkingMode] = useState<"off" | "low" | "medium" | "high">("off");
-  const [permissionMode, setPermissionMode] = useState<string>("dangerouslySkipPermissions");
-  const [workspaceGroupConfig, setWorkspaceGroupConfig] = useState<WorkspaceGroup[]>(DEFAULT_WORKSPACE_GROUPS);
-  const [workspaceGroupOverrides, setWorkspaceGroupOverrides] = useState<Record<string, string>>({});
+  const [envOverridesText, setEnvOverridesText] = usePersistedState(
+    ENV_OVERRIDES_STORAGE_KEY, "", (v) => v, (v) => v,
+  );
+  const [defaultModel, setDefaultModel] = usePersistedState(
+    MODEL_STORAGE_KEY, DEFAULT_MODEL_ID, (v) => v,
+    (raw) => {
+      const normalized = raw.trim();
+      return MODEL_OPTIONS.some((o) => o.value === normalized) ? normalized : DEFAULT_MODEL_ID;
+    },
+  );
+  const [selectedModelByWorkspace, setSelectedModelByWorkspace] = usePersistedState<Record<string, string>>(
+    MODEL_BY_WORKSPACE_STORAGE_KEY, {},
+    (v) => Object.keys(v).length > 0 ? JSON.stringify(v) : null,
+  );
+  const [thinkingMode, setThinkingMode] = usePersistedState<"off" | "low" | "medium" | "high">(
+    THINKING_MODE_STORAGE_KEY, "off", (v) => v,
+    (raw) => (raw === "off" || raw === "low" || raw === "medium" || raw === "high") ? raw : "off",
+  );
+  const [permissionMode, setPermissionMode] = usePersistedState<string>(
+    PERMISSION_MODE_STORAGE_KEY, "dangerouslySkipPermissions", (v) => v,
+    (raw) => {
+      const validModes = ["dangerouslySkipPermissions", "bypassPermissions", "auto", "acceptEdits", "default", "dontAsk", "plan"];
+      return validModes.includes(raw) ? raw : "dangerouslySkipPermissions";
+    },
+  );
+  const [workspaceGroupConfig, setWorkspaceGroupConfig] = usePersistedState<WorkspaceGroup[]>(
+    WORKSPACE_GROUPS_STORAGE_KEY, DEFAULT_WORKSPACE_GROUPS, JSON.stringify,
+    (raw) => { const parsed = JSON.parse(raw); return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_WORKSPACE_GROUPS; },
+  );
+  const [workspaceGroupOverrides, setWorkspaceGroupOverrides] = usePersistedState<Record<string, string>>(
+    WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY, {},
+    (v) => Object.keys(v).length > 0 ? JSON.stringify(v) : null,
+  );
   const [showGroupSettings, setShowGroupSettings] = useState(false);
   const [dragActiveId, setDragActiveId] = useState<string | null>(null);
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null);
@@ -258,12 +309,10 @@ function App() {
   const [shortcutOverrides, setShortcutOverrides] = useState<Record<string, ShortcutKeys>>(() => loadCustomShortcuts());
   const [initialSettingsTab, setInitialSettingsTab] = useState<SettingsTab | undefined>(undefined);
   const [workspaceOpenTarget, setWorkspaceOpenTarget] = useState<WorkspaceOpenTarget>("");
-  const [leftPanelWidth, setLeftPanelWidth] = useState(280);
-  const [rightPanelWidth, setRightPanelWidth] = useState(360);
-  const [terminalHeight, setTerminalHeight] = useState(180);
-  const [isResizingLeft, setIsResizingLeft] = useState(false);
-  const [isResizingRight, setIsResizingRight] = useState(false);
-  const [isResizingTerminal, setIsResizingTerminal] = useState(false);
+  const {
+    leftPanelWidth, rightPanelWidth, terminalHeight, isResizing,
+    startResizingLeft, startResizingRight, startResizingTerminal,
+  } = usePanelResize();
   const [terminalInput, setTerminalInput] = useState("");
   const [terminalHistoryByWorkspace, setTerminalHistoryByWorkspace] = useState<Record<string, string[]>>({});
   const [terminalHistoryIndex, setTerminalHistoryIndex] = useState<number | null>(null);
@@ -278,16 +327,14 @@ function App() {
   const [orchestratorConfig, setOrchestratorConfig] = useState<OrchestratorConfig | null>(null);
   const [isRunningScript, setIsRunningScript] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
-  const [sidebarFontSize, setSidebarFontSize] = useState<number>(() => {
-    const stored = localStorage.getItem(SIDEBAR_FONT_SIZE_STORAGE_KEY);
-    const parsed = stored ? Number(stored) : NaN;
-    return Number.isNaN(parsed) ? SIDEBAR_FONT_SIZE_DEFAULT : parsed;
-  });
-  const [chatFontSize, setChatFontSize] = useState<number>(() => {
-    const stored = localStorage.getItem(CHAT_FONT_SIZE_STORAGE_KEY);
-    const parsed = stored ? Number(stored) : NaN;
-    return Number.isNaN(parsed) ? CHAT_FONT_SIZE_DEFAULT : parsed;
-  });
+  const [sidebarFontSize, setSidebarFontSize] = usePersistedState<number>(
+    SIDEBAR_FONT_SIZE_STORAGE_KEY, SIDEBAR_FONT_SIZE_DEFAULT, String,
+    (raw) => { const n = Number(raw); return Number.isNaN(n) ? SIDEBAR_FONT_SIZE_DEFAULT : n; },
+  );
+  const [chatFontSize, setChatFontSize] = usePersistedState<number>(
+    CHAT_FONT_SIZE_STORAGE_KEY, CHAT_FONT_SIZE_DEFAULT, String,
+    (raw) => { const n = Number(raw); return Number.isNaN(n) ? CHAT_FONT_SIZE_DEFAULT : n; },
+  );
   const [v2Chat, setV2Chat] = usePersistedState<boolean>(
     V2_CHAT_STORAGE_KEY, true, String, (raw) => raw === "true",
   );
@@ -399,163 +446,39 @@ function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [showSettingsModal, showGroupSettings, showCreateForm, showRenameForm, showThemeForm, resolvedShortcuts]);
 
+  useAgentEvents({
+    selectedWorkspaceRef,
+    thinkingSinceByWorkspaceRef,
+    pendingUnreadByWorkspaceRef,
+    detectedPrUrlByWorkspaceRef,
+    queuedMessagesByWorkspaceRef,
+    sendMessageRef,
+    setMessages,
+    setThinkingSinceByWorkspace,
+    setPendingUnreadByWorkspace,
+    setUnreadByWorkspace,
+    setCredentialErrorWorkspaces,
+    setWorkspaces,
+    setPendingPermissions,
+    setQueuedMessagesByWorkspace,
+    persistUnread,
+  });
+
+  useTauriListener<number>("remote-clients-updated", (count) => {
+    setServerStatus((prev) => prev ? { ...prev, connectedClients: count } : prev);
+  });
+
+  useTauriListener("open-settings", () => {
+    setShowSettingsModal(true);
+  });
+
   useEffect(() => {
     loadInitialState();
     // Silent background check on launch and every hour thereafter.
     void checkForAppUpdate(false, false);
     const updateInterval = setInterval(() => void checkForAppUpdate(false, false), 60 * 60 * 1000);
     void getVersion().then(setAppVersion);
-    
-    // Listen for agent messages from backend
-    const unlisten = listen<AgentMessage>("agent-message", (event) => {
-      const messageWorkspaceId = event.payload.workspaceId ?? selectedWorkspaceRef.current;
-      if (messageWorkspaceId && selectedWorkspaceRef.current === messageWorkspaceId) {
-        setMessages((prev) => upsertMessageByIdentity(prev, event.payload));
-      }
-      if (
-        messageWorkspaceId &&
-        selectedWorkspaceRef.current !== messageWorkspaceId &&
-        isUnreadCandidateMessage(event.payload)
-      ) {
-        const isWorkspaceRunning = (thinkingSinceByWorkspaceRef.current[messageWorkspaceId] ?? null) !== null;
-        if (isWorkspaceRunning) {
-          setPendingUnreadByWorkspace((prev) => {
-            if (prev[messageWorkspaceId]) return prev;
-            const next = { ...prev, [messageWorkspaceId]: true };
-            pendingUnreadByWorkspaceRef.current = next;
-            return next;
-          });
-        } else {
-          setUnreadByWorkspace((prev) => {
-            const next = (prev[messageWorkspaceId] || 0) + 1;
-            persistUnread(messageWorkspaceId, next);
-            return { ...prev, [messageWorkspaceId]: next };
-          });
-        }
-      }
-      if (event.payload.role === "credential_error" && messageWorkspaceId) {
-        setCredentialErrorWorkspaces((prev) => new Set(prev).add(messageWorkspaceId));
-      }
-      if (
-        messageWorkspaceId &&
-        event.payload.agentId !== "user" &&
-        (event.payload.role ?? "") !== "user"
-      ) {
-        const prUrl = extractPullRequestUrl(event.payload.content);
-        if (prUrl && detectedPrUrlByWorkspaceRef.current[messageWorkspaceId] !== prUrl) {
-          detectedPrUrlByWorkspaceRef.current[messageWorkspaceId] = prUrl;
-          setWorkspaces((prev) =>
-            prev.map((workspace) =>
-              workspace.id === messageWorkspaceId
-                ? { ...workspace, status: workspace.status === "merged" ? "merged" : "inReview", prUrl }
-                : workspace,
-            ),
-          );
-          invoke("mark_workspace_in_review", { workspaceId: messageWorkspaceId, prUrl }).catch((err) => {
-            console.error("Failed to mark workspace in review:", err);
-          });
-        }
-      }
-    });
-    const unlistenRunState = listen<AgentRunStateEvent>("agent-run-state", (event) => {
-      const { workspaceId, running, timestamp } = event.payload;
-      if (!workspaceId) return;
-
-      setThinkingSinceByWorkspace((prev) => {
-        const current = prev[workspaceId] ?? null;
-        if (running) {
-          if (current !== null) return prev;
-          const parsedTimestamp = Date.parse(timestamp);
-          const startedAt = Number.isFinite(parsedTimestamp) ? parsedTimestamp : Date.now();
-          const next = { ...prev, [workspaceId]: startedAt };
-          thinkingSinceByWorkspaceRef.current = next;
-          return next;
-        }
-        if (current === null) return prev;
-        const next = { ...prev, [workspaceId]: null };
-        thinkingSinceByWorkspaceRef.current = next;
-        return next;
-      });
-
-      if (running) {
-        return;
-      }
-
-      // Clear any pending permission requests when agent stops
-      setPendingPermissions((prev) => {
-        if (!prev[workspaceId]) return prev;
-        const next = { ...prev };
-        delete next[workspaceId];
-        return next;
-      });
-
-      // Drain the next queued message for this workspace
-      const queue = queuedMessagesByWorkspaceRef.current[workspaceId];
-      if (queue && queue.length > 0) {
-        const [next, ...rest] = queue;
-        setQueuedMessagesByWorkspace((prev) => ({
-          ...prev,
-          [workspaceId]: rest,
-        }));
-        // Small delay to let the agent settle before sending the next message
-        setTimeout(() => {
-          void sendMessageRef.current(next.text, next.visible, workspaceId);
-        }, 300);
-      }
-
-      if (selectedWorkspaceRef.current === workspaceId) {
-        setPendingUnreadByWorkspace((prev) => {
-          if (!prev[workspaceId]) return prev;
-          const next = { ...prev };
-          delete next[workspaceId];
-          pendingUnreadByWorkspaceRef.current = next;
-          return next;
-        });
-        return;
-      }
-      if (pendingUnreadByWorkspaceRef.current[workspaceId]) {
-        setUnreadByWorkspace((prev) => {
-          const next = (prev[workspaceId] || 0) + 1;
-          persistUnread(workspaceId, next);
-          return { ...prev, [workspaceId]: next };
-        });
-        setPendingUnreadByWorkspace((prev) => {
-          if (!prev[workspaceId]) return prev;
-          const next = { ...prev };
-          delete next[workspaceId];
-          pendingUnreadByWorkspaceRef.current = next;
-          return next;
-        });
-      }
-    });
-    const unlistenPermission = listen<PermissionRequestEvent>("permission-request", (event) => {
-      const req = event.payload;
-      if (req.workspaceId) {
-        setPendingPermissions((prev) => ({
-          ...prev,
-          [req.workspaceId]: [...(prev[req.workspaceId] || []), req],
-        }));
-      }
-    });
-    const unlistenClients = listen<number>("remote-clients-updated", (event) => {
-      setServerStatus((prev) => {
-        if (!prev) return prev;
-        return { ...prev, connectedClients: event.payload };
-      });
-    });
-    
-    const unlistenSettings = listen("open-settings", () => {
-      setShowSettingsModal(true);
-    });
-
-    return () => {
-      unlisten.then(fn => fn());
-      unlistenRunState.then(fn => fn());
-      unlistenPermission.then(fn => fn());
-      unlistenClients.then(fn => fn());
-      unlistenSettings.then(fn => fn());
-      clearInterval(updateInterval);
-    };
+    return () => { clearInterval(updateInterval); };
   }, []);
 
   useEffect(() => {
@@ -568,13 +491,8 @@ function App() {
     void loadSkills(selectedRepo);
   }, [selectedRepo]);
 
-  useEffect(() => {
-    const unlisten = listen("skills-changed", () => {
-      void loadSkills(selectedRepo);
-    });
-    return () => {
-      void unlisten.then((fn) => fn());
-    };
+  useTauriListener("skills-changed", () => {
+    void loadSkills(selectedRepo);
   }, [selectedRepo]);
 
   useEffect(() => {
@@ -715,33 +633,6 @@ function App() {
     return () => clearInterval(interval);
   }, [selectedRepo, workspaces.filter((ws) => ws.status !== "merged").length]);
 
-  useEffect(() => {
-    const onMouseMove = (event: MouseEvent) => {
-      if (isResizingLeft) {
-        setLeftPanelWidth(Math.min(460, Math.max(220, event.clientX)));
-      }
-      if (isResizingRight) {
-        setRightPanelWidth(Math.min(560, Math.max(280, window.innerWidth - event.clientX)));
-      }
-      if (isResizingTerminal) {
-        const next = window.innerHeight - event.clientY - 24;
-        setTerminalHeight(Math.min(360, Math.max(120, next)));
-      }
-    };
-
-    const onMouseUp = () => {
-      setIsResizingLeft(false);
-      setIsResizingRight(false);
-      setIsResizingTerminal(false);
-    };
-
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-    };
-  }, [isResizingLeft, isResizingRight, isResizingTerminal]);
 
   // Track whether we're below the lg breakpoint so persistence effects
   // can skip saving responsive closes to localStorage.
@@ -769,69 +660,15 @@ function App() {
     return () => mq.removeEventListener("change", handler);
   }, []);
 
+  // Panel open state uses a conditional persist guard (isBelowLg) so it
+  // cannot use usePersistedState — keep as raw effects.
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(PROMPT_SHORTCUTS_STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        const normalized: PromptShortcut[] = parsed
-          .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
-          .map((item, index) => {
-            const name = typeof item.name === "string" ? item.name : "";
-            const prompt = typeof item.prompt === "string" ? item.prompt : "";
-            const id =
-              typeof item.id === "string" && item.id.trim()
-                ? item.id
-                : `${Date.now()}-${index}-${Math.floor(Math.random() * 100000)}`;
-            return {
-              id,
-              name,
-              prompt,
-              autoRunOnCreate: item.autoRunOnCreate === true,
-            };
-          })
-          .filter((item) => item.name.trim() && item.prompt.trim());
-        setPromptShortcuts(normalized);
-      }
-    } catch (err) {
-      console.error("Failed to load prompt shortcuts:", err);
-    }
-  }, []);
+    if (!isBelowLg.current) localStorage.setItem(LEFT_PANEL_OPEN_STORAGE_KEY, String(isLeftPanelOpen));
+  }, [isLeftPanelOpen]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(PROMPT_SHORTCUTS_STORAGE_KEY, JSON.stringify(promptShortcuts));
-    } catch (err) {
-      console.error("Failed to persist prompt shortcuts:", err);
-    }
-  }, [promptShortcuts]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(CUSTOM_CHECKS_STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        setCustomChecks(
-          parsed.filter(
-            (item): item is CustomCheck =>
-              !!item && typeof item === "object" && typeof item.id === "string" && typeof item.name === "string" && typeof item.command === "string",
-          ),
-        );
-      }
-    } catch (err) {
-      console.error("Failed to load custom checks:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(CUSTOM_CHECKS_STORAGE_KEY, JSON.stringify(customChecks));
-    } catch (err) {
-      console.error("Failed to persist custom checks:", err);
-    }
-  }, [customChecks]);
+    if (!isBelowLg.current) localStorage.setItem(RIGHT_PANEL_OPEN_STORAGE_KEY, String(isRightPanelOpen));
+  }, [isRightPanelOpen]);
 
   useEffect(() => {
     saveCustomThemes(customThemes);
@@ -851,177 +688,12 @@ function App() {
     }
   }, [availableThemes, selectedTheme]);
 
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(ENV_OVERRIDES_STORAGE_KEY);
-      if (raw) {
-        setEnvOverridesText(raw);
-      }
-    } catch (err) {
-      console.error("Failed to load env overrides:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(ENV_OVERRIDES_STORAGE_KEY, envOverridesText);
-    } catch (err) {
-      console.error("Failed to persist env overrides:", err);
-    }
-  }, [envOverridesText]);
-
-  useEffect(() => {
-    localStorage.setItem(SIDEBAR_FONT_SIZE_STORAGE_KEY, String(sidebarFontSize));
-  }, [sidebarFontSize]);
-
-  useEffect(() => {
-    localStorage.setItem(CHAT_FONT_SIZE_STORAGE_KEY, String(chatFontSize));
-  }, [chatFontSize]);
-
-  useEffect(() => {
-    // Don't persist responsive closes — only save user-initiated toggles
-    if (!isBelowLg.current) localStorage.setItem(LEFT_PANEL_OPEN_STORAGE_KEY, String(isLeftPanelOpen));
-  }, [isLeftPanelOpen]);
-
-  useEffect(() => {
-    if (!isBelowLg.current) localStorage.setItem(RIGHT_PANEL_OPEN_STORAGE_KEY, String(isRightPanelOpen));
-  }, [isRightPanelOpen]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(MODEL_STORAGE_KEY);
-      if (raw && raw.trim().length > 0) {
-        const normalized = raw.trim();
-        const isKnownOption = MODEL_OPTIONS.some((option) => option.value === normalized);
-        if (isKnownOption) {
-          setDefaultModel(normalized);
-        } else {
-          setDefaultModel(DEFAULT_MODEL_ID);
-        }
-      }
-    } catch (err) {
-      console.error("Failed to load model selection:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(MODEL_STORAGE_KEY, defaultModel);
-    } catch (err) {
-      console.error("Failed to persist model selection:", err);
-    }
-  }, [defaultModel]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(MODEL_BY_WORKSPACE_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as Record<string, string>;
-        setSelectedModelByWorkspace(parsed);
-      }
-    } catch (err) {
-      console.error("Failed to load per-workspace model selection:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      if (Object.keys(selectedModelByWorkspace).length > 0) {
-        localStorage.setItem(MODEL_BY_WORKSPACE_STORAGE_KEY, JSON.stringify(selectedModelByWorkspace));
-      } else {
-        localStorage.removeItem(MODEL_BY_WORKSPACE_STORAGE_KEY);
-      }
-    } catch (err) {
-      console.error("Failed to persist per-workspace model selection:", err);
-    }
-  }, [selectedModelByWorkspace]);
 
   useEffect(() => {
     saveCustomShortcuts(shortcutOverrides);
   }, [shortcutOverrides]);
 
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(THINKING_MODE_STORAGE_KEY);
-      if (raw === "off" || raw === "low" || raw === "medium" || raw === "high") {
-        setThinkingMode(raw);
-      }
-    } catch (err) {
-      console.error("Failed to load thinking mode:", err);
-    }
-  }, []);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(THINKING_MODE_STORAGE_KEY, thinkingMode);
-    } catch (err) {
-      console.error("Failed to persist thinking mode:", err);
-    }
-  }, [thinkingMode]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(PERMISSION_MODE_STORAGE_KEY);
-      const validModes = ["dangerouslySkipPermissions", "bypassPermissions", "auto", "acceptEdits", "default", "dontAsk", "plan"];
-      if (raw && validModes.includes(raw)) {
-        setPermissionMode(raw);
-      }
-    } catch (err) {
-      console.error("Failed to load permission mode:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(PERMISSION_MODE_STORAGE_KEY, permissionMode);
-    } catch (err) {
-      console.error("Failed to persist permission mode:", err);
-    }
-  }, [permissionMode]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(WORKSPACE_GROUPS_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as WorkspaceGroup[];
-        if (Array.isArray(parsed) && parsed.length > 0) setWorkspaceGroupConfig(parsed);
-      }
-    } catch (err) {
-      console.error("Failed to load workspace groups:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(WORKSPACE_GROUPS_STORAGE_KEY, JSON.stringify(workspaceGroupConfig));
-    } catch (err) {
-      console.error("Failed to persist workspace groups:", err);
-    }
-  }, [workspaceGroupConfig]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as Record<string, string>;
-        if (parsed && typeof parsed === "object") setWorkspaceGroupOverrides(parsed);
-      }
-    } catch (err) {
-      console.error("Failed to load workspace group overrides:", err);
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      if (Object.keys(workspaceGroupOverrides).length > 0) {
-        localStorage.setItem(WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY, JSON.stringify(workspaceGroupOverrides));
-      } else {
-        localStorage.removeItem(WORKSPACE_GROUP_OVERRIDES_STORAGE_KEY);
-      }
-    } catch (err) {
-      console.error("Failed to persist workspace group overrides:", err);
-    }
-  }, [workspaceGroupOverrides]);
 
   // useLayoutEffect prevents a visual flash when switching workspaces:
   // it clears stale state synchronously before the browser paints,
@@ -3122,7 +2794,7 @@ function App() {
   }
 
   return (
-    <div className={`md-surface relative flex h-screen overflow-hidden md-text-strong ${isResizingLeft || isResizingRight || isResizingTerminal ? "select-none" : ""}`}>
+    <div className={`md-surface relative flex h-screen overflow-hidden md-text-strong ${isResizing ? "select-none" : ""}`}>
       {(isLeftPanelOpen || isRightPanelOpen) && (
         <button
           className="fixed inset-0 z-30 bg-black/55 lg:hidden"
@@ -3306,7 +2978,7 @@ function App() {
 
       <div
         className="relative -ml-px z-10 hidden w-0.5 cursor-col-resize transition hover:w-1 hover:bg-violet-400/60 lg:block"
-        onMouseDown={() => setIsResizingLeft(true)}
+        onMouseDown={startResizingLeft}
         title="Resize sidebar"
       />
 
@@ -3809,7 +3481,7 @@ function App() {
 
       <div
         className="hidden w-1 cursor-col-resize md-resizer transition hover:bg-violet-400/60 lg:block"
-        onMouseDown={() => setIsResizingRight(true)}
+        onMouseDown={startResizingRight}
         title="Resize tools panel"
       />
 
@@ -4540,7 +4212,7 @@ function App() {
 
         <div
           className="h-1 cursor-row-resize border-t md-outline-strong md-surface-subtle transition hover:bg-amber-400/60"
-          onMouseDown={() => setIsResizingTerminal(true)}
+          onMouseDown={startResizingTerminal}
           title="Resize terminal"
         />
         <div className="flex flex-col overflow-hidden border-t md-outline md-px-4 md-py-2" style={{ height: `${terminalHeight}px` }}>
