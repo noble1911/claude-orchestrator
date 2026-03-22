@@ -12,7 +12,17 @@ export const COLOR_TOKEN_KEYS = [
   "--md-sys-color-on-surface-variant",
   "--md-sys-color-tertiary-container",
   "--md-sys-color-on-tertiary-container",
+  "--md-sys-color-chat-accent",
+  "--md-sys-color-chat-insight",
+  "--md-sys-color-chat-code-text",
 ] as const;
+
+/** Tokens added after initial release — custom themes missing these get defaults. */
+const OPTIONAL_TOKEN_DEFAULTS: Partial<Record<ThemeColorTokenKey, string>> = {
+  "--md-sys-color-chat-accent": "#38bdf8",
+  "--md-sys-color-chat-insight": "#34d399",
+  "--md-sys-color-chat-code-text": "#b0b8d0",
+};
 
 export type ThemeColorTokenKey = (typeof COLOR_TOKEN_KEYS)[number];
 export type ThemeMap = Record<string, ThemeDefinition>;
@@ -37,6 +47,9 @@ export const THEME_COLOR_FIELDS: Array<{ key: ThemeColorTokenKey; label: string 
   { key: "--md-sys-color-on-surface-variant", label: "On surface variant" },
   { key: "--md-sys-color-tertiary-container", label: "Tertiary container" },
   { key: "--md-sys-color-on-tertiary-container", label: "On tertiary container" },
+  { key: "--md-sys-color-chat-accent", label: "Chat accent" },
+  { key: "--md-sys-color-chat-insight", label: "Chat insight" },
+  { key: "--md-sys-color-chat-code-text", label: "Chat code text" },
 ];
 
 const BUILTIN_THEMES: ThemeMap = {
@@ -57,6 +70,9 @@ const BUILTIN_THEMES: ThemeMap = {
       "--md-sys-color-on-surface-variant": "#a1a1aa",
       "--md-sys-color-tertiary-container": "#1e293b",
       "--md-sys-color-on-tertiary-container": "#93c5fd",
+      "--md-sys-color-chat-accent": "#38bdf8",
+      "--md-sys-color-chat-insight": "#34d399",
+      "--md-sys-color-chat-code-text": "#b0b8d0",
     },
   },
   dark: {
@@ -76,6 +92,9 @@ const BUILTIN_THEMES: ThemeMap = {
       "--md-sys-color-on-surface-variant": "#aab4c3",
       "--md-sys-color-tertiary-container": "#1f1a2b",
       "--md-sys-color-on-tertiary-container": "#d9c8ff",
+      "--md-sys-color-chat-accent": "#7dd3fc",
+      "--md-sys-color-chat-insight": "#6ee7b7",
+      "--md-sys-color-chat-code-text": "#b8c4de",
     },
   },
   light: {
@@ -95,6 +114,9 @@ const BUILTIN_THEMES: ThemeMap = {
       "--md-sys-color-on-surface-variant": "#556175",
       "--md-sys-color-tertiary-container": "#e8ddff",
       "--md-sys-color-on-tertiary-container": "#3b285f",
+      "--md-sys-color-chat-accent": "#2563eb",
+      "--md-sys-color-chat-insight": "#059669",
+      "--md-sys-color-chat-code-text": "#64748b",
     },
   },
   aurora: {
@@ -114,6 +136,9 @@ const BUILTIN_THEMES: ThemeMap = {
       "--md-sys-color-on-surface-variant": "#b6bedf",
       "--md-sys-color-tertiary-container": "#2a1f49",
       "--md-sys-color-on-tertiary-container": "#e4d8ff",
+      "--md-sys-color-chat-accent": "#818cf8",
+      "--md-sys-color-chat-insight": "#5eead4",
+      "--md-sys-color-chat-code-text": "#c4cbf5",
     },
   },
   sunset: {
@@ -133,6 +158,9 @@ const BUILTIN_THEMES: ThemeMap = {
       "--md-sys-color-on-surface-variant": "#d2b8ad",
       "--md-sys-color-tertiary-container": "#3d2634",
       "--md-sys-color-on-tertiary-container": "#ffd7eb",
+      "--md-sys-color-chat-accent": "#f9a8d4",
+      "--md-sys-color-chat-insight": "#fcd34d",
+      "--md-sys-color-chat-code-text": "#e0c8bb",
     },
   },
   lagoon: {
@@ -152,6 +180,9 @@ const BUILTIN_THEMES: ThemeMap = {
       "--md-sys-color-on-surface-variant": "#48606a",
       "--md-sys-color-tertiary-container": "#f9e1ff",
       "--md-sys-color-on-tertiary-container": "#4b2f5e",
+      "--md-sys-color-chat-accent": "#0891b2",
+      "--md-sys-color-chat-insight": "#059669",
+      "--md-sys-color-chat-code-text": "#3d6070",
     },
   },
   neoncitrus: {
@@ -171,6 +202,9 @@ const BUILTIN_THEMES: ThemeMap = {
       "--md-sys-color-on-surface-variant": "#c0cfaf",
       "--md-sys-color-tertiary-container": "#233524",
       "--md-sys-color-on-tertiary-container": "#d9ffd6",
+      "--md-sys-color-chat-accent": "#22d3ee",
+      "--md-sys-color-chat-insight": "#a3e635",
+      "--md-sys-color-chat-code-text": "#c8d4b0",
     },
   },
   roselatte: {
@@ -190,6 +224,9 @@ const BUILTIN_THEMES: ThemeMap = {
       "--md-sys-color-on-surface-variant": "#6f5365",
       "--md-sys-color-tertiary-container": "#e8f4ff",
       "--md-sys-color-on-tertiary-container": "#1f4463",
+      "--md-sys-color-chat-accent": "#be185d",
+      "--md-sys-color-chat-insight": "#0d9488",
+      "--md-sys-color-chat-code-text": "#7a5870",
     },
   },
 };
@@ -226,10 +263,13 @@ function normalizeThemeDefinition(source: unknown): ThemeDefinition | null {
   const normalizedColors = {} as Record<ThemeColorTokenKey, string>;
   for (const key of COLOR_TOKEN_KEYS) {
     const value = (colors as Record<string, unknown>)[key];
-    if (typeof value !== "string" || !isHexColor(value)) {
+    if (typeof value === "string" && isHexColor(value)) {
+      normalizedColors[key] = value.trim();
+    } else if (key in OPTIONAL_TOKEN_DEFAULTS) {
+      normalizedColors[key] = OPTIONAL_TOKEN_DEFAULTS[key]!;
+    } else {
       return null;
     }
-    normalizedColors[key] = value.trim();
   }
 
   return {

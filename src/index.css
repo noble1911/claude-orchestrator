@@ -309,6 +309,53 @@
     background: color-mix(in srgb, #ff6f7c 22%, transparent);
   }
 
+  /* ── Chat v2 themed classes ───────────────────────────────── */
+  .md-chat-accent { color: var(--md-sys-color-chat-accent); }
+  .md-chat-insight { color: var(--md-sys-color-chat-insight); }
+  .md-chat-code-text { color: var(--md-sys-color-chat-code-text); }
+
+  .md-chat-code-bg {
+    background: color-mix(in srgb, var(--md-sys-color-on-surface) 6%, transparent);
+  }
+
+  .md-chat-blockquote {
+    border-color: var(--md-sys-color-chat-accent);
+    background: color-mix(in srgb, var(--md-sys-color-chat-accent) 8%, transparent);
+  }
+
+  .md-chat-insight-block {
+    border-color: color-mix(in srgb, var(--md-sys-color-chat-insight) 20%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-chat-insight) 4%, transparent);
+  }
+
+  .md-chat-insight-header {
+    border-color: color-mix(in srgb, var(--md-sys-color-chat-insight) 15%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-chat-insight) 6%, transparent);
+  }
+
+  .md-chat-bubble-user {
+    border-color: color-mix(in srgb, var(--md-sys-color-on-surface) 13%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-on-surface) 5%, transparent);
+  }
+
+  .md-chat-bubble-assistant {
+    border-color: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-on-surface) 3%, transparent);
+  }
+
+  .md-chat-codeblock {
+    border-color: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent);
+    background: color-mix(in srgb, var(--md-sys-color-surface) 40%, black 60%);
+  }
+
+  .md-chat-link-decoration {
+    text-decoration-color: color-mix(in srgb, var(--md-sys-color-on-surface) 35%, transparent);
+  }
+
+  .md-chat-link-decoration:hover {
+    text-decoration-color: color-mix(in srgb, var(--md-sys-color-on-surface) 70%, transparent);
+  }
+
   .material-symbols-rounded {
     font-family: "Material Symbols Rounded";
     font-weight: normal;

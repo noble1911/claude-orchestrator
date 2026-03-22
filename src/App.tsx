@@ -3001,7 +3001,7 @@ function App() {
         return (
           <div key={row.id} className="flex justify-end">
             <div className={v2Chat
-              ? "max-w-[72%] rounded-[18px] rounded-br-[4px] border-[0.5px] border-white/[0.13] bg-white/[0.05] px-3.5 py-2"
+              ? "max-w-[72%] rounded-[18px] rounded-br-[4px] border-[0.5px] md-chat-bubble-user px-3.5 py-2"
               : "max-w-[80%] rounded-2xl rounded-tr-sm bg-sky-900/40 px-4 py-3"
             }>
               <pre className={v2Chat
@@ -3016,7 +3016,7 @@ function App() {
       }
 
       return (
-        <div key={row.id} className={v2Chat ? "rounded-lg border-[0.5px] border-white/[0.08] bg-white/[0.03] px-4 py-3.5" : ""}>
+        <div key={row.id} className={v2Chat ? "rounded-lg border-[0.5px] md-chat-bubble-assistant px-4 py-3.5" : ""}>
           <MarkdownMessage content={msg.content} v2={v2Chat} />
         </div>
       );
