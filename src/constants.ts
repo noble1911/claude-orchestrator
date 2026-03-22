@@ -57,6 +57,7 @@ export const CHAT_FONT_SIZE_OPTIONS = [12, 13, 14, 15, 16] as const;
 export const V2_CHAT_STORAGE_KEY = "claude_orchestrator_v2_chat";
 
 export const CUSTOM_CHECKS_STORAGE_KEY = "claude_orchestrator_custom_checks";
+export const CUSTOM_SKILL_REPOS_STORAGE_KEY = "claude_orchestrator_custom_skill_repos";
 export const SHORTCUTS_STORAGE_KEY = "claude_orchestrator_shortcuts";
 
 export const DEFAULT_SHORTCUTS: ShortcutBinding[] = [
