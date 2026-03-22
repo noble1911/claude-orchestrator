@@ -31,7 +31,7 @@ function MarkdownCodeBlock({ children, v2 = false }: { children: ReactNode; v2?:
         </span>
       </button>
       <pre className={v2
-        ? "m-0 max-h-[50vh] overflow-auto rounded-[5px] border-[0.5px] border-white/[0.08] bg-black/60 px-3 py-2 whitespace-pre font-mono text-[11.5px] leading-[1.6] md-text-primary"
+        ? "m-0 max-h-[50vh] overflow-auto rounded-[5px] border-[0.5px] md-chat-codeblock px-3 py-2 whitespace-pre font-mono text-[11.5px] leading-[1.6] md-text-primary"
         : "m-0 max-h-[50vh] overflow-auto rounded-xl border md-outline bg-black/45 px-3 py-2 whitespace-pre font-mono text-[12px] md-text-primary"
       }>
         {children}

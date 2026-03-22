@@ -37,7 +37,7 @@ function buildMarkdownComponents(v2: boolean): Components {
         href={href}
         target="_blank"
         rel="noreferrer"
-        className="underline decoration-white/35 underline-offset-2 hover:decoration-white/70"
+        className="underline md-chat-link-decoration underline-offset-2"
         onClick={(event: ReactMouseEvent<HTMLAnchorElement>) => {
           event.preventDefault();
           void openExternalHref(href);
@@ -56,7 +56,7 @@ function buildMarkdownComponents(v2: boolean): Components {
       }
       return (
         <code className={v2
-          ? "rounded-[3px] bg-white/[0.06] px-[5px] py-[1px] font-mono text-[11px] text-[#b0b8d0]"
+          ? "rounded-[3px] md-chat-code-bg px-[5px] py-[1px] font-mono text-[11px] md-chat-code-text"
           : "rounded-md bg-white/10 px-1.5 py-0.5 font-mono text-[12px]"
         }>{children}</code>
       );
@@ -83,7 +83,7 @@ function buildMarkdownComponents(v2: boolean): Components {
     li: ({ children }) => (
       v2 ? (
         <li className="flex items-start gap-2 list-none leading-[1.5]">
-          <span className="mt-[1px] flex-shrink-0 text-[11px] text-sky-400">→</span>
+          <span className="mt-[1px] flex-shrink-0 text-[11px] md-chat-accent">→</span>
           <span>{children}</span>
         </li>
       ) : (
@@ -93,7 +93,7 @@ function buildMarkdownComponents(v2: boolean): Components {
     hr: () => <hr className="border-0 border-t md-outline" />,
     blockquote: ({ children }) => (
       <blockquote className={v2
-        ? "m-0 rounded-r-lg border-l-2 border-sky-500 bg-sky-500/[0.08] py-2.5 pl-3.5 text-[12.5px] leading-[1.65] md-text-secondary"
+        ? "m-0 rounded-r-lg border-l-2 md-chat-blockquote py-2.5 pl-3.5 text-[12.5px] leading-[1.65] md-text-secondary"
         : "m-0 border-l-2 border-white/20 pl-3 text-sm leading-relaxed italic md-text-dim"
       }>
         {children}
@@ -104,7 +104,7 @@ function buildMarkdownComponents(v2: boolean): Components {
         <table className="w-full border-collapse text-xs md-text-primary">{children}</table>
       </div>
     ),
-    thead: ({ children }) => <thead className="bg-white/5">{children}</thead>,
+    thead: ({ children }) => <thead className="md-surface-subtle">{children}</thead>,
     tbody: ({ children }) => <tbody>{children}</tbody>,
     tr: ({ children }) => <tr className="border-t md-outline">{children}</tr>,
     th: ({ children }) => (
@@ -130,10 +130,10 @@ function MarkdownSegment({ content, components }: { content: string; components:
 
 function InsightBlock({ content, components }: { content: string; components: Components }): ReactNode {
   return (
-    <div className="my-1 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.04] overflow-hidden">
-      <div className="flex items-center gap-2 border-b border-emerald-500/15 bg-emerald-500/[0.06] px-3.5 py-1.5">
-        <span className="text-[12px] text-emerald-400">★</span>
-        <span className="text-[11px] font-medium tracking-wide text-emerald-400/80">Insight</span>
+    <div className="my-1 rounded-lg border md-chat-insight-block overflow-hidden">
+      <div className="flex items-center gap-2 border-b md-chat-insight-header px-3.5 py-1.5">
+        <span className="text-[12px] md-chat-insight">★</span>
+        <span className="text-[11px] font-medium tracking-wide md-chat-insight opacity-80">Insight</span>
       </div>
       <div className="px-3.5 py-2.5">
         <MarkdownSegment content={content} components={components} />
