@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "cd mcp-permission-bridge && npm install --prefer-offline && npm run build && cd .. && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "cd mcp-permission-bridge && npm run build && cd .. && npm run build:web && npm run build",
+    "beforeBuildCommand": "cd mcp-permission-bridge && npm install --prefer-offline && npm run build && cd .. && npm run build:web && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
