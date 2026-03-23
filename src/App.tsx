@@ -1698,13 +1698,18 @@ function App() {
   }
   sendMessageRef.current = sendMessage;
 
-  const handleQuestionAnswer = useCallback((questionTimestamp: string, answer: string) => {
+  const handleQuestionAnswer = useCallback((agentId: string, questionTimestamp: string, answer: string) => {
     setAnsweredQuestionTimestamps((prev) => {
       const next = new Set(prev);
       next.add(questionTimestamp);
       return next;
     });
-    void sendMessageRef.current(answer);
+    // Write the answer directly to the running CLI process's stdin instead of
+    // going through sendMessage (which would queue it behind the "running" state).
+    invoke("answer_agent_question", {
+      agentId,
+      message: answer,
+    }).catch((err) => setError(String(err)));
   }, []);
 
   function generateWorkspaceName() {
@@ -2529,7 +2534,7 @@ function App() {
             message={msg}
             rowId={row.id}
             isAnswered={isAnswered}
-            onAnswer={(answer) => handleQuestionAnswer(msg.timestamp, answer)}
+            onAnswer={(answer) => handleQuestionAnswer(msg.agentId, msg.timestamp, answer)}
           />
         );
       }
