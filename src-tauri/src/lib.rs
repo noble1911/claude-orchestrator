@@ -2589,6 +2589,56 @@ async fn respond_to_permission(
     send_permission_response(&state, &agent_id, &request_id, allow, deny_message)
 }
 
+/// Answer a question asked by the Claude CLI (AskUserQuestion tool).
+/// Writes the answer directly to the running process's stdin, just like
+/// permission responses.  This avoids the need to spawn a new CLI process
+/// and prevents the answer from being queued behind the "running" state.
+#[tauri::command]
+async fn answer_agent_question(
+    agent_id: String,
+    message: String,
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let app_state = state.inner().clone();
+
+    // Look up agent info for DB persistence and message emission
+    let (session_id, workspace_id) = {
+        let agents = app_state.agents.read();
+        let agent = agents.get(&agent_id).ok_or("Agent not found")?;
+        (
+            agent.session_id.clone().ok_or("No active session")?,
+            agent.workspace_id.clone(),
+        )
+    };
+
+    // Emit the user message — this also persists it to the database
+    let ws_server = app_state.ws_server.clone();
+    emit_agent_message(
+        &app,
+        &app_state.db,
+        &session_id,
+        &agent_id,
+        &workspace_id,
+        &ws_server,
+        message.clone(),
+        false,
+        "user",
+    );
+
+    // Write the answer to the existing CLI process's stdin
+    let handle = {
+        let stdins = app_state.agent_stdin.read();
+        stdins.get(&agent_id).cloned()
+    };
+    let handle = handle.ok_or("No active CLI process for this agent")?;
+    let mut stdin = handle.lock().map_err(|e| format!("Stdin lock poisoned: {}", e))?;
+    write_stdin_user_message(&mut stdin, &message)
+        .map_err(|e| format!("Failed to write answer to stdin: {}", e))?;
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn send_message_to_agent(
     agent_id: String,
@@ -6644,6 +6694,7 @@ pub fn run() {
             stop_agent,
             interrupt_agent,
             respond_to_permission,
+            answer_agent_question,
             send_message_to_agent,
             get_agent_messages,
             open_workspace_in_editor,
