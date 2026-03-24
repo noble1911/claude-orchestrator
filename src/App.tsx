@@ -1549,21 +1549,22 @@ function App() {
   ) {
     try {
       await invoke("respond_to_permission", { agentId, requestId, allow, denyMessage });
+      // Only clear the card on success — if invoke fails the user can retry.
+      setPendingPermissions((prev) => {
+        const list = prev[wsId];
+        if (!list) return prev;
+        const next = list.filter((p) => p.requestId !== requestId);
+        if (next.length === 0) {
+          const result = { ...prev };
+          delete result[wsId];
+          return result;
+        }
+        return { ...prev, [wsId]: next };
+      });
     } catch (err) {
       console.error("Failed to respond to permission:", err);
       setError(String(err));
     }
-    setPendingPermissions((prev) => {
-      const list = prev[wsId];
-      if (!list) return prev;
-      const next = list.filter((p) => p.requestId !== requestId);
-      if (next.length === 0) {
-        const result = { ...prev };
-        delete result[wsId];
-        return result;
-      }
-      return { ...prev, [wsId]: next };
-    });
   }
 
   async function sendMessage(rawMessage?: string, visibleOverride?: string, targetWorkspaceId?: string): Promise<boolean> {
@@ -1703,16 +1704,18 @@ function App() {
   sendMessageRef.current = sendMessage;
 
   const handleQuestionAnswer = useCallback((agentId: string, questionTimestamp: string, answer: string) => {
-    setAnsweredQuestionTimestamps((prev) => {
-      const next = new Set(prev);
-      next.add(questionTimestamp);
-      return next;
-    });
     // Write the answer directly to the running CLI process's stdin instead of
     // going through sendMessage (which would queue it behind the "running" state).
     invoke("answer_agent_question", {
       agentId,
       message: answer,
+    }).then(() => {
+      // Only mark answered after the invoke succeeds, so the user can retry on failure.
+      setAnsweredQuestionTimestamps((prev) => {
+        const next = new Set(prev);
+        next.add(questionTimestamp);
+        return next;
+      });
     }).catch((err) => setError(String(err)));
   }, []);
 
