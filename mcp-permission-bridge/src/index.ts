@@ -68,8 +68,18 @@ server.tool(
       }
 
       const decision = await res.json();
+
+      // Claude CLI expects either { updatedInput: <record> } for allow
+      // or { behavior: "deny", message: <string> } for deny.
+      // The orchestrator returns { behavior: "allow" | "deny", message?: ... },
+      // so we transform allow responses into the expected shape.
+      const response =
+        decision.behavior === "allow"
+          ? { updatedInput: input }
+          : { behavior: "deny" as const, message: decision.message ?? "Permission denied" };
+
       return {
-        content: [{ type: "text" as const, text: JSON.stringify(decision) }],
+        content: [{ type: "text" as const, text: JSON.stringify(response) }],
       };
     } catch (err) {
       // If the orchestrator isn't reachable, deny by default
