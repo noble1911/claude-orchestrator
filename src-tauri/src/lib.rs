@@ -1802,6 +1802,34 @@ fn credential_error_message(details: &str) -> String {
     }
 }
 
+/// Detect "Prompt is too long" errors from the Claude CLI.
+/// This happens when a resumed session's conversation history exceeds the
+/// model's context window and the CLI fails to compact in time.
+fn detect_prompt_too_long(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("prompt is too long")
+        || lower.contains("prompt too long")
+        || lower.contains("context length exceeded")
+        || lower.contains("maximum context length")
+}
+
+/// Sleep for `total_secs` but check every second whether the agent has been
+/// removed from `AppState::agents` (i.e. the user called stop_agent).
+/// Returns `true` if the full duration elapsed, `false` if interrupted.
+fn interruptible_sleep(
+    app_state: &Arc<AppState>,
+    agent_id: &str,
+    total_secs: u64,
+) -> bool {
+    for _ in 0..total_secs {
+        if !app_state.agents.read().contains_key(agent_id) {
+            return false; // Agent was stopped — abort.
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    true
+}
+
 fn extract_missing_conversation_session_id(text: &str) -> Option<String> {
     let marker = "No conversation found with session ID:";
     let start = text.find(marker)?;
@@ -2834,6 +2862,15 @@ async fn send_message_to_agent(
         let model = resolved_model.as_deref();
         let effort = requested_effort.as_deref();
 
+        // Retry loop: when the CLI reports "Prompt is too long", the session's
+        // conversation history exceeded the context window.  The CLI typically
+        // compacts (summarises) the history as a side-effect of the failed load,
+        // so retrying after a delay often succeeds.
+        const MAX_PROMPT_TOO_LONG_RETRIES: u32 = 6;
+        let mut prompt_too_long_attempts: u32 = 0;
+
+        'retry: loop {
+
         // Build a compatibility-first command and include optional flags only
         // when the detected Claude CLI supports them.
         let mut cmd = Command::new(&claude_path);
@@ -2971,6 +3008,7 @@ async fn send_message_to_agent(
         let mut last_plan: Option<String> = None;
         let mut error_emitted = false;
         let mut saw_credential_error = false;
+        let mut saw_prompt_too_long = false;
         let mut missing_conversation_session_id: Option<String> = None;
         let stderr_handle = child.stderr.take().map(|stderr| {
             std::thread::spawn(move || {
@@ -3050,6 +3088,9 @@ async fn send_message_to_agent(
                         if missing_conversation_session_id.is_none() {
                             missing_conversation_session_id =
                                 extract_missing_conversation_session_id(&stream_error);
+                        }
+                        if !saw_prompt_too_long && detect_prompt_too_long(&stream_error) {
+                            saw_prompt_too_long = true;
                         }
                         emit_agent_message(
                             &app,
@@ -3209,6 +3250,9 @@ async fn send_message_to_agent(
                                 missing_conversation_session_id =
                                     extract_missing_conversation_session_id(&errors);
                             }
+                            if !saw_prompt_too_long && detect_prompt_too_long(&errors) {
+                                saw_prompt_too_long = true;
+                            }
                             if detect_credential_error(&errors) {
                                 saw_credential_error = true;
                                 emit_agent_message(
@@ -3247,6 +3291,9 @@ async fn send_message_to_agent(
                     if missing_conversation_session_id.is_none() {
                         missing_conversation_session_id =
                             extract_missing_conversation_session_id(&line);
+                    }
+                    if !saw_prompt_too_long && detect_prompt_too_long(&line) {
+                        saw_prompt_too_long = true;
                     }
                     let line_has_credential_error = detect_credential_error(&cli_line);
                     if line_has_credential_error {
@@ -3287,18 +3334,6 @@ async fn send_message_to_agent(
         drop(stdin_handle);
         app_state_for_pids.agent_stdin.write().remove(&agent_id_clone);
 
-        // Emit running=false NOW, before child.wait(). The MCP bridge
-        // subprocess may keep the process tree alive long after the CLI
-        // has sent its final `result` event. We don't want the UI blocked.
-        _run_guard.disarm();
-        emit_agent_run_state(
-            &app,
-            &ws_server,
-            &workspace_id,
-            &agent_id_clone,
-            false,
-        );
-
         let status = match child.wait() {
             Ok(s) => s,
             Err(e) => {
@@ -3325,6 +3360,9 @@ async fn send_message_to_agent(
         }
         if missing_conversation_session_id.is_none() {
             missing_conversation_session_id = extract_missing_conversation_session_id(&stderr_buf);
+        }
+        if !saw_prompt_too_long && detect_prompt_too_long(&stderr_buf) {
+            saw_prompt_too_long = true;
         }
 
         // Clean up stored PID now that process has exited
@@ -3474,6 +3512,9 @@ async fn send_message_to_agent(
                     "error",
                 );
             }
+            if !saw_prompt_too_long && detect_prompt_too_long(&error_content) {
+                saw_prompt_too_long = true;
+            }
             if detect_credential_error(&error_content) {
                 saw_credential_error = true;
                 emit_agent_message(
@@ -3510,7 +3551,7 @@ async fn send_message_to_agent(
                 true,
                 "error",
             );
-            if let Some(hint) = env_hint {
+            if let Some(ref hint) = env_hint {
                 emit_agent_message(
                     &app,
                     &db,
@@ -3519,6 +3560,54 @@ async fn send_message_to_agent(
                     &workspace_id,
                     &ws_server,
                     format!("Hint: {}", hint),
+                    true,
+                    "error",
+                );
+            }
+        }
+
+        // When the CLI reports "Prompt is too long", the session history exceeded
+        // the context window.  The CLI typically compacts the history as a side-effect
+        // of the failed load, so retrying after a delay often succeeds.
+        if saw_prompt_too_long && missing_conversation_session_id.is_none() {
+            if prompt_too_long_attempts < MAX_PROMPT_TOO_LONG_RETRIES {
+                prompt_too_long_attempts += 1;
+                let delay_secs: u64 = 30;
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    format!(
+                        "Context window exceeded — the CLI is compacting conversation history. Retrying in {} seconds (attempt {}/{})...",
+                        delay_secs, prompt_too_long_attempts, MAX_PROMPT_TOO_LONG_RETRIES
+                    ),
+                    false,
+                    "system",
+                );
+                if !interruptible_sleep(&app_state_for_pids, &agent_id_clone, delay_secs) {
+                    // Agent was stopped during the wait — bail out.
+                    break 'retry;
+                }
+                continue 'retry;
+            } else {
+                // Exhausted retries — reset session so the user isn't stuck.
+                reset_agent_claude_session(
+                    &app_state_for_pids,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                );
+                emit_agent_message(
+                    &app,
+                    &db,
+                    &session_id,
+                    &agent_id_clone,
+                    &workspace_id,
+                    &ws_server,
+                    "Context compaction did not reduce the session enough after multiple attempts. The session was reset — your next message will start a fresh conversation.".to_string(),
                     true,
                     "error",
                 );
@@ -3556,7 +3645,20 @@ async fn send_message_to_agent(
                 }
             }
         }
-        // running=false was already emitted before child.wait() above.
+
+        break; // Normal exit — no retry needed.
+        } // end 'retry loop
+
+        // Emit running=false after the retry loop completes (success or exhausted retries).
+        // Deferred so the agent stays "running" during retries.
+        _run_guard.disarm();
+        emit_agent_run_state(
+            &app,
+            &ws_server,
+            &workspace_id,
+            &agent_id_clone,
+            false,
+        );
     });
 
     Ok(())
@@ -5522,8 +5624,6 @@ async fn handle_ws_commands(
                             );
                             let effective_env = build_effective_cli_env(&env_overrides);
                             if let Some(claude_path) = find_claude_cli_with_env(Some(&effective_env)) {
-                                let mut cmd = Command::new(&claude_path);
-                                cmd.current_dir(&workspace_path);
                                 let (env_summary, env_hint) = auth_env_feedback(&effective_env);
                                 let permission_mode = requested_permission_mode.as_str();
                                 let is_bedrock = env_truthy(effective_env.get("CLAUDE_CODE_USE_BEDROCK"));
@@ -5531,6 +5631,14 @@ async fn handle_ws_commands(
                                     resolve_model_for_runtime(requested_model.as_deref(), is_bedrock);
                                 let model = resolved_model.as_deref();
                                 let effort = requested_effort.as_deref();
+
+                                const MAX_PROMPT_TOO_LONG_RETRIES: u32 = 6;
+                                let mut prompt_too_long_attempts: u32 = 0;
+
+                                'retry: loop {
+
+                                let mut cmd = Command::new(&claude_path);
+                                cmd.current_dir(&workspace_path);
                                 configure_cli_env(&mut cmd, &effective_env);
                                 let interactive = append_claude_request_args(
                                     &mut cmd,
@@ -5637,6 +5745,7 @@ async fn handle_ws_commands(
                                 let mut last_plan: Option<String> = None;
                                 let mut error_emitted = false;
                                 let mut saw_credential_error = false;
+                                let mut saw_prompt_too_long = false;
                                 let mut missing_conversation_session_id: Option<String> = None;
                                 let stderr_handle = child.stderr.take().map(|stderr| {
                                     std::thread::spawn(move || {
@@ -5720,6 +5829,9 @@ async fn handle_ws_commands(
                                                 if missing_conversation_session_id.is_none() {
                                                     missing_conversation_session_id =
                                                         extract_missing_conversation_session_id(&stream_error);
+                                                }
+                                                if !saw_prompt_too_long && detect_prompt_too_long(&stream_error) {
+                                                    saw_prompt_too_long = true;
                                                 }
                                                 emit_agent_message(
                                                     &app_clone,
@@ -5896,6 +6008,9 @@ async fn handle_ws_commands(
                                                         missing_conversation_session_id =
                                                             extract_missing_conversation_session_id(&errors);
                                                     }
+                                                    if !saw_prompt_too_long && detect_prompt_too_long(&errors) {
+                                                        saw_prompt_too_long = true;
+                                                    }
                                                     if detect_credential_error(&errors) {
                                                         saw_credential_error = true;
                                                         emit_agent_message(
@@ -5932,6 +6047,9 @@ async fn handle_ws_commands(
                                             if missing_conversation_session_id.is_none() {
                                                 missing_conversation_session_id =
                                                     extract_missing_conversation_session_id(&line);
+                                            }
+                                            if !saw_prompt_too_long && detect_prompt_too_long(&line) {
+                                                saw_prompt_too_long = true;
                                             }
                                             let line_has_credential_error = detect_credential_error(&cli_line);
                                             if line_has_credential_error {
@@ -5972,17 +6090,6 @@ async fn handle_ws_commands(
                                 drop(stdin_handle);
                                 app_state_clone.agent_stdin.write().remove(&agent_id_clone);
 
-                                // Emit running=false NOW, before child.wait(). The MCP bridge
-                                // subprocess may keep the process tree alive after the result event.
-                                _run_guard.disarm();
-                                emit_agent_run_state(
-                                    &app_clone,
-                                    &ws_server,
-                                    &workspace_id_clone,
-                                    &agent_id_clone,
-                                    false,
-                                );
-
                                 let status = match child.wait() {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -6010,6 +6117,9 @@ async fn handle_ws_commands(
                                 if missing_conversation_session_id.is_none() {
                                     missing_conversation_session_id =
                                         extract_missing_conversation_session_id(&stderr_buf);
+                                }
+                                if !saw_prompt_too_long && detect_prompt_too_long(&stderr_buf) {
+                                    saw_prompt_too_long = true;
                                 }
 
                                 app_state_clone.child_pids.write().remove(&agent_id_clone);
@@ -6162,6 +6272,9 @@ async fn handle_ws_commands(
                                             "error",
                                         );
                                     }
+                                    if !saw_prompt_too_long && detect_prompt_too_long(&error_content) {
+                                        saw_prompt_too_long = true;
+                                    }
                                     if detect_credential_error(&error_content) {
                                         saw_credential_error = true;
                                         emit_agent_message(
@@ -6198,7 +6311,7 @@ async fn handle_ws_commands(
                                         true,
                                         "error",
                                     );
-                                    if let Some(hint) = env_hint {
+                                    if let Some(ref hint) = env_hint {
                                         emit_agent_message(
                                             &app_clone,
                                             &db,
@@ -6207,6 +6320,51 @@ async fn handle_ws_commands(
                                             &workspace_id_clone,
                                             &ws_server,
                                             format!("Hint: {}", hint),
+                                            true,
+                                            "error",
+                                        );
+                                    }
+                                }
+
+                                // Prompt-too-long retry: the CLI compacts history as a
+                                // side-effect of the failed load, so retrying often works.
+                                if saw_prompt_too_long && missing_conversation_session_id.is_none() {
+                                    if prompt_too_long_attempts < MAX_PROMPT_TOO_LONG_RETRIES {
+                                        prompt_too_long_attempts += 1;
+                                        let delay_secs: u64 = 30;
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            format!(
+                                                "Context window exceeded — the CLI is compacting conversation history. Retrying in {} seconds (attempt {}/{})...",
+                                                delay_secs, prompt_too_long_attempts, MAX_PROMPT_TOO_LONG_RETRIES
+                                            ),
+                                            false,
+                                            "system",
+                                        );
+                                        if !interruptible_sleep(&app_state_clone, &agent_id_clone, delay_secs) {
+                                            break 'retry;
+                                        }
+                                        continue 'retry;
+                                    } else {
+                                        reset_agent_claude_session(
+                                            &app_state_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                        );
+                                        emit_agent_message(
+                                            &app_clone,
+                                            &db,
+                                            &session_id,
+                                            &agent_id_clone,
+                                            &workspace_id_clone,
+                                            &ws_server,
+                                            "Context compaction did not reduce the session enough after multiple attempts. The session was reset — your next message will start a fresh conversation.".to_string(),
                                             true,
                                             "error",
                                         );
@@ -6244,7 +6402,19 @@ async fn handle_ws_commands(
                                         }
                                     }
                                 }
-                                // running=false was already emitted before child.wait() above.
+
+                                break; // Normal exit — no retry needed.
+                                } // end 'retry loop
+
+                                // Emit running=false after the retry loop completes.
+                                _run_guard.disarm();
+                                emit_agent_run_state(
+                                    &app_clone,
+                                    &ws_server,
+                                    &workspace_id_clone,
+                                    &agent_id_clone,
+                                    false,
+                                );
                             } else {
                                 emit_agent_message(
                                     &app_clone,
