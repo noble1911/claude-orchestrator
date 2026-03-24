@@ -69,13 +69,14 @@ server.tool(
 
       const decision = await res.json();
 
-      // Claude CLI expects either { updatedInput: <record> } for allow
-      // or { behavior: "deny", message: <string> } for deny.
+      // Claude CLI validates a discriminated union on the `behavior` field:
+      //   Allow: { behavior: "allow", updatedInput?: <record> }
+      //   Deny:  { behavior: "deny", message: <string> }
       // The orchestrator returns { behavior: "allow" | "deny", message?: ... },
-      // so we transform allow responses into the expected shape.
+      // so we transform allow responses to include the original input.
       const response =
         decision.behavior === "allow"
-          ? { updatedInput: input }
+          ? { behavior: "allow" as const, updatedInput: input }
           : { behavior: "deny" as const, message: decision.message ?? "Permission denied" };
 
       return {
