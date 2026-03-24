@@ -399,7 +399,10 @@ async fn get_app_status(state: State<'_, Arc<AppState>>) -> Result<AppStatus, St
 }
 
 #[tauri::command]
-async fn start_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerStatus, String> {
+async fn start_remote_server(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<ServerStatus, String> {
     let server = state
         .ws_server
         .clone()
@@ -413,14 +416,23 @@ async fn start_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerSt
     *state.ws_server_running.write() = true;
     *state.ws_connected_clients.write() = server.client_count();
 
-    // HTTP server is auto-started on app init (needed for MCP permission bridge).
-    // No need to start it here — just report status.
+    // Restart the HTTP server with web client static files enabled.
+    // On app init it was started with only the permission API (serve_web=false);
+    // now upgrade it to also serve the web client.
+    if let Some(http) = &state.http_server {
+        let pending = state.pending_permission_requests.clone();
+        http.start(pending, app, true).await
+            .map_err(|e| format!("Failed to start HTTP server with web client: {}", e))?;
+    }
 
     Ok(build_server_status(state.inner().as_ref()))
 }
 
 #[tauri::command]
-async fn stop_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerStatus, String> {
+async fn stop_remote_server(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<ServerStatus, String> {
     let server = state
         .ws_server
         .clone()
@@ -431,9 +443,13 @@ async fn stop_remote_server(state: State<'_, Arc<AppState>>) -> Result<ServerSta
     *state.ws_connected_clients.write() = 0;
     *state.pairing_code.write() = None;
 
-    // Stop HTTP server
+    // Downgrade the HTTP server: stop serving web client static files
+    // but keep the /api/permission endpoint alive for the MCP bridge.
     if let Some(http) = &state.http_server {
-        http.stop();
+        let pending = state.pending_permission_requests.clone();
+        if let Err(e) = http.start(pending, app, false).await {
+            tracing::warn!("Failed to restart HTTP server in API-only mode: {}", e);
+        }
     }
 
     Ok(build_server_status(state.inner().as_ref()))
@@ -1125,7 +1141,42 @@ fn claude_supports_permission_mode(claude_path: &str) -> bool {
 }
 
 fn claude_supports_permission_prompt_tool(claude_path: &str) -> bool {
-    claude_supports_option(claude_path, "--permission-prompt-tool")
+    // Fast path: check help text first (in case a future CLI version lists it).
+    if claude_supports_option(claude_path, "--permission-prompt-tool") {
+        return true;
+    }
+    // The flag is hidden from --help in current CLI versions.  Probe it
+    // directly: "argument missing" means the flag exists but needs a value;
+    // "unknown option" (or no output) means it doesn't exist at all.
+    static PROBE_CACHE: std::sync::OnceLock<Mutex<HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    let cache = PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(&cached) = guard.get(claude_path) {
+            return cached;
+        }
+    }
+    let result = match Command::new(claude_path)
+        .args(["--print", "--permission-prompt-tool"])
+        .output()
+    {
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let combined = format!("{}{}", stderr, stdout);
+            combined.contains("argument missing")
+        }
+        Err(_) => false,
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(claude_path.to_string(), result);
+    }
+    tracing::info!(
+        claude_path = %claude_path,
+        supported = result,
+        "probed --permission-prompt-tool support"
+    );
+    result
 }
 
 fn claude_supports_model_option(claude_path: &str) -> bool {
@@ -6651,7 +6702,7 @@ pub fn run() {
                 let http_app_handle = app_handle.clone();
                 let http = http.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = http.start(pending, http_app_handle).await {
+                    if let Err(e) = http.start(pending, http_app_handle, false).await {
                         tracing::warn!("Failed to auto-start HTTP server: {}", e);
                     }
                 });
