@@ -1221,8 +1221,10 @@ fn append_claude_request_args(
         None
     };
     let use_mcp_bridge = bridge_path.is_some();
-    // Fall back to stdin interactive mode when the bridge is unavailable.
-    let interactive = wants_interactive && !use_mcp_bridge;
+    // We need stdin piped whenever the CLI supports stream-json, even when using
+    // the MCP bridge for permissions, because question answers (AskUserQuestion)
+    // and follow-up messages are still sent via stdin.
+    let interactive = wants_interactive;
 
     cmd.arg("--print");
     if supports_stream {
