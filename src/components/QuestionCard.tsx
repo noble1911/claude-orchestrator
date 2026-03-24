@@ -19,8 +19,9 @@ function QuestionCard({ message, rowId, isAnswered, onAnswer }: QuestionCardProp
     );
   }
 
+  const hasMultiSelect = payload.questions.some((q) => q.multiSelect);
   const canBundleAnswers =
-    payload.questions.length > 1 &&
+    (payload.questions.length > 1 || hasMultiSelect) &&
     payload.questions.every((question) => (question.options?.length ?? 0) > 0);
 
   const canSubmitBundledAnswers =
