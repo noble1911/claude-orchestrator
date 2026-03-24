@@ -60,14 +60,22 @@ impl HttpServer {
         }
     }
 
+    /// Start the HTTP server.
+    ///
+    /// When `serve_web` is `false`, only the `/api/permission` endpoint is
+    /// mounted (for the MCP permission bridge).  When `true`, the web client
+    /// static files are also served — call this when the user explicitly
+    /// starts the remote server.
     pub async fn start(
         &self,
         pending_permissions: PendingPermissions,
         app_handle: AppHandle,
+        serve_web: bool,
     ) -> Result<(), String> {
-        if let Some(handle) = self.task.read().as_ref() {
+        // If already running, stop first so we can rebuild with/without web.
+        if let Some(handle) = self.task.write().take() {
             if !handle.is_finished() {
-                return Ok(());
+                handle.abort();
             }
         }
 
@@ -81,18 +89,21 @@ impl HttpServer {
             .route("/api/permission", post(handle_permission_request))
             .with_state(api_state);
 
-        // Static file serving with permissive CORS (web client needs cross-origin access)
+        // Only serve static web client files when explicitly requested
+        // (i.e. when the user starts the remote server).
         let mut app = api_routes;
-        let index_path = self.web_dist_path.join("index.html");
-        if self.web_dist_path.exists() {
-            let cors = CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any);
-            app = app.fallback_service(
-                ServeDir::new(&self.web_dist_path)
-                    .not_found_service(ServeFile::new(&index_path)),
-            ).layer(cors);
+        if serve_web {
+            let index_path = self.web_dist_path.join("index.html");
+            if self.web_dist_path.exists() {
+                let cors = CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any);
+                app = app.fallback_service(
+                    ServeDir::new(&self.web_dist_path)
+                        .not_found_service(ServeFile::new(&index_path)),
+                ).layer(cors);
+            }
         }
 
         let addr = format!("127.0.0.1:{}", self.port);

@@ -721,17 +721,21 @@ function App() {
 
   useEffect(() => {
     if (!selectedWorkspace) return;
+    const ws = workspaces.find((w) => w.id === selectedWorkspace);
+    if (!ws || ws.status === "initializing") return;
     if (activeRightTab === "changes") {
       loadWorkspaceChanges(selectedWorkspace);
     }
-  }, [activeRightTab, selectedWorkspace]);
+  }, [activeRightTab, selectedWorkspace, workspaces]);
 
   useEffect(() => {
     if (!selectedWorkspace) return;
+    const ws = workspaces.find((w) => w.id === selectedWorkspace);
+    if (!ws || ws.status === "initializing") return;
     if (activeRightTab === "checks") {
       loadWorkspaceCheckDefinitions(selectedWorkspace);
     }
-  }, [activeRightTab, selectedWorkspace]);
+  }, [activeRightTab, selectedWorkspace, workspaces]);
 
   useEffect(() => {
     if (!selectedWorkspace) return;
