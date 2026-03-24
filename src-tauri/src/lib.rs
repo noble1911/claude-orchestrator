@@ -1220,11 +1220,11 @@ fn append_claude_request_args(
     } else {
         None
     };
-    let use_mcp_bridge = bridge_path.is_some();
-    // We need stdin piped whenever the CLI supports stream-json, even when using
-    // the MCP bridge for permissions, because question answers (AskUserQuestion)
-    // and follow-up messages are still sent via stdin.
-    let interactive = wants_interactive;
+    let _use_mcp_bridge = bridge_path.is_some();
+    // Stdin must be piped whenever the CLI supports stream-json, regardless of
+    // permission mode.  Question answers (AskUserQuestion) and follow-up messages
+    // are always sent via stdin — this is orthogonal to permission handling.
+    let interactive = supports_stream;
 
     cmd.arg("--print");
     if supports_stream {
@@ -1254,7 +1254,7 @@ fn append_claude_request_args(
         cmd.args(["--permission-prompt-tool", "mcp__perm_bridge__check_permission"]);
     }
     if interactive {
-        // Legacy fallback: bidirectional stream-json for control_request/control_response.
+        // Enable bidirectional stream-json for question answers and follow-up messages.
         cmd.args(["--input-format", "stream-json"]);
     }
     if let Some(model) = model {
@@ -1968,6 +1968,40 @@ fn emit_agent_run_state(
     }
 }
 
+/// Guard that emits `agent-run-state: false` when dropped, even on thread panic.
+/// Create this right after emitting `running: true` in the agent execution thread.
+/// Call `disarm()` before the explicit `emit_agent_run_state(false)` to avoid double-emit.
+struct RunStateGuard {
+    app: tauri::AppHandle,
+    ws_server: Option<Arc<WebSocketServer>>,
+    workspace_id: String,
+    agent_id: String,
+    armed: bool,
+}
+
+impl RunStateGuard {
+    fn new(
+        app: tauri::AppHandle,
+        ws_server: Option<Arc<WebSocketServer>>,
+        workspace_id: String,
+        agent_id: String,
+    ) -> Self {
+        Self { app, ws_server, workspace_id, agent_id, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunStateGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            emit_agent_run_state(&self.app, &self.ws_server, &self.workspace_id, &self.agent_id, false);
+        }
+    }
+}
+
 fn summarize_tool_call(tool_name: &str, input_json: &str) -> Option<String> {
     let parsed = serde_json::from_str::<Value>(input_json).ok();
     let lower = tool_name.to_lowercase();
@@ -2520,6 +2554,17 @@ async fn stop_agent(
         let _ = state.db.end_session(&sid, &now);
     }
     
+    // Drop any pending permission requests for this agent. Dropping the
+    // oneshot senders causes the HTTP handler to auto-deny (channel recv error).
+    // The map is keyed by request_id, not agent_id, so we drop all entries —
+    // in practice there is at most one pending permission at a time.
+    {
+        let mut pending = state.pending_permission_requests.write();
+        if !pending.is_empty() {
+            pending.clear();
+        }
+    }
+
     // Update workspace status if no more agents
     if let Some(ws_id) = workspace_id.clone() {
         let agents = state.agents.read();
@@ -2748,6 +2793,13 @@ async fn send_message_to_agent(
             &agent_id_clone,
             true,
         );
+        // Safety net: if this thread panics, the guard's Drop impl will emit running=false.
+        let mut _run_guard = RunStateGuard::new(
+            app.clone(),
+            ws_server.clone(),
+            workspace_id.clone(),
+            agent_id_clone.clone(),
+        );
         let effective_env = build_effective_cli_env(&env_overrides);
         let claude_path = match find_claude_cli_with_env(Some(&effective_env)) {
             Some(p) => p,
@@ -2771,13 +2823,7 @@ async fn send_message_to_agent(
                         timestamp: msg.timestamp,
                     });
                 }
-                emit_agent_run_state(
-                    &app,
-                    &ws_server,
-                    &workspace_id,
-                    &agent_id_clone,
-                    false,
-                );
+                // Guard will emit running=false on return.
                 return;
             }
         };
@@ -2865,13 +2911,7 @@ async fn send_message_to_agent(
                         "error",
                     );
                 }
-                emit_agent_run_state(
-                    &app,
-                    &ws_server,
-                    &workspace_id,
-                    &agent_id_clone,
-                    false,
-                );
+                // Guard will emit running=false on return.
                 return;
             }
         };
@@ -3039,6 +3079,9 @@ async fn send_message_to_agent(
                                 if last_activity.as_deref() == Some(activity.as_str()) {
                                     continue;
                                 }
+                                // Reset question dedup: activity means the CLI moved past
+                                // the previous question, so a repeat is a genuine re-ask.
+                                last_question = None;
                                 emit_agent_message(
                                     &app,
                                     &db,
@@ -3193,6 +3236,10 @@ async fn send_message_to_agent(
                             );
                             error_emitted = true;
                         }
+                        // The `result` event is the CLI's final output. Break out
+                        // of the stdout loop immediately — the MCP bridge subprocess
+                        // may hold the pipe's write-end FD open, preventing EOF.
+                        break;
                     }
                 } else {
                     // Forward non-JSON runtime output so authentication/runtime issues are visible.
@@ -3240,6 +3287,18 @@ async fn send_message_to_agent(
         drop(stdin_handle);
         app_state_for_pids.agent_stdin.write().remove(&agent_id_clone);
 
+        // Emit running=false NOW, before child.wait(). The MCP bridge
+        // subprocess may keep the process tree alive long after the CLI
+        // has sent its final `result` event. We don't want the UI blocked.
+        _run_guard.disarm();
+        emit_agent_run_state(
+            &app,
+            &ws_server,
+            &workspace_id,
+            &agent_id_clone,
+            false,
+        );
+
         let status = match child.wait() {
             Ok(s) => s,
             Err(e) => {
@@ -3254,13 +3313,6 @@ async fn send_message_to_agent(
                     format!("Error waiting for Claude: {}", e),
                     true,
                     "error",
-                );
-                emit_agent_run_state(
-                    &app,
-                    &ws_server,
-                    &workspace_id,
-                    &agent_id_clone,
-                    false,
                 );
                 return;
             }
@@ -3504,13 +3556,7 @@ async fn send_message_to_agent(
                 }
             }
         }
-        emit_agent_run_state(
-            &app,
-            &ws_server,
-            &workspace_id,
-            &agent_id_clone,
-            false,
-        );
+        // running=false was already emitted before child.wait() above.
     });
 
     Ok(())
@@ -5468,6 +5514,12 @@ async fn handle_ws_commands(
                                 &agent_id_clone,
                                 true,
                             );
+                            let mut _run_guard = RunStateGuard::new(
+                                app_clone.clone(),
+                                ws_server.clone(),
+                                workspace_id_clone.clone(),
+                                agent_id_clone.clone(),
+                            );
                             let effective_env = build_effective_cli_env(&env_overrides);
                             if let Some(claude_path) = find_claude_cli_with_env(Some(&effective_env)) {
                                 let mut cmd = Command::new(&claude_path);
@@ -5537,13 +5589,7 @@ async fn handle_ws_commands(
                                                 "error",
                                             );
                                         }
-                                        emit_agent_run_state(
-                                            &app_clone,
-                                            &ws_server,
-                                            &workspace_id_clone,
-                                            &agent_id_clone,
-                                            false,
-                                        );
+                                        // Guard will emit running=false on return.
                                         return;
                                     }
                                 };
@@ -5712,6 +5758,8 @@ async fn handle_ws_commands(
                                                         if last_activity.as_deref() == Some(activity.as_str()) {
                                                             continue;
                                                         }
+                                                        // Reset question dedup so repeated questions aren't dropped.
+                                                        last_question = None;
                                                         emit_agent_message(
                                                             &app_clone,
                                                             &db,
@@ -5875,6 +5923,9 @@ async fn handle_ws_commands(
                                                     );
                                                     error_emitted = true;
                                                 }
+                                                // The `result` event is the CLI's final output. Break out
+                                                // of the stdout loop — MCP bridge may hold pipe FD open.
+                                                break;
                                             }
                                         } else {
                                             let cli_line = format!("cli: {}", line);
@@ -5921,6 +5972,17 @@ async fn handle_ws_commands(
                                 drop(stdin_handle);
                                 app_state_clone.agent_stdin.write().remove(&agent_id_clone);
 
+                                // Emit running=false NOW, before child.wait(). The MCP bridge
+                                // subprocess may keep the process tree alive after the result event.
+                                _run_guard.disarm();
+                                emit_agent_run_state(
+                                    &app_clone,
+                                    &ws_server,
+                                    &workspace_id_clone,
+                                    &agent_id_clone,
+                                    false,
+                                );
+
                                 let status = match child.wait() {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -5935,13 +5997,6 @@ async fn handle_ws_commands(
                                             format!("Error waiting for Claude: {}", e),
                                             true,
                                             "error",
-                                        );
-                                        emit_agent_run_state(
-                                            &app_clone,
-                                            &ws_server,
-                                            &workspace_id_clone,
-                                            &agent_id_clone,
-                                            false,
                                         );
                                         return;
                                     }
@@ -6189,13 +6244,7 @@ async fn handle_ws_commands(
                                         }
                                     }
                                 }
-                                emit_agent_run_state(
-                                    &app_clone,
-                                    &ws_server,
-                                    &workspace_id_clone,
-                                    &agent_id_clone,
-                                    false,
-                                );
+                                // running=false was already emitted before child.wait() above.
                             } else {
                                 emit_agent_message(
                                     &app_clone,
@@ -6208,13 +6257,7 @@ async fn handle_ws_commands(
                                     true,
                                     "error",
                                 );
-                                emit_agent_run_state(
-                                    &app_clone,
-                                    &ws_server,
-                                    &workspace_id_clone,
-                                    &agent_id_clone,
-                                    false,
-                                );
+                                // Guard will emit running=false on drop.
                             }
                         });
                     }
@@ -6404,6 +6447,23 @@ async fn handle_ws_commands(
             }
 
             ServerCommand::RespondToPermission { workspace_id, request_id, allow, deny_message, response_tx } => {
+                // Try the MCP bridge path first (HTTP long-poll oneshot channel).
+                let pending_tx = state.pending_permission_requests.write().remove(&request_id);
+                if let Some(tx) = pending_tx {
+                    let response = if allow {
+                        serde_json::json!({ "behavior": "allow" })
+                    } else {
+                        serde_json::json!({
+                            "behavior": "deny",
+                            "message": deny_message.as_deref().unwrap_or("User denied this action")
+                        })
+                    };
+                    let _ = tx.send(response);
+                    let resp = serde_json::json!({ "type": "ok" });
+                    let _ = response_tx.send(serde_json::to_string(&resp).unwrap());
+                    continue;
+                }
+                // Fall back to stdin control_response path.
                 let agent_id = {
                     let agents = state.agents.read();
                     agents.values()
