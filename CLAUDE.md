@@ -16,7 +16,15 @@ This file provides guidance to Claude Code when working with the Claude Orchestr
 claude-orchestrator/
 ├── src-tauri/                    # Rust backend
 │   ├── src/
-│   │   ├── lib.rs               # Tauri commands, app state, Claude CLI execution
+│   │   ├── lib.rs               # Tauri commands, app state (~3,800 lines)
+│   │   ├── claude/              # Claude CLI integration (Phase 4)
+│   │   │   ├── mod.rs           # Module root + help cache
+│   │   │   ├── discovery.rs     # CLI path finding, capability probes
+│   │   │   ├── env.rs           # Shell env, AWS auth, build_effective_cli_env
+│   │   │   ├── models.rs        # Model/effort/permission normalization, CLI args
+│   │   │   ├── stream.rs        # Stream event parsing, message emission
+│   │   │   └── runner.rs        # Shared execution loop (run_claude_message)
+│   │   ├── git.rs               # Worktree ops, branch detection, orchestrator config
 │   │   ├── types.rs             # Shared structs/enums (extracted Phase 1)
 │   │   ├── helpers.rs           # Shared helpers: now_rfc3339(), new_id(), constants
 │   │   ├── database.rs          # SQLite schema & CRUD operations
@@ -161,7 +169,9 @@ When an agent is busy (thinking), new messages are queued and sent automatically
 
 | File | Purpose |
 |------|---------|
-| `src-tauri/src/lib.rs` | All Tauri commands, state management, Claude CLI execution (~6,840 lines) |
+| `src-tauri/src/lib.rs` | Tauri commands, state management, WS handler (~3,800 lines) |
+| `src-tauri/src/claude/` | Claude CLI integration: discovery, env, models, stream, runner (~1,900 lines) |
+| `src-tauri/src/git.rs` | Git worktree ops, branch detection, orchestrator config (~170 lines) |
 | `src-tauri/src/types.rs` | Shared structs/enums (extracted Phase 1) |
 | `src-tauri/src/helpers.rs` | Shared helpers: `now_rfc3339()`, `new_id()`, constants |
 | `src-tauri/src/database.rs` | SQLite schema and CRUD operations |
@@ -170,7 +180,7 @@ When an agent is busy (thinking), new messages are queued and sent automatically
 | `src/constants.ts` | Storage keys, defaults, model options |
 | `src/utils.ts` | Pure utility functions (message handling, URL parsing, etc.) |
 | `src/themes.ts` | Theme definitions & management |
-| `src/App.tsx` | Main React component (state, effects, handlers, layout) (~4,950 lines) |
+| `src/App.tsx` | Main React component (state, effects, handlers, layout) (~4,343 lines) |
 | `src/hooks/*.ts` | Custom React hooks (usePersistedState, useTauriListener, useAgentEvents, usePanelResize) |
 | `src/components/*.tsx` | 12 extracted UI components |
 
@@ -263,15 +273,17 @@ Mobile clients connect to `ws://localhost:3001` and can send:
 ## Refactoring Roadmap
 
 ### Current State
-- `src-tauri/src/lib.rs` is ~6,840 lines — all Tauri commands, Claude CLI execution, stream parsing, env management live in one file
+- `src-tauri/src/lib.rs` is ~3,800 lines — Tauri commands, app state, WS handler (reduced from ~6,840 in Phase 4)
+- `src-tauri/src/claude/` — Claude CLI integration extracted to 6 submodules (~1,900 lines, Phase 4 complete)
+- `src-tauri/src/git.rs` — worktree ops, branch detection, orchestrator config (~170 lines, Phase 4 complete)
 - `src-tauri/src/types.rs` — all shared structs/enums extracted (Phase 1 complete)
 - `src-tauri/src/helpers.rs` — shared helpers (`now_rfc3339`, `new_id`, constants) extracted to public module (Phase 1 complete)
-- `src/App.tsx` is ~4,950 lines — ~36 useState hooks, effects, handlers, and JSX layout in one component
+- `src/App.tsx` is ~4,343 lines — ~36 useState hooks, effects, handlers, and JSX layout in one component (reduced from ~4,950 in Phase 3)
 - `src/hooks/` — 4 hooks extracted (Phase 2 complete): `usePersistedState` (broadly adopted, 11 pairs), `useTauriListener`, `useAgentEvents`, `usePanelResize`
 - `src-tauri/src/process_manager.rs` — deleted (confirmed unused, Phase 1 complete)
 - 7 components extracted outside roadmap: `SettingsModal`, `SkillsMarketplace`, `ToolbarDropdown`, `ThinkingTimer`, `PermissionCard`, `GroupDropZone`, `SortableGroupItem`
-- The Claude execution loop (~700 lines) is **duplicated verbatim** between `send_message_to_agent` and `handle_ws_commands::SendMessage`
-- Multiple WS command handlers duplicate their corresponding Tauri commands (remove_workspace, remove_repository, run_checks, list_files, etc.)
+- ~~The Claude execution loop (~700 lines) is duplicated verbatim~~ → resolved: unified `run_claude_message` in `claude/runner.rs` (Phase 4)
+- Multiple WS command handlers still duplicate their corresponding Tauri commands (remove_workspace, remove_repository, run_checks, list_files, etc.)
 
 ### Known DRY Violations
 
@@ -374,10 +386,12 @@ src/
 10. Extract 7 dialog components from App.tsx
 11. `<SkillCard>`, `<FileTree>` components
 
-**Phase 4 — Rust module extraction (highest impact)**
-12. Extract `claude/runner.rs` — shared execution loop
-13. Extract `commands/` modules
-14. Slim `handle_ws_commands` to delegate to `commands/*`
+**Phase 4 — Rust module extraction (highest impact)** ✓ Partial
+12. ~~Extract `claude/runner.rs` — shared execution loop~~ → complete: `claude/` with 6 submodules (discovery, env, models, stream, runner)
+12b. ~~Extract `git.rs`~~ → complete: worktree ops, branch detection, orchestrator config
+12c. ~~Unify WS `SendMessage` handler~~ → complete: delegates to `run_claude_message`
+13. Extract `commands/` modules (not yet started)
+14. Slim remaining `handle_ws_commands` arms to delegate to `commands/*` (not yet started)
 
 **Phase 5 — State management (enables panel extraction)**
 15. Introduce zustand or React Context
