@@ -1,24 +1,30 @@
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, UdpSocket};
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
 
+pub mod claude;
+pub mod commands;
 mod database;
+pub mod git;
 pub mod helpers;
 mod http_server;
 pub mod types;
 mod websocket_server;
 
+use claude::discovery::find_claude_cli_with_env;
+use claude::models::{append_claude_request_args, write_stdin_user_message};
+use claude::runner::reset_agent_claude_session;
+use commands::agent::{status_for_agent_start, status_for_agent_stop};
 use database::Database;
 use helpers::*;
 use http_server::{HttpServer, PendingPermissions};
@@ -28,9 +34,8 @@ use websocket_server::{
     WorkspaceInfo, WsResponse,
 };
 
-static CLAUDE_HELP_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 const REMOTE_SERVER_PORT: u16 = 3001;
-const HTTP_SERVER_PORT: u16 = 3002;
+pub const HTTP_SERVER_PORT: u16 = 3002;
 
 
 // Application State
@@ -114,22 +119,6 @@ fn workspace_status_to_ws(status: &WorkspaceStatus) -> String {
     }
 }
 
-fn status_for_agent_start(current: &WorkspaceStatus) -> WorkspaceStatus {
-    if matches!(current, WorkspaceStatus::InReview | WorkspaceStatus::Merged) {
-        current.clone()
-    } else {
-        WorkspaceStatus::Running
-    }
-}
-
-fn status_for_agent_stop(current: &WorkspaceStatus) -> WorkspaceStatus {
-    if matches!(current, WorkspaceStatus::InReview | WorkspaceStatus::Merged) {
-        current.clone()
-    } else {
-        WorkspaceStatus::Idle
-    }
-}
-
 fn to_workspace_info(workspace: &Workspace, has_agent: bool) -> WorkspaceInfo {
     WorkspaceInfo {
         id: workspace.id.clone(),
@@ -154,180 +143,6 @@ fn to_repository_info(repository: &Repository) -> RepositoryInfo {
 }
 
 // Git helpers
-fn get_default_branch(repo_path: &str) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to run git: {}", e))?;
-    
-    if output.status.success() {
-        let branch = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .replace("origin/", "");
-        Ok(branch)
-    } else {
-        Ok("main".to_string())
-    }
-}
-
-fn is_git_repo(path: &str) -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(path)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Check if a git repository has an operation in progress that would prevent commits.
-/// Returns "clean" if safe, or "busy:<reason>" if an operation is in progress.
-/// Pattern from Conductor's git-busy-check.sh
-fn git_busy_check(repo_path: &str) -> String {
-    let git_dir = {
-        let output = Command::new("git")
-            .args(["rev-parse", "--git-dir"])
-            .current_dir(repo_path)
-            .output();
-        match output {
-            Ok(o) if o.status.success() => {
-                let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if dir.starts_with('/') {
-                    PathBuf::from(dir)
-                } else {
-                    PathBuf::from(repo_path).join(dir)
-                }
-            }
-            _ => return "error:not_a_git_repo".to_string(),
-        }
-    };
-
-    // Check for rebase (directory-based, more reliable than REBASE_HEAD)
-    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
-        return "busy:rebase".to_string();
-    }
-
-    // Check for merge
-    if git_dir.join("MERGE_HEAD").exists() {
-        return "busy:merge".to_string();
-    }
-
-    // Check for cherry-pick
-    if git_dir.join("CHERRY_PICK_HEAD").exists() {
-        return "busy:cherry-pick".to_string();
-    }
-
-    // Check for revert
-    if git_dir.join("REVERT_HEAD").exists() {
-        return "busy:revert".to_string();
-    }
-
-    "clean".to_string()
-}
-
-/// Read conductor.json or orchestrator.json configuration from a repository or workspace path
-/// Checks conductor.json first, then orchestrator.json as fallback
-fn read_orchestrator_config(path: &str) -> OrchestratorConfig {
-    let base = PathBuf::from(path);
-
-    // Check conductor.json first (Conductor compatibility)
-    for filename in ["conductor.json", "orchestrator.json"] {
-        let config_path = base.join(filename);
-        if config_path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&config_path) {
-                if let Ok(config) = serde_json::from_str::<OrchestratorConfig>(&contents) {
-                    return config;
-                }
-            }
-        }
-    }
-    OrchestratorConfig::default()
-}
-
-/// Run a script in a workspace with environment variables set
-fn run_script_in_workspace(
-    workspace_path: &str,
-    workspace_name: &str,
-    script: &str,
-) -> Result<(String, String, i32), String> {
-    let output = Command::new("sh")
-        .args(["-c", script])
-        .current_dir(workspace_path)
-        .env("ORCHESTRATOR_WORKSPACE_NAME", workspace_name)
-        .env("ORCHESTRATOR_WORKSPACE_PATH", workspace_path)
-        .output()
-        .map_err(|e| format!("Failed to run script: {}", e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
-
-    Ok((stdout, stderr, exit_code))
-}
-
-fn create_worktree(repo_path: &str, worktree_path: &str, branch: &str, default_branch: &str) -> Result<(), String> {
-    // Fetch latest from origin so the worktree starts from the remote HEAD
-    // rather than the (potentially stale) local main branch.
-    let fetch = Command::new("git")
-        .args(["fetch", "origin", default_branch])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to fetch origin: {}", e))?;
-    if !fetch.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch.stderr);
-        return Err(format!("Git fetch failed: {}", stderr));
-    }
-
-    let start_point = format!("origin/{}", default_branch);
-    let output = Command::new("git")
-        .args(["worktree", "add", "-b", branch, worktree_path, &start_point])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to create worktree: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Git worktree failed: {}", stderr));
-    }
-
-    Ok(())
-}
-
-fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
-    let output = Command::new("git")
-        .args(["worktree", "remove", worktree_path, "--force"])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to remove worktree: {}", e))?;
-    
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Git worktree remove failed: {}", stderr));
-    }
-    
-    Ok(())
-}
-
-fn remove_workspace_directory(repo_path: &str, worktree_path: &str) -> Result<(), String> {
-    let repo_root = PathBuf::from(repo_path);
-    let allowed_root = repo_root.join(".worktrees");
-    let workspace_path = PathBuf::from(worktree_path);
-
-    if !workspace_path.starts_with(&allowed_root) {
-        return Err(format!(
-            "Refusing to delete workspace path outside .worktrees: {}",
-            worktree_path
-        ));
-    }
-
-    if workspace_path.exists() {
-        std::fs::remove_dir_all(&workspace_path)
-            .map_err(|e| format!("Failed to delete workspace files: {}", e))?;
-    }
-
-    Ok(())
-}
-
 fn detect_remote_connect_host() -> String {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(socket) => socket,
@@ -511,44 +326,7 @@ async fn add_repository(
     path: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Repository, String> {
-    let path_buf = PathBuf::from(&path);
-    
-    if !path_buf.exists() {
-        return Err(format!("Path does not exist: {}", path));
-    }
-    
-    if !path_buf.is_dir() {
-        return Err(format!("Path is not a directory: {}", path));
-    }
-    
-    if !is_git_repo(&path) {
-        return Err("Not a git repository. Please select a folder containing a .git directory.".to_string());
-    }
-    
-    let name = path_buf
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("Repository")
-        .to_string();
-    
-    let default_branch = get_default_branch(&path)?;
-    
-    let repo = Repository {
-        id: new_id(),
-        path,
-        name,
-        default_branch,
-        added_at: now_rfc3339(),
-    };
-    
-    // Save to database
-    state.db.insert_repository(&repo)
-        .map_err(|e| format!("Failed to save repository: {}", e))?;
-    
-    let mut repos = state.repositories.write();
-    repos.insert(repo.id.clone(), repo.clone());
-    
-    Ok(repo)
+    commands::repository::add_repository(&state, path)
 }
 
 #[tauri::command]
@@ -556,53 +334,12 @@ async fn remove_repository(
     repo_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let repo_path = {
-        let repos = state.repositories.read();
-        repos.get(&repo_id).map(|r| r.path.clone())
-    };
-    
-    if let Some(repo_path) = repo_path {
-        let workspaces_to_remove: Vec<Workspace> = {
-            let workspaces = state.workspaces.read();
-            workspaces.values()
-                .filter(|w| w.repo_id == repo_id)
-                .cloned()
-                .collect()
-        };
-        
-        for workspace in workspaces_to_remove {
-            if let Err(e) = remove_worktree(&repo_path, &workspace.worktree_path) {
-                tracing::warn!(
-                    "git worktree remove failed for {}: {}",
-                    workspace.worktree_path,
-                    e
-                );
-            }
-            if let Err(e) = remove_workspace_directory(&repo_path, &workspace.worktree_path) {
-                tracing::warn!(
-                    "workspace directory cleanup failed for {}: {}",
-                    workspace.worktree_path,
-                    e
-                );
-            }
-            let mut workspaces = state.workspaces.write();
-            workspaces.remove(&workspace.id);
-        }
-    }
-    
-    // Delete from database
-    state.db.delete_repository(&repo_id)
-        .map_err(|e| format!("Failed to delete repository: {}", e))?;
-    
-    let mut repos = state.repositories.write();
-    repos.remove(&repo_id);
-    Ok(())
+    commands::repository::remove_repository(&state, repo_id)
 }
 
 #[tauri::command]
 async fn list_repositories(state: State<'_, Arc<AppState>>) -> Result<Vec<Repository>, String> {
-    let repos = state.repositories.read();
-    Ok(repos.values().cloned().collect())
+    commands::repository::list_repositories(&state)
 }
 
 #[tauri::command]
@@ -610,12 +347,7 @@ async fn list_workspaces(
     repo_id: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<Workspace>, String> {
-    let workspaces = state.workspaces.read();
-    let result: Vec<Workspace> = workspaces.values()
-        .filter(|w| repo_id.as_ref().map_or(true, |id| &w.repo_id == id))
-        .cloned()
-        .collect();
-    Ok(result)
+    commands::workspace::list_workspaces(&state, repo_id)
 }
 
 /// Check if a repository has a git operation in progress (Conductor pattern)
@@ -624,76 +356,32 @@ async fn check_git_busy(
     repo_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let repo = {
-        let repos = state.repositories.read();
-        repos.get(&repo_id).cloned()
-            .ok_or("Repository not found")?
-    };
-    Ok(git_busy_check(&repo.path))
+    commands::workspace::check_git_busy(&state, repo_id)
 }
 
-/// Get orchestrator.json configuration for a repository
 #[tauri::command]
 async fn get_orchestrator_config(
     repo_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<OrchestratorConfig, String> {
-    let repo = {
-        let repos = state.repositories.read();
-        repos.get(&repo_id).cloned()
-            .ok_or("Repository not found")?
-    };
-    Ok(read_orchestrator_config(&repo.path))
+    commands::workspace::get_orchestrator_config(&state, repo_id)
 }
 
-/// Get orchestrator.json configuration for a workspace
 #[tauri::command]
 async fn get_workspace_config(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<OrchestratorConfig, String> {
-    let workspace = {
-        let workspaces = state.workspaces.read();
-        workspaces.get(&workspace_id).cloned()
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?
-    };
-    // First check workspace path, then fall back to repo path
-    let config = read_orchestrator_config(&workspace.worktree_path);
-    if config.setup_script.is_some() || config.run_script.is_some() || !config.checks.is_empty() {
-        return Ok(config);
-    }
-    // Fall back to repo config
-    let repo = {
-        let repos = state.repositories.read();
-        repos.get(&workspace.repo_id).cloned()
-            .ok_or("Repository not found")?
-    };
-    Ok(read_orchestrator_config(&repo.path))
+    commands::workspace::get_workspace_config(&state, workspace_id)
 }
 
-/// Run a script from orchestrator.json in a workspace
 #[tauri::command]
 async fn run_orchestrator_script(
     workspace_id: String,
-    script_type: String, // "setup", "run", or "archive"
+    script_type: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(String, String, i32), String> {
-    let workspace = {
-        let workspaces = state.workspaces.read();
-        workspaces.get(&workspace_id).cloned()
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?
-    };
-
-    let config = read_orchestrator_config(&workspace.worktree_path);
-    let script = match script_type.as_str() {
-        "setup" => config.setup_script,
-        "run" => config.run_script,
-        "archive" => config.archive_script,
-        _ => return Err(format!("Unknown script type: {}", script_type)),
-    };
-
-    let script = script.ok_or(format!("No {} script configured", script_type))?;
-    run_script_in_workspace(&workspace.worktree_path, &workspace.name, &script)
+    commands::workspace::run_orchestrator_script(&state, workspace_id, script_type)
 }
 
 #[tauri::command]
@@ -702,46 +390,7 @@ async fn create_workspace(
     name: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Workspace, String> {
-    let repo = {
-        let repos = state.repositories.read();
-        repos.get(&repo_id).cloned()
-            .ok_or("Repository not found")?
-    };
-    
-    let branch = format!("workspace/{}", name.to_lowercase().replace(' ', "-"));
-    
-    let worktrees_dir = PathBuf::from(&repo.path).join(".worktrees");
-    std::fs::create_dir_all(&worktrees_dir)
-        .map_err(|e| format!("Failed to create worktrees directory: {}", e))?;
-    
-    let worktree_path = worktrees_dir.join(&name);
-    let worktree_path_str = worktree_path.to_string_lossy().to_string();
-    
-    create_worktree(&repo.path, &worktree_path_str, &branch, &repo.default_branch)?;
-
-    let workspace = Workspace {
-        id: new_id(),
-        repo_id,
-        name,
-        branch,
-        worktree_path: worktree_path_str,
-        status: WorkspaceStatus::Idle,
-        last_activity: None,
-        pr_url: None,
-        unread: 0,
-        display_order: 0,
-        pinned_at: None,
-        notes: None,
-    };
-
-    // Save to database
-    state.db.insert_workspace(&workspace)
-        .map_err(|e| format!("Failed to save workspace: {}", e))?;
-
-    let mut workspaces = state.workspaces.write();
-    workspaces.insert(workspace.id.clone(), workspace.clone());
-
-    Ok(workspace)
+    commands::workspace::create_workspace(&state, repo_id, name)
 }
 
 #[tauri::command]
@@ -749,31 +398,7 @@ async fn remove_workspace(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let (repo_path, worktree_path) = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces.get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        
-        let repos = state.repositories.read();
-        let repo = repos.get(&workspace.repo_id)
-            .ok_or("Repository not found")?;
-        
-        (repo.path.clone(), workspace.worktree_path.clone())
-    };
-    
-    if let Err(e) = remove_worktree(&repo_path, &worktree_path) {
-        tracing::warn!("git worktree remove failed for {}: {}", worktree_path, e);
-    }
-    remove_workspace_directory(&repo_path, &worktree_path)?;
-    
-    // Delete from database
-    state.db.delete_workspace(&workspace_id)
-        .map_err(|e| format!("Failed to delete workspace: {}", e))?;
-    
-    let mut workspaces = state.workspaces.write();
-    workspaces.remove(&workspace_id);
-    
-    Ok(())
+    commands::workspace::remove_workspace(&state, workspace_id)
 }
 
 #[tauri::command]
@@ -782,26 +407,7 @@ async fn rename_workspace(
     name: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Workspace, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("Workspace name cannot be empty".to_string());
-    }
-
-    let updated = {
-        let mut workspaces = state.workspaces.write();
-        let workspace = workspaces
-            .get_mut(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.name = trimmed.to_string();
-        workspace.clone()
-    };
-
-    state
-        .db
-        .update_workspace_name(&workspace_id, trimmed)
-        .map_err(|e| format!("Failed to rename workspace: {}", e))?;
-
-    Ok(updated)
+    commands::workspace::rename_workspace(&state, workspace_id, name)
 }
 
 #[tauri::command]
@@ -810,14 +416,7 @@ async fn update_workspace_unread(
     unread: i32,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    {
-        let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.unread = unread;
-    }
-    state.db.update_workspace_unread(&workspace_id, unread)
-        .map_err(|e| format!("Failed to update unread: {}", e))?;
-    Ok(())
+    commands::workspace::update_workspace_unread(&state, workspace_id, unread)
 }
 
 #[tauri::command]
@@ -826,14 +425,7 @@ async fn update_workspace_display_order(
     display_order: i32,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    {
-        let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.display_order = display_order;
-    }
-    state.db.update_workspace_display_order(&workspace_id, display_order)
-        .map_err(|e| format!("Failed to update display order: {}", e))?;
-    Ok(())
+    commands::workspace::update_workspace_display_order(&state, workspace_id, display_order)
 }
 
 #[tauri::command]
@@ -841,19 +433,7 @@ async fn toggle_workspace_pinned(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Workspace, String> {
-    let updated = {
-        let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        if workspace.pinned_at.is_some() {
-            workspace.pinned_at = None;
-        } else {
-            workspace.pinned_at = Some(now_rfc3339());
-        }
-        workspace.clone()
-    };
-    state.db.update_workspace_pinned(&workspace_id, updated.pinned_at.as_deref())
-        .map_err(|e| format!("Failed to toggle pin: {}", e))?;
-    Ok(updated)
+    commands::workspace::toggle_workspace_pinned(&state, workspace_id)
 }
 
 #[tauri::command]
@@ -862,15 +442,7 @@ async fn update_workspace_notes(
     notes: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let notes_opt = if notes.trim().is_empty() { None } else { Some(notes.as_str()) };
-    {
-        let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.notes = notes_opt.map(String::from);
-    }
-    state.db.update_workspace_notes(&workspace_id, notes_opt)
-        .map_err(|e| format!("Failed to update notes: {}", e))?;
-    Ok(())
+    commands::workspace::update_workspace_notes(&state, workspace_id, notes)
 }
 
 #[tauri::command]
@@ -879,24 +451,7 @@ async fn set_workspace_status(
     status: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Workspace, String> {
-    let new_status = match status.as_str() {
-        "idle" => WorkspaceStatus::Idle,
-        "running" => WorkspaceStatus::Running,
-        "inReview" => WorkspaceStatus::InReview,
-        "merged" => WorkspaceStatus::Merged,
-        _ => return Err(format!("Unknown status: {}", status)),
-    };
-    let updated = {
-        let mut workspaces = state.workspaces.write();
-        let workspace = workspaces.get_mut(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.status = new_status;
-        workspace.last_activity = Some(now_rfc3339());
-        workspace.clone()
-    };
-    let now = now_rfc3339();
-    state.db.update_workspace_status(&workspace_id, &updated.status, Some(&now))
-        .map_err(|e| format!("Failed to update status: {}", e))?;
-    Ok(updated)
+    commands::workspace::set_workspace_status(&state, workspace_id, status)
 }
 
 #[tauri::command]
@@ -906,45 +461,12 @@ async fn run_workspace_terminal_command(
     env_overrides: Option<HashMap<String, String>>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<TerminalCommandResult, String> {
-    let cmd = command.trim();
-    if cmd.is_empty() {
-        return Err("Command cannot be empty".to_string());
-    }
-
-    let workspace = {
-        let workspaces = state.workspaces.read();
-        workspaces
-            .get(&workspace_id)
-            .cloned()
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?
-    };
-
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let started = Instant::now();
-    let mut process = Command::new(shell);
-    process.current_dir(&workspace.worktree_path);
-    process.args(["-lc", cmd]);
-    let overrides = env_overrides.unwrap_or_default();
-    let effective_env = build_effective_cli_env(&overrides);
-    configure_cli_env(&mut process, &effective_env);
-    let output = process
-        .output()
-        .map_err(|e| format!("Failed to execute command: {}", e))?;
-
-    Ok(TerminalCommandResult {
-        command: cmd.to_string(),
-        cwd: workspace.worktree_path,
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: output.status.code(),
-        duration_ms: started.elapsed().as_millis(),
-    })
+    commands::workspace::run_workspace_terminal_command(&state, workspace_id, command, env_overrides)
 }
 
 #[tauri::command]
 async fn list_agents(state: State<'_, Arc<AppState>>) -> Result<Vec<Agent>, String> {
-    let agents = state.agents.read();
-    Ok(agents.values().cloned().collect())
+    commands::agent::list_agents(&state)
 }
 
 #[tauri::command]
@@ -1042,301 +564,6 @@ async fn start_agent(
     Ok(agent)
 }
 
-fn find_claude_cli_in_path(path_value: &str) -> Option<String> {
-    for dir in std::env::split_paths(path_value) {
-        let candidate = dir.join("claude");
-        if candidate.exists() && candidate.is_file() {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-    }
-    None
-}
-
-fn find_claude_cli_with_env(env_map: Option<&HashMap<String, String>>) -> Option<String> {
-    let home = env_map
-        .and_then(|map| map.get("HOME").cloned())
-        .or_else(|| std::env::var("HOME").ok())
-        .unwrap_or_default();
-    let preferred_paths = [
-        format!("{}/.local/bin/claude", home),
-        format!("{}/.claude/local/claude", home),
-    ];
-
-    for path in preferred_paths {
-        if std::path::Path::new(&path).exists() {
-            return Some(path);
-        }
-    }
-
-    if let Some(map) = env_map {
-        if let Some(found) = map
-            .get("PATH")
-            .and_then(|path_value| find_claude_cli_in_path(path_value))
-        {
-            return Some(found);
-        }
-    }
-
-    if let Ok(path_value) = std::env::var("PATH") {
-        if let Some(found) = find_claude_cli_in_path(&path_value) {
-            return Some(found);
-        }
-    }
-
-    let paths = [
-        "/usr/local/bin/claude".to_string(),
-        "/opt/homebrew/bin/claude".to_string(),
-    ];
-    
-    paths.iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .cloned()
-}
-
-fn claude_help_text(claude_path: &str) -> Option<String> {
-    let cache = CLAUDE_HELP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(cached) = guard.get(claude_path) {
-            return Some(cached.clone());
-        }
-    }
-
-    let output = Command::new(claude_path).arg("--help").output().ok()?;
-    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-    if !output.stderr.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-    }
-    if text.trim().is_empty() {
-        tracing::warn!(claude_path = %claude_path, "claude --help returned empty output");
-        return None;
-    }
-    tracing::info!(
-        claude_path = %claude_path,
-        help_len = text.len(),
-        has_model_flag = text.contains("--model"),
-        "claude --help output captured"
-    );
-
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(claude_path.to_string(), text.clone());
-    }
-    Some(text)
-}
-
-fn claude_supports_option(claude_path: &str, option: &str) -> bool {
-    claude_help_text(claude_path)
-        .map(|help| help.contains(option))
-        .unwrap_or(false)
-}
-
-fn claude_supports_stream_json(claude_path: &str) -> bool {
-    claude_supports_option(claude_path, "--output-format")
-}
-
-fn claude_supports_permission_mode(claude_path: &str) -> bool {
-    claude_supports_option(claude_path, "--permission-mode")
-}
-
-fn claude_supports_permission_prompt_tool(claude_path: &str) -> bool {
-    // Fast path: check help text first (in case a future CLI version lists it).
-    if claude_supports_option(claude_path, "--permission-prompt-tool") {
-        return true;
-    }
-    // The flag is hidden from --help in current CLI versions.  Probe it
-    // directly: "argument missing" means the flag exists but needs a value;
-    // "unknown option" (or no output) means it doesn't exist at all.
-    static PROBE_CACHE: std::sync::OnceLock<Mutex<HashMap<String, bool>>> =
-        std::sync::OnceLock::new();
-    let cache = PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(&cached) = guard.get(claude_path) {
-            return cached;
-        }
-    }
-    let result = match Command::new(claude_path)
-        .args(["--print", "--permission-prompt-tool"])
-        .output()
-    {
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let combined = format!("{}{}", stderr, stdout);
-            combined.contains("argument missing")
-        }
-        Err(_) => false,
-    };
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(claude_path.to_string(), result);
-    }
-    tracing::info!(
-        claude_path = %claude_path,
-        supported = result,
-        "probed --permission-prompt-tool support"
-    );
-    result
-}
-
-fn claude_supports_model_option(claude_path: &str) -> bool {
-    claude_supports_option(claude_path, "--model")
-}
-
-fn claude_supports_resume_option(claude_path: &str) -> bool {
-    claude_supports_option(claude_path, "--resume")
-}
-
-/// Permission modes that require interactive stdin for tool-approval control messages.
-/// All modes can produce permission prompts except those that explicitly skip or
-/// auto-approve everything.
-fn needs_interactive_permissions(permission_mode: &str) -> bool {
-    !matches!(permission_mode, "dangerouslySkipPermissions" | "bypassPermissions" | "dontAsk")
-}
-
-/// Build the CLI arguments for a Claude request.  Returns `true` when the
-/// caller must send the prompt via stdin (interactive permission mode) rather
-/// than as a `-p` CLI arg.
-fn append_claude_request_args(
-    cmd: &mut Command,
-    claude_path: &str,
-    permission_mode: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
-    claude_session_id: Option<&str>,
-    prompt: &str,
-    workspace_id: &str,
-    agent_id: &str,
-) -> bool {
-    let supports_stream = claude_supports_stream_json(claude_path);
-    let has_permission_prompt_tool = claude_supports_permission_prompt_tool(claude_path);
-    let wants_interactive = needs_interactive_permissions(permission_mode) && supports_stream;
-
-    // When --permission-prompt-tool is available AND the bridge script exists,
-    // delegate permission handling to the MCP bridge (HTTP-based) instead of
-    // using stdin control_request/control_response.
-    let bridge_path = if wants_interactive && has_permission_prompt_tool {
-        find_permission_bridge_path()
-    } else {
-        None
-    };
-    let _use_mcp_bridge = bridge_path.is_some();
-    // Stdin must be piped whenever the CLI supports stream-json, regardless of
-    // permission mode.  Question answers (AskUserQuestion) and follow-up messages
-    // are always sent via stdin — this is orthogonal to permission handling.
-    let interactive = supports_stream;
-
-    cmd.arg("--print");
-    if supports_stream {
-        cmd.arg("--verbose");
-        cmd.args(["--output-format", "stream-json"]);
-    }
-    if permission_mode == "dangerouslySkipPermissions" {
-        cmd.arg("--dangerously-skip-permissions");
-    } else if claude_supports_permission_mode(claude_path) {
-        cmd.args(["--permission-mode", permission_mode]);
-    }
-    if let Some(bridge_path) = bridge_path {
-        let mcp_config = serde_json::json!({
-            "mcpServers": {
-                "perm_bridge": {
-                    "command": "node",
-                    "args": [bridge_path],
-                    "env": {
-                        "ORCHESTRATOR_HTTP_PORT": HTTP_SERVER_PORT.to_string(),
-                        "ORCHESTRATOR_WORKSPACE_ID": workspace_id,
-                        "ORCHESTRATOR_AGENT_ID": agent_id
-                    }
-                }
-            }
-        });
-        cmd.args(["--mcp-config", &mcp_config.to_string()]);
-        cmd.args(["--permission-prompt-tool", "mcp__perm_bridge__check_permission"]);
-    }
-    if interactive {
-        // Enable bidirectional stream-json for question answers and follow-up messages.
-        cmd.args(["--input-format", "stream-json"]);
-    }
-    if let Some(model) = model {
-        cmd.args(["--model", model]);
-    }
-    if let Some(effort) = effort {
-        cmd.args(["--effort", effort]);
-    }
-    if let Some(claude_sid) = claude_session_id {
-        cmd.args(["--resume", claude_sid]);
-    }
-    if !interactive {
-        cmd.args(["-p", prompt]);
-    }
-    interactive
-}
-
-/// Locate the bundled MCP permission bridge script.
-/// Returns the path to `mcp-permission-bridge/dist/index.js` in dev,
-/// or from the Tauri resource bundle in production.
-fn find_permission_bridge_path() -> Option<String> {
-    // Dev: relative to Cargo manifest dir
-    let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../mcp-permission-bridge/dist/index.js");
-    if dev_path.exists() {
-        return Some(dev_path.to_string_lossy().to_string());
-    }
-    // Prod: resolve from macOS bundle -> Contents/Resources/
-    if let Ok(exe_path) = std::env::current_exe() {
-        let prod_path = exe_path
-            .parent()
-            .unwrap_or(&exe_path)
-            .join("../Resources/mcp-permission-bridge/dist/index.js");
-        if prod_path.exists() {
-            return Some(prod_path.to_string_lossy().to_string());
-        }
-    }
-    tracing::warn!("MCP permission bridge not found — interactive permissions unavailable");
-    None
-}
-
-/// Write a JSON user message to the Claude CLI stdin (for --input-format stream-json).
-fn write_stdin_user_message(stdin: &mut ChildStdin, prompt: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let msg = serde_json::json!({
-        "type": "user",
-        "message": { "role": "user", "content": prompt },
-    });
-    writeln!(stdin, "{}", msg)?;
-    stdin.flush()
-}
-
-/// Write a permission control_response to the Claude CLI stdin.
-fn write_stdin_permission_response(
-    stdin: &mut ChildStdin,
-    request_id: &str,
-    allow: bool,
-    original_input: Option<&Value>,
-) -> std::io::Result<()> {
-    use std::io::Write;
-    let response_body = if allow {
-        let mut r = serde_json::json!({ "behavior": "allow" });
-        if let Some(input) = original_input {
-            r.as_object_mut()
-                .unwrap()
-                .insert("updatedInput".to_string(), input.clone());
-        }
-        r
-    } else {
-        serde_json::json!({ "behavior": "deny", "message": "User denied this action" })
-    };
-    let msg = serde_json::json!({
-        "type": "control_response",
-        "response": {
-            "subtype": "success",
-            "request_id": request_id,
-            "response": response_body,
-        }
-    });
-    writeln!(stdin, "{}", msg)?;
-    stdin.flush()
-}
 
 fn load_cli_shell_env() -> HashMap<String, String> {
     // Source env vars from the user's login shell profile — NOT the Tauri
@@ -1845,21 +1072,6 @@ fn extract_missing_conversation_session_id(text: &str) -> Option<String> {
     } else {
         Some(session_id.to_string())
     }
-}
-
-fn reset_agent_claude_session(
-    app_state: &Arc<AppState>,
-    db: &Database,
-    session_id: &str,
-    agent_id: &str,
-) {
-    {
-        let mut agents = app_state.agents.write();
-        if let Some(agent) = agents.get_mut(agent_id) {
-            agent.claude_session_id = None;
-        }
-    }
-    let _ = db.clear_session_claude_id(session_id);
 }
 
 fn stream_event_payload<'a>(event: &'a Value) -> &'a Value {
@@ -2567,62 +1779,7 @@ async fn stop_agent(
     agent_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let (workspace_id, session_id) = {
-        let mut agents = state.agents.write();
-        if let Some(agent) = agents.remove(&agent_id) {
-            (Some(agent.workspace_id), agent.session_id)
-        } else {
-            (None, None)
-        }
-    };
-    
-    // End session in database
-    if let Some(sid) = session_id {
-        let now = now_rfc3339();
-        let _ = state.db.end_session(&sid, &now);
-    }
-    
-    // Drop any pending permission requests for this agent. Dropping the
-    // oneshot senders causes the HTTP handler to auto-deny (channel recv error).
-    // The map is keyed by request_id, not agent_id, so we drop all entries —
-    // in practice there is at most one pending permission at a time.
-    {
-        let mut pending = state.pending_permission_requests.write();
-        if !pending.is_empty() {
-            pending.clear();
-        }
-    }
-
-    // Update workspace status if no more agents
-    if let Some(ws_id) = workspace_id.clone() {
-        let agents = state.agents.read();
-        let has_running = agents.values().any(|a| a.workspace_id == ws_id);
-        
-        if !has_running {
-            let next_status = {
-                let mut workspaces = state.workspaces.write();
-                if let Some(workspace) = workspaces.get_mut(&ws_id) {
-                    let next = status_for_agent_stop(&workspace.status);
-                    workspace.status = next.clone();
-                    Some(next)
-                } else {
-                    None
-                }
-            };
-            if let Some(status) = next_status {
-                let _ = state.db.update_workspace_status(&ws_id, &status, None);
-            }
-            
-            // Broadcast to WebSocket clients
-            if let Some(ws) = &state.ws_server {
-                ws.broadcast_to_workspace(&ws_id.clone(), &WsResponse::AgentStopped {
-                    workspace_id: ws_id.clone(),
-                });
-            }
-        }
-    }
-    
-    Ok(())
+    commands::agent::stop_agent(&state, agent_id)
 }
 
 /// Interrupt the currently running Claude CLI process for an agent by sending
@@ -2633,60 +1790,7 @@ async fn interrupt_agent(
     agent_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let pid = {
-        let pids = state.child_pids.read();
-        pids.get(&agent_id).copied()
-    };
-    match pid {
-        Some(pid) => {
-            // Send SIGINT (graceful interrupt) to the child process
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGINT);
-            }
-            Ok(())
-        }
-        None => Err("No running process found for this agent".into()),
-    }
-}
-
-/// Shared helper: send a permission control_response to the Claude CLI stdin.
-/// Used by both the Tauri command and the WebSocket handler.
-fn send_permission_response(
-    app_state: &AppState,
-    agent_id: &str,
-    request_id: &str,
-    allow: bool,
-    deny_message: Option<String>,
-) -> Result<(), String> {
-    let handle = {
-        let stdins = app_state.agent_stdin.read();
-        stdins.get(agent_id).cloned()
-    };
-    let handle = handle.ok_or("No active CLI process for this agent")?;
-
-    let response_body = if allow {
-        serde_json::json!({ "behavior": "allow" })
-    } else {
-        serde_json::json!({
-            "behavior": "deny",
-            "message": deny_message.unwrap_or_else(|| "User denied this action".to_string())
-        })
-    };
-    let msg = serde_json::json!({
-        "type": "control_response",
-        "response": {
-            "subtype": "success",
-            "request_id": request_id,
-            "response": response_body,
-        }
-    });
-
-    let mut stdin = handle.lock().map_err(|e| format!("Stdin lock poisoned: {}", e))?;
-    use std::io::Write;
-    writeln!(stdin, "{}", msg).map_err(|e| format!("Failed to write to stdin: {}", e))?;
-    stdin.flush().map_err(|e| format!("Failed to flush stdin: {}", e))?;
-
-    Ok(())
+    commands::agent::interrupt_agent(&state, agent_id)
 }
 
 #[tauri::command]
@@ -2695,24 +1799,10 @@ async fn respond_to_permission(
     request_id: String,
     allow: bool,
     deny_message: Option<String>,
+    updated_input: Option<Value>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    // Try the MCP bridge path first (permission requested via HTTP long-poll).
-    let pending_tx = state.pending_permission_requests.write().remove(&request_id);
-    if let Some(tx) = pending_tx {
-        let response = if allow {
-            serde_json::json!({ "behavior": "allow" })
-        } else {
-            serde_json::json!({
-                "behavior": "deny",
-                "message": deny_message.as_deref().unwrap_or("User denied this action")
-            })
-        };
-        let _ = tx.send(response);
-        return Ok(());
-    }
-    // Fall back to stdin control_response (for legacy/forward-compat control_request support).
-    send_permission_response(&state, &agent_id, &request_id, allow, deny_message)
+    commands::agent::respond_to_permission(&state, agent_id, request_id, allow, deny_message, updated_input)
 }
 
 /// Answer a question asked by the Claude CLI (AskUserQuestion tool).
@@ -2886,6 +1976,7 @@ async fn send_message_to_agent(
             &message_clone,
             &workspace_id,
             &agent_id_clone,
+            HTTP_SERVER_PORT,
         );
         eprintln!(
             "[orchestrator] CLI: path={} model={:?} effort={:?} resume={:?}",
@@ -3669,67 +2760,7 @@ async fn get_agent_messages(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<AgentMessage>, String> {
-    state.db.get_messages_by_workspace(&workspace_id)
-        .map_err(|e| format!("Failed to get messages: {}", e))
-}
-
-fn try_launch_editor(binary: &str, args: &[&str]) -> bool {
-    Command::new(binary)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn open_workspace_in_vscode(path: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        if try_launch_editor("open", &["-b", "com.microsoft.VSCode", path]) {
-            return true;
-        }
-        if try_launch_editor("open", &["-b", "com.microsoft.VSCodeInsiders", path]) {
-            return true;
-        }
-        if try_launch_editor("open", &["-a", "Visual Studio Code", path]) {
-            return true;
-        }
-    }
-
-    try_launch_editor("code", &[path])
-}
-
-fn open_workspace_in_intellij(path: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        if try_launch_editor("open", &["-b", "com.jetbrains.intellij", path]) {
-            return true;
-        }
-        if try_launch_editor("open", &["-b", "com.jetbrains.intellij.ce", path]) {
-            return true;
-        }
-        if try_launch_editor("open", &["-a", "IntelliJ IDEA", path]) {
-            return true;
-        }
-        if try_launch_editor("open", &["-a", "IntelliJ IDEA CE", path]) {
-            return true;
-        }
-    }
-
-    if try_launch_editor("idea", &[path]) {
-        return true;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        if try_launch_editor("idea64.exe", &[path]) {
-            return true;
-        }
-    }
-
-    false
+    commands::agent::get_agent_messages(&state, workspace_id)
 }
 
 #[tauri::command]
@@ -3738,32 +2769,7 @@ async fn open_workspace_in_editor(
     editor: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let worktree_path = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces
-            .get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.worktree_path.clone()
-    };
-
-    let opened = match editor.trim().to_lowercase().as_str() {
-        "vscode" | "vs_code" | "code" => open_workspace_in_vscode(&worktree_path),
-        "intellij" | "idea" => open_workspace_in_intellij(&worktree_path),
-        _ => {
-            return Err(
-                "Unsupported editor. Use 'vscode' or 'intellij'.".to_string(),
-            );
-        }
-    };
-
-    if opened {
-        Ok(())
-    } else {
-        Err(format!(
-            "Could not open '{}' in {}. Ensure the editor is installed and available on this machine.",
-            worktree_path, editor
-        ))
-    }
+    commands::pr::open_workspace_in_editor(&state, workspace_id, editor)
 }
 
 #[tauri::command]
@@ -3773,126 +2779,7 @@ async fn create_pull_request(
     body: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let (repo_path, worktree_path, branch) = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces.get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        
-        let repos = state.repositories.read();
-        let repo = repos.get(&workspace.repo_id)
-            .ok_or("Repository not found")?;
-        
-        (repo.path.clone(), workspace.worktree_path.clone(), workspace.branch.clone())
-    };
-    
-    // First push the branch from the worktree
-    let push_output = Command::new("git")
-        .args(["push", "-u", "origin", &branch])
-        .current_dir(&worktree_path)
-        .output()
-        .map_err(|e| format!("Failed to push: {}", e))?;
-    
-    if !push_output.status.success() {
-        let stderr = String::from_utf8_lossy(&push_output.stderr);
-        return Err(format!("Git push failed: {}", stderr));
-    }
-    
-    // Create PR using gh CLI from repo root
-    let pr_output = Command::new("gh")
-        .args(["pr", "create", "--title", &title, "--body", &body, "--head", &branch])
-        .current_dir(&repo_path)
-        .output()
-        .map_err(|e| format!("Failed to create PR: {}", e))?;
-    
-    if !pr_output.status.success() {
-        let stderr = String::from_utf8_lossy(&pr_output.stderr);
-        return Err(format!("PR creation failed: {}", stderr));
-    }
-    
-    let pr_url = String::from_utf8_lossy(&pr_output.stdout).trim().to_string();
-
-    // Transition workspace to InReview and store PR URL
-    {
-        let mut workspaces = state.workspaces.write();
-        if let Some(workspace) = workspaces.get_mut(&workspace_id) {
-            workspace.status = WorkspaceStatus::InReview;
-            workspace.pr_url = Some(pr_url.clone());
-        }
-    }
-    let _ = state.db.update_workspace_pr_url(&workspace_id, &pr_url, &WorkspaceStatus::InReview);
-
-    Ok(pr_url)
-}
-
-fn lookup_branch_pr_state(repo_path: &str, branch: &str, shell_path: &str) -> Option<(String, String)> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--json",
-            "url,state",
-            "--limit",
-            "1",
-        ])
-        .current_dir(repo_path)
-        .env("PATH", shell_path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let items = serde_json::from_slice::<Vec<Value>>(&output.stdout).ok()?;
-    let first = items.first()?;
-    let url = first
-        .get("url")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-    let state = first
-        .get("state")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("")
-        .to_lowercase();
-    if url.is_empty() || state.is_empty() {
-        return None;
-    }
-    Some((url, state))
-}
-
-fn lookup_pr_state_by_url(repo_path: &str, pr_url: &str, shell_path: &str) -> Option<(String, String)> {
-    let output = Command::new("gh")
-        .args(["pr", "view", pr_url, "--json", "url,state"])
-        .current_dir(repo_path)
-        .env("PATH", shell_path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let parsed = serde_json::from_slice::<Value>(&output.stdout).ok()?;
-    let url = parsed
-        .get("url")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-    let state = parsed
-        .get("state")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("")
-        .to_lowercase();
-    if url.is_empty() || state.is_empty() {
-        return None;
-    }
-    Some((url, state))
+    commands::pr::create_pull_request(&state, workspace_id, title, body)
 }
 
 #[tauri::command]
@@ -3901,28 +2788,7 @@ async fn mark_workspace_in_review(
     pr_url: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let trimmed_pr_url = pr_url.trim();
-    if trimmed_pr_url.is_empty() {
-        return Err("PR URL cannot be empty.".to_string());
-    }
-
-    {
-        let mut workspaces = state.workspaces.write();
-        let workspace = workspaces
-            .get_mut(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        if !matches!(workspace.status, WorkspaceStatus::Merged) {
-            workspace.status = WorkspaceStatus::InReview;
-        }
-        workspace.pr_url = Some(trimmed_pr_url.to_string());
-    }
-
-    state
-        .db
-        .update_workspace_pr_url(&workspace_id, trimmed_pr_url, &WorkspaceStatus::InReview)
-        .map_err(|e| format!("Failed to persist PR URL: {}", e))?;
-
-    Ok(())
+    commands::pr::mark_workspace_in_review(&state, workspace_id, pr_url)
 }
 
 /// Sync workspace review state from GitHub PR state.
@@ -3933,258 +2799,7 @@ async fn mark_workspace_in_review(
 async fn sync_pr_statuses(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<String>, String> {
-    // Collect all non-merged workspaces and discover PRs by branch.
-    let to_check: Vec<(String, String, String, WorkspaceStatus, Option<String>)> = {
-        let workspaces = state.workspaces.read();
-        let repos = state.repositories.read();
-        workspaces.values()
-            .filter(|ws| !matches!(ws.status, WorkspaceStatus::Merged))
-            .filter_map(|ws| {
-                let repo = repos.get(&ws.repo_id)?;
-                Some((
-                    ws.id.clone(),
-                    repo.path.clone(),
-                    ws.branch.clone(),
-                    ws.status.clone(),
-                    ws.pr_url.clone(),
-                ))
-            })
-            .collect()
-    };
-
-    // Resolve the user's shell PATH once so `gh` can be found even when
-    // the app is launched as a GUI (macOS Finder / launchd) where the
-    // default PATH is minimal and won't include Homebrew etc.
-    let shell_env = load_cli_shell_env();
-    let shell_path = shell_env
-        .get("PATH")
-        .cloned()
-        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-
-    let mut merged_ids = Vec::new();
-    for (ws_id, repo_path, branch, current_status, current_pr_url) in to_check {
-        let discovered = lookup_branch_pr_state(&repo_path, &branch, &shell_path).or_else(|| {
-            current_pr_url
-                .as_deref()
-                .and_then(|url| lookup_pr_state_by_url(&repo_path, url, &shell_path))
-        });
-        let Some((pr_url, state_str)) = discovered else {
-            continue;
-        };
-
-        if state_str == "open" {
-            let should_update = !matches!(current_status, WorkspaceStatus::InReview)
-                || current_pr_url.as_deref() != Some(pr_url.as_str());
-            if should_update {
-                {
-                    let mut workspaces = state.workspaces.write();
-                    if let Some(ws) = workspaces.get_mut(&ws_id) {
-                        ws.status = WorkspaceStatus::InReview;
-                        ws.pr_url = Some(pr_url.clone());
-                    }
-                }
-                let _ = state
-                    .db
-                    .update_workspace_pr_url(&ws_id, &pr_url, &WorkspaceStatus::InReview);
-            }
-            continue;
-        }
-
-        if state_str == "merged" {
-            let should_update = !matches!(current_status, WorkspaceStatus::Merged)
-                || current_pr_url.as_deref() != Some(pr_url.as_str());
-            if should_update {
-                {
-                    let mut workspaces = state.workspaces.write();
-                    if let Some(ws) = workspaces.get_mut(&ws_id) {
-                        ws.status = WorkspaceStatus::Merged;
-                        ws.pr_url = Some(pr_url.clone());
-                    }
-                }
-                let _ = state
-                    .db
-                    .update_workspace_pr_url(&ws_id, &pr_url, &WorkspaceStatus::Merged);
-                merged_ids.push(ws_id);
-            }
-        }
-    }
-    Ok(merged_ids)
-}
-
-fn normalize_skill_relative_path(path: &Path) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for component in path.components() {
-        if let Component::Normal(part) = component {
-            parts.push(part.to_string_lossy().to_string());
-        }
-    }
-    parts.join("/")
-}
-
-fn normalize_skill_directory_input(raw: &str) -> Result<PathBuf, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("Skill path cannot be empty.".to_string());
-    }
-    let path = PathBuf::from(trimmed);
-    if path.is_absolute() {
-        return Err("Skill path must be relative.".to_string());
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => normalized.push(part),
-            Component::CurDir => {}
-            _ => return Err("Skill path cannot contain '..' or absolute segments.".to_string()),
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        return Err("Skill path cannot be empty.".to_string());
-    }
-    Ok(normalized)
-}
-
-fn sanitize_skill_dir_name(name: &str) -> String {
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in name.chars() {
-        let next = if ch.is_ascii_alphanumeric() {
-            ch.to_ascii_lowercase()
-        } else if matches!(ch, ' ' | '-' | '_' | '/') {
-            '-'
-        } else {
-            continue;
-        };
-        if next == '-' {
-            if last_dash {
-                continue;
-            }
-            last_dash = true;
-        } else {
-            last_dash = false;
-        }
-        out.push(next);
-    }
-    out.trim_matches('-').to_string()
-}
-
-fn infer_skill_name(content: &str, fallback: &str) -> String {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("# ") {
-            let heading = rest.trim();
-            if !heading.is_empty() {
-                return heading.to_string();
-            }
-        }
-    }
-    fallback.to_string()
-}
-
-fn build_skill_entry(scope: &str, root: &Path, skill_file: &Path) -> Result<SkillEntry, String> {
-    let content = std::fs::read_to_string(skill_file)
-        .map_err(|e| format!("Failed to read skill file '{}': {}", skill_file.display(), e))?;
-
-    let skill_dir = skill_file.parent().unwrap_or(root);
-    let relative_dir = skill_dir
-        .strip_prefix(root)
-        .map(normalize_skill_relative_path)
-        .map_err(|_| "Failed to normalize skill path.".to_string())?;
-
-    let fallback_name = if relative_dir.is_empty() {
-        "Skill".to_string()
-    } else {
-        relative_dir
-            .rsplit('/')
-            .next()
-            .map(|value| value.replace('-', " "))
-            .unwrap_or_else(|| "Skill".to_string())
-    };
-    let name = infer_skill_name(&content, &fallback_name);
-
-    let command_target = if relative_dir.is_empty() {
-        sanitize_skill_dir_name(&name)
-    } else {
-        relative_dir.clone()
-    };
-    let command_name = format!("{}:{}", scope, command_target);
-    let id = format!("{}::{}", scope, command_target);
-
-    Ok(SkillEntry {
-        id,
-        scope: scope.to_string(),
-        name,
-        command_name,
-        relative_path: command_target,
-        file_path: skill_file.to_string_lossy().to_string(),
-        content,
-    })
-}
-
-fn collect_skills_from_root(scope: &str, root: &Path) -> Result<Vec<SkillEntry>, String> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    if !root.is_dir() {
-        return Err(format!(
-            "Skills root is not a directory: {}",
-            root.to_string_lossy()
-        ));
-    }
-
-    let mut stack = vec![root.to_path_buf()];
-    let mut files: Vec<PathBuf> = Vec::new();
-
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("Failed to read '{}': {}", dir.to_string_lossy(), e))?;
-        for item in entries {
-            let entry = item.map_err(|e| format!("Failed to inspect directory entry: {}", e))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|e| format!("Failed to inspect entry type: {}", e))?;
-            let path = entry.path();
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if file_type.is_file()
-                && entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case("SKILL.md")
-            {
-                files.push(path);
-            }
-        }
-    }
-
-    files.sort();
-    let mut skills = Vec::new();
-    for file in files {
-        skills.push(build_skill_entry(scope, root, &file)?);
-    }
-    Ok(skills)
-}
-
-fn resolve_project_skills_root(repo_id: &str, state: &Arc<AppState>) -> Result<PathBuf, String> {
-    let repo_path = {
-        let repos = state.repositories.read();
-        repos.get(repo_id)
-            .ok_or("Repository not found")?
-            .path
-            .clone()
-    };
-    Ok(PathBuf::from(repo_path).join(".claude").join("skills"))
-}
-
-fn resolve_user_skills_root() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not resolve user home directory.")?;
-    Ok(home.join(".claude").join("skills"))
+    commands::pr::sync_pr_statuses(&state)
 }
 
 #[tauri::command]
@@ -4192,23 +2807,7 @@ async fn list_skills(
     repo_id: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<SkillListResponse, String> {
-    let user_root = resolve_user_skills_root()?;
-    let user_skills = collect_skills_from_root("user", &user_root)?;
-
-    let (project_root, project_skills) = if let Some(repo_id) = repo_id {
-        let root = resolve_project_skills_root(&repo_id, &state)?;
-        let skills = collect_skills_from_root("project", &root)?;
-        (Some(root), skills)
-    } else {
-        (None, Vec::new())
-    };
-
-    Ok(SkillListResponse {
-        project_root: project_root.map(|path| path.to_string_lossy().to_string()),
-        user_root: Some(user_root.to_string_lossy().to_string()),
-        project_skills,
-        user_skills,
-    })
+    commands::skills::list_skills(&state, repo_id)
 }
 
 #[tauri::command]
@@ -4220,77 +2819,7 @@ async fn save_skill(
     content: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<SkillEntry, String> {
-    let scope = scope.trim().to_lowercase();
-    if scope != "project" && scope != "user" {
-        return Err("Unsupported skill scope. Use 'project' or 'user'.".to_string());
-    }
-
-    let trimmed_content = content.trim();
-    if trimmed_content.is_empty() {
-        return Err("Skill content cannot be empty.".to_string());
-    }
-
-    let root = if scope == "project" {
-        let repo_id = repo_id.ok_or("Repository is required for project skills.")?;
-        resolve_project_skills_root(&repo_id, &state)?
-    } else {
-        resolve_user_skills_root()?
-    };
-
-    std::fs::create_dir_all(&root).map_err(|e| {
-        format!(
-            "Failed to create skills directory '{}': {}",
-            root.to_string_lossy(),
-            e
-        )
-    })?;
-
-    let relative_dir = if let Some(existing_relative) = relative_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        normalize_skill_directory_input(existing_relative)?
-    } else {
-        let source = if name.trim().is_empty() {
-            infer_skill_name(trimmed_content, "skill")
-        } else {
-            name.trim().to_string()
-        };
-        let dir_name = sanitize_skill_dir_name(&source);
-        if dir_name.is_empty() {
-            return Err("Skill name must contain letters or numbers.".to_string());
-        }
-        let next = PathBuf::from(dir_name);
-        if root.join(&next).exists() {
-            return Err("A skill with this name already exists.".to_string());
-        }
-        next
-    };
-
-    let skill_dir = root.join(&relative_dir);
-    let skill_file = skill_dir.join("SKILL.md");
-
-    std::fs::create_dir_all(&skill_dir).map_err(|e| {
-        format!(
-            "Failed to create skill directory '{}': {}",
-            skill_dir.to_string_lossy(),
-            e
-        )
-    })?;
-    let mut persisted = trimmed_content.to_string();
-    if !persisted.ends_with('\n') {
-        persisted.push('\n');
-    }
-    std::fs::write(&skill_file, persisted).map_err(|e| {
-        format!(
-            "Failed to write skill file '{}': {}",
-            skill_file.to_string_lossy(),
-            e
-        )
-    })?;
-
-    build_skill_entry(&scope, &root, &skill_file)
+    commands::skills::save_skill(&state, scope, repo_id, relative_path, name, content)
 }
 
 #[tauri::command]
@@ -4300,42 +2829,7 @@ async fn delete_skill(
     relative_path: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let scope = scope.trim().to_lowercase();
-    if scope != "project" && scope != "user" {
-        return Err("Unsupported skill scope. Use 'project' or 'user'.".to_string());
-    }
-
-    let root = if scope == "project" {
-        let repo_id = repo_id.ok_or("Repository is required for project skills.")?;
-        resolve_project_skills_root(&repo_id, &state)?
-    } else {
-        resolve_user_skills_root()?
-    };
-
-    let skill_dir = root.join(&relative_path);
-    if !skill_dir.exists() {
-        return Err("Skill not found.".to_string());
-    }
-
-    // Canonicalize both paths to prevent directory traversal
-    let canonical_root = root.canonicalize().map_err(|e| {
-        format!("Failed to resolve skills root: {}", e)
-    })?;
-    let canonical_dir = skill_dir.canonicalize().map_err(|e| {
-        format!("Failed to resolve skill path: {}", e)
-    })?;
-    if !canonical_dir.starts_with(&canonical_root) {
-        return Err("Invalid skill path.".to_string());
-    }
-
-    std::fs::remove_dir_all(&canonical_dir).map_err(|e| {
-        format!(
-            "Failed to delete skill directory '{}': {}",
-            skill_dir.to_string_lossy(),
-            e
-        )
-    })?;
-    Ok(())
+    commands::skills::delete_skill(&state, scope, repo_id, relative_path)
 }
 
 #[tauri::command]
@@ -4344,103 +2838,7 @@ async fn list_workspace_files(
     relative_path: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<WorkspaceFileEntry>, String> {
-    let workspace_root = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces
-            .get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.worktree_path.clone()
-    };
-
-    let root = std::fs::canonicalize(&workspace_root)
-        .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
-
-    let requested_rel = relative_path.unwrap_or_default();
-    let target = if requested_rel.is_empty() {
-        root.clone()
-    } else {
-        root.join(&requested_rel)
-    };
-
-    let canonical_target = std::fs::canonicalize(&target)
-        .map_err(|e| format!("Failed to resolve target path: {}", e))?;
-
-    if !canonical_target.starts_with(&root) {
-        return Err("Path is outside workspace root".to_string());
-    }
-
-    let read_dir = std::fs::read_dir(&canonical_target)
-        .map_err(|e| format!("Failed to read directory: {}", e))?;
-
-    let mut entries: Vec<WorkspaceFileEntry> = Vec::new();
-
-    for item in read_dir {
-        let entry = item.map_err(|e| format!("Failed to read directory entry: {}", e))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("Failed to inspect directory entry: {}", e))?;
-        let entry_path = entry.path();
-        let relative = entry_path
-            .strip_prefix(&root)
-            .map_err(|e| format!("Failed to normalize file path: {}", e))?;
-        let relative_str = relative.to_string_lossy().replace('\\', "/");
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        entries.push(WorkspaceFileEntry {
-            name,
-            path: relative_str,
-            is_dir: file_type.is_dir(),
-        });
-    }
-
-    entries.sort_by(|a, b| {
-        use std::cmp::Ordering;
-        match (a.is_dir, b.is_dir) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
-    });
-
-    Ok(entries)
-}
-
-/// Read a file's contents up to `max_bytes`, returning the content as a UTF-8 string.
-/// Appends `[truncated]` if the file exceeds the limit.
-fn read_file_contents(path: &std::path::Path, max_bytes: usize) -> Result<String, String> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
-    if !metadata.is_file() {
-        return Err("Path is not a file".to_string());
-    }
-
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
-
-    let (slice, truncated) = if bytes.len() > max_bytes {
-        (&bytes[..max_bytes], true)
-    } else {
-        (&bytes[..], false)
-    };
-
-    // Reject binary files: check for nul bytes in the first 8KB (or full slice if smaller).
-    // Nul bytes are valid UTF-8 but cannot appear in CLI arguments (C strings),
-    // and indicate binary content (images, compiled files, etc.) that isn't useful as text.
-    let check_len = slice.len().min(8192);
-    if slice[..check_len].contains(&0u8) {
-        return Err(format!(
-            "Binary file cannot be attached: {}",
-            path.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string())
-        ));
-    }
-
-    let mut content = String::from_utf8_lossy(slice).to_string();
-    if truncated {
-        content.push_str("\n\n[truncated]");
-    }
-    Ok(content)
+    commands::files::list_workspace_files(&state, workspace_id, relative_path)
 }
 
 #[tauri::command]
@@ -4450,25 +2848,7 @@ async fn read_workspace_file(
     max_bytes: Option<usize>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let workspace_root = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces
-            .get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.worktree_path.clone()
-    };
-
-    let root = std::fs::canonicalize(&workspace_root)
-        .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
-    let target = root.join(&relative_path);
-    let canonical_target = std::fs::canonicalize(&target)
-        .map_err(|e| format!("Failed to resolve file path: {}", e))?;
-
-    if !canonical_target.starts_with(&root) {
-        return Err("Path is outside workspace root".to_string());
-    }
-
-    read_file_contents(&canonical_target, max_bytes.unwrap_or(MAX_FILE_READ_BYTES))
+    commands::files::read_workspace_file(&state, workspace_id, relative_path, max_bytes)
 }
 
 /// Write content to a file inside a workspace. Path-traversal guarded.
@@ -4479,32 +2859,7 @@ async fn write_workspace_file(
     content: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let workspace_root = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces
-            .get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.worktree_path.clone()
-    };
-
-    let root = std::fs::canonicalize(&workspace_root)
-        .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
-    let target = root.join(&relative_path);
-
-    // For new files the target may not exist yet, so canonicalize the parent instead.
-    let parent = target
-        .parent()
-        .ok_or_else(|| "Invalid file path".to_string())?;
-    let canonical_parent = std::fs::canonicalize(parent)
-        .map_err(|e| format!("Failed to resolve parent directory: {}", e))?;
-    if !canonical_parent.starts_with(&root) {
-        return Err("Path is outside workspace root".to_string());
-    }
-
-    std::fs::write(&target, content.as_bytes())
-        .map_err(|e| format!("Failed to write file: {}", e))?;
-
-    Ok(())
+    commands::files::write_workspace_file(&state, workspace_id, relative_path, content)
 }
 
 /// Read any file by absolute path. No workspace restriction.
@@ -4513,10 +2868,7 @@ async fn read_file_by_path(
     file_path: String,
     max_bytes: Option<usize>,
 ) -> Result<String, String> {
-    let canonical = std::fs::canonicalize(&file_path)
-        .map_err(|e| format!("Failed to resolve file path: {}", e))?;
-
-    read_file_contents(&canonical, max_bytes.unwrap_or(MAX_FILE_READ_BYTES))
+    commands::files::read_file_by_path(file_path, max_bytes)
 }
 
 #[tauri::command]
@@ -4524,85 +2876,7 @@ async fn list_workspace_changes(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<WorkspaceChangeEntry>, String> {
-    let (workspace_root, default_branch) = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces
-            .get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        let repos = state.repositories.read();
-        let repo = repos
-            .get(&workspace.repo_id)
-            .ok_or("Repository not found")?;
-        (workspace.worktree_path.clone(), repo.default_branch.clone())
-    };
-
-    let compare_ref = format!("origin/{}", default_branch);
-    let mut changes = Vec::new();
-
-    // Get all changes (committed + staged + unstaged) relative to origin/<default_branch>
-    let diff_output = Command::new("git")
-        .args(["diff", "--name-status", &compare_ref])
-        .current_dir(&workspace_root)
-        .output()
-        .map_err(|e| format!("Failed to run git diff: {}", e))?;
-
-    if diff_output.status.success() {
-        let stdout = String::from_utf8_lossy(&diff_output.stdout);
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            // Format: "M\tpath" or "R100\told_path\tnew_path"
-            let parts: Vec<&str> = line.splitn(3, '\t').collect();
-            if parts.len() >= 2 {
-                let status_code = parts[0].to_string();
-                if status_code.starts_with('R') && parts.len() == 3 {
-                    changes.push(WorkspaceChangeEntry {
-                        status: format!("R "),
-                        path: parts[2].to_string(),
-                        old_path: Some(parts[1].to_string()),
-                    });
-                } else {
-                    // Map git diff status codes to two-char codes matching git status format
-                    let status = match status_code.as_str() {
-                        "M" => " M".to_string(),
-                        "A" => "A ".to_string(),
-                        "D" => " D".to_string(),
-                        other => format!("{: <2}", other),
-                    };
-                    changes.push(WorkspaceChangeEntry {
-                        status,
-                        path: parts[1].to_string(),
-                        old_path: None,
-                    });
-                }
-            }
-        }
-    }
-
-    // Also pick up untracked files (not yet committed)
-    let untracked_output = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .current_dir(&workspace_root)
-        .output()
-        .map_err(|e| format!("Failed to list untracked files: {}", e))?;
-
-    if untracked_output.status.success() {
-        let stdout = String::from_utf8_lossy(&untracked_output.stdout);
-        for line in stdout.lines() {
-            let path = line.trim().to_string();
-            if !path.is_empty() && !changes.iter().any(|c| c.path == path) {
-                changes.push(WorkspaceChangeEntry {
-                    status: "??".to_string(),
-                    path,
-                    old_path: None,
-                });
-            }
-        }
-    }
-
-    Ok(changes)
+    commands::files::list_workspace_changes(&state, workspace_id)
 }
 
 #[tauri::command]
@@ -4613,132 +2887,7 @@ async fn read_workspace_change_diff(
     status: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<String, String> {
-    let (workspace_root, default_branch) = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces
-            .get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        let repos = state.repositories.read();
-        let repo = repos
-            .get(&workspace.repo_id)
-            .ok_or("Repository not found")?;
-        (workspace.worktree_path.clone(), repo.default_branch.clone())
-    };
-
-    let compare_ref = format!("origin/{}", default_branch);
-
-    let status_trimmed = status.unwrap_or_default().trim().to_string();
-    if status_trimmed == "??" {
-        let full_path = PathBuf::from(&workspace_root).join(&path);
-        let bytes = std::fs::read(&full_path)
-            .map_err(|e| format!("Failed to read untracked file for diff: {}", e))?;
-        let limit = MAX_FILE_READ_BYTES;
-        let (slice, truncated) = if bytes.len() > limit {
-            (&bytes[..limit], true)
-        } else {
-            (&bytes[..], false)
-        };
-        let content = String::from_utf8_lossy(slice).to_string();
-
-        let mut output = String::new();
-        output.push_str(&format!("diff --git a/{0} b/{0}\n", path));
-        output.push_str("new file mode 100644\n");
-        output.push_str("--- /dev/null\n");
-        output.push_str(&format!("+++ b/{}\n", path));
-        output.push_str("@@ -0,0 +1 @@\n");
-
-        if content.is_empty() {
-            output.push_str("+\n");
-        } else {
-            for line in content.lines() {
-                output.push('+');
-                output.push_str(line);
-                output.push('\n');
-            }
-            if truncated {
-                output.push_str("+\n+[truncated]\n");
-            }
-        }
-        return Ok(output);
-    }
-
-    let mut cmd = Command::new("git");
-    cmd.current_dir(&workspace_root);
-    cmd.args(["diff", "--no-color", &compare_ref, "--"]);
-    if let Some(old) = old_path.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        cmd.arg(old);
-    }
-    cmd.arg(&path);
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to run git diff: {}", e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Git diff failed: {}", stderr));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if stdout.trim().is_empty() {
-        return Ok("No textual diff output for this change.".to_string());
-    }
-
-    Ok(stdout)
-}
-
-fn detect_workspace_checks(workspace_root: &str) -> Vec<WorkspaceCheckDefinition> {
-    let root_path = PathBuf::from(workspace_root);
-    let mut checks: Vec<WorkspaceCheckDefinition> = Vec::new();
-
-    if root_path.join("Cargo.toml").exists() {
-        checks.push(WorkspaceCheckDefinition {
-            name: "Cargo Check".to_string(),
-            command: "cargo check".to_string(),
-            description: "Rust compile and type checks without producing binaries.".to_string(),
-        });
-    }
-    if root_path.join("package.json").exists() {
-        checks.push(WorkspaceCheckDefinition {
-            name: "NPM Lint".to_string(),
-            command: "npm run lint --if-present".to_string(),
-            description: "Runs JavaScript/TypeScript linting when configured.".to_string(),
-        });
-        checks.push(WorkspaceCheckDefinition {
-            name: "NPM Build".to_string(),
-            command: "npm run build --if-present".to_string(),
-            description: "Build verification for frontend or Node projects.".to_string(),
-        });
-    }
-
-    let has_gradle_project = root_path.join("build.gradle").exists()
-        || root_path.join("build.gradle.kts").exists()
-        || root_path.join("settings.gradle").exists()
-        || root_path.join("settings.gradle.kts").exists();
-    if root_path.join("gradlew").exists() {
-        checks.push(WorkspaceCheckDefinition {
-            name: "Gradle Check".to_string(),
-            command: "./gradlew check --console=plain".to_string(),
-            description: "Runs Gradle's standard verification lifecycle.".to_string(),
-        });
-        checks.push(WorkspaceCheckDefinition {
-            name: "Gradle Build".to_string(),
-            command: "./gradlew build --console=plain".to_string(),
-            description: "Runs full Gradle build including tests and packaging tasks.".to_string(),
-        });
-    } else if has_gradle_project {
-        checks.push(WorkspaceCheckDefinition {
-            name: "Gradle Check".to_string(),
-            command: "gradle check --console=plain".to_string(),
-            description: "Runs Gradle verification using a system Gradle install.".to_string(),
-        });
-        checks.push(WorkspaceCheckDefinition {
-            name: "Gradle Build".to_string(),
-            command: "gradle build --console=plain".to_string(),
-            description: "Runs full Gradle build using a system Gradle install.".to_string(),
-        });
-    }
-
-    checks
+    commands::files::read_workspace_change_diff(&state, workspace_id, path, old_path, status)
 }
 
 #[tauri::command]
@@ -4746,15 +2895,7 @@ async fn list_workspace_checks(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<WorkspaceCheckDefinition>, String> {
-    let workspace_root = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces
-            .get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.worktree_path.clone()
-    };
-
-    Ok(detect_workspace_checks(&workspace_root))
+    commands::checks::list_workspace_checks(&state, workspace_id)
 }
 
 #[tauri::command]
@@ -4762,81 +2903,7 @@ async fn run_workspace_checks(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<WorkspaceCheckResult>, String> {
-    let workspace_root = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces
-            .get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.worktree_path.clone()
-    };
-
-    let checks = detect_workspace_checks(&workspace_root);
-
-    if checks.is_empty() {
-        return Ok(vec![WorkspaceCheckResult {
-            name: "No configured checks".to_string(),
-            command: "-".to_string(),
-            success: true,
-            exit_code: Some(0),
-            stdout: "No known check commands were detected for this workspace.".to_string(),
-            stderr: String::new(),
-            duration_ms: 0,
-            skipped: true,
-        }]);
-    }
-
-    let mut results = Vec::new();
-    for check in checks {
-        let mut parts = check.command.split_whitespace();
-        let Some(bin) = parts.next() else {
-            results.push(WorkspaceCheckResult {
-                name: check.name.clone(),
-                command: check.command.clone(),
-                success: false,
-                exit_code: None,
-                stdout: String::new(),
-                stderr: "Invalid check command configuration.".to_string(),
-                duration_ms: 0,
-                skipped: false,
-            });
-            continue;
-        };
-        let args: Vec<String> = parts.map(|arg| arg.to_string()).collect();
-        let cmd_str = check.command.clone();
-        let started = Instant::now();
-
-        let result = match Command::new(bin).args(&args).current_dir(&workspace_root).output() {
-            Ok(output) => {
-                let elapsed = started.elapsed().as_millis();
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                WorkspaceCheckResult {
-                    name: check.name.clone(),
-                    command: cmd_str,
-                    success: output.status.success(),
-                    exit_code: output.status.code(),
-                    stdout,
-                    stderr,
-                    duration_ms: elapsed,
-                    skipped: false,
-                }
-            }
-            Err(e) => WorkspaceCheckResult {
-                name: check.name.clone(),
-                command: cmd_str,
-                success: false,
-                exit_code: None,
-                stdout: String::new(),
-                stderr: format!("Failed to execute check: {}", e),
-                duration_ms: started.elapsed().as_millis(),
-                skipped: false,
-            },
-        };
-
-        results.push(result);
-    }
-
-    Ok(results)
+    commands::checks::run_workspace_checks(&state, workspace_id)
 }
 
 #[tauri::command]
@@ -4846,41 +2913,7 @@ async fn run_single_workspace_check(
     check_command: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<WorkspaceCheckResult, String> {
-    let workspace_root = {
-        let workspaces = state.workspaces.read();
-        let workspace = workspaces
-            .get(&workspace_id)
-            .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        workspace.worktree_path.clone()
-    };
-
-    let mut parts = check_command.split_whitespace();
-    let bin = parts.next().ok_or("Invalid check command")?;
-    let args: Vec<String> = parts.map(|arg| arg.to_string()).collect();
-    let started = Instant::now();
-
-    match Command::new(bin).args(&args).current_dir(&workspace_root).output() {
-        Ok(output) => Ok(WorkspaceCheckResult {
-            name: check_name,
-            command: check_command,
-            success: output.status.success(),
-            exit_code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            duration_ms: started.elapsed().as_millis(),
-            skipped: false,
-        }),
-        Err(e) => Ok(WorkspaceCheckResult {
-            name: check_name,
-            command: check_command,
-            success: false,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: format!("Failed to execute check: {}", e),
-            duration_ms: started.elapsed().as_millis(),
-            skipped: false,
-        }),
-    }
+    commands::checks::run_single_workspace_check(&state, workspace_id, check_name, check_command)
 }
 
 // WebSocket command handler
@@ -4906,122 +2939,19 @@ async fn handle_ws_commands(
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
             ServerCommand::AddRepository { path, response_tx } => {
-                let path_buf = PathBuf::from(&path);
-                if !path_buf.exists() {
-                    let response = WsResponse::Error {
-                        message: format!("Path does not exist: {}", path),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                if !path_buf.is_dir() {
-                    let response = WsResponse::Error {
-                        message: format!("Path is not a directory: {}", path),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                if !is_git_repo(&path) {
-                    let response = WsResponse::Error {
-                        message:
-                            "Not a git repository. Please select a folder containing a .git directory."
-                                .to_string(),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-
-                let name = path_buf
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Repository")
-                    .to_string();
-                let default_branch = match get_default_branch(&path) {
-                    Ok(branch) => branch,
-                    Err(err) => {
-                        let response = WsResponse::Error {
-                            message: format!("Failed to detect default branch: {}", err),
-                        };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        continue;
-                    }
-                };
-
-                let repository = Repository {
-                    id: new_id(),
-                    path,
-                    name,
-                    default_branch,
-                    added_at: now_rfc3339(),
-                };
-
-                if let Err(err) = state.db.insert_repository(&repository) {
-                    let response = WsResponse::Error {
-                        message: format!("Failed to save repository: {}", err),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                {
-                    let mut repos = state.repositories.write();
-                    repos.insert(repository.id.clone(), repository.clone());
-                }
-
-                let response = WsResponse::RepositoryAdded {
-                    repository: to_repository_info(&repository),
+                let response = match commands::repository::add_repository(&state, path) {
+                    Ok(repo) => WsResponse::RepositoryAdded {
+                        repository: to_repository_info(&repo),
+                    },
+                    Err(e) => WsResponse::Error { message: e },
                 };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
             ServerCommand::RemoveRepository { repo_id, response_tx } => {
-                let repo_path = {
-                    let repos = state.repositories.read();
-                    repos.get(&repo_id).map(|r| r.path.clone())
+                let response = match commands::repository::remove_repository(&state, repo_id.clone()) {
+                    Ok(()) => WsResponse::RepositoryRemoved { repo_id },
+                    Err(e) => WsResponse::Error { message: e },
                 };
-
-                if let Some(repo_path) = repo_path {
-                    let workspaces_to_remove: Vec<Workspace> = {
-                        let workspaces = state.workspaces.read();
-                        workspaces
-                            .values()
-                            .filter(|w| w.repo_id == repo_id)
-                            .cloned()
-                            .collect()
-                    };
-
-                    for workspace in workspaces_to_remove {
-                        if let Err(e) = remove_worktree(&repo_path, &workspace.worktree_path) {
-                            tracing::warn!(
-                                "git worktree remove failed for {}: {}",
-                                workspace.worktree_path,
-                                e
-                            );
-                        }
-                        if let Err(e) = remove_workspace_directory(&repo_path, &workspace.worktree_path)
-                        {
-                            tracing::warn!(
-                                "workspace directory cleanup failed for {}: {}",
-                                workspace.worktree_path,
-                                e
-                            );
-                        }
-                        let mut workspaces = state.workspaces.write();
-                        workspaces.remove(&workspace.id);
-                    }
-                }
-
-                if let Err(err) = state.db.delete_repository(&repo_id) {
-                    let response = WsResponse::Error {
-                        message: format!("Failed to delete repository: {}", err),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                {
-                    let mut repos = state.repositories.write();
-                    repos.remove(&repo_id);
-                }
-
-                let response = WsResponse::RepositoryRemoved { repo_id };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
             ServerCommand::ListWorkspaces { repo_id, response_tx } => {
@@ -5041,523 +2971,95 @@ async fn handle_ws_commands(
                 let response = WsResponse::WorkspaceList { workspaces: workspace_list };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-            ServerCommand::CreateWorkspace {
-                repo_id,
-                name,
-                response_tx,
-            } => {
+            ServerCommand::CreateWorkspace { repo_id, name, response_tx } => {
                 let trimmed = name.trim();
                 if trimmed.is_empty() {
-                    let response = WsResponse::Error {
-                        message: "Workspace name cannot be empty".to_string(),
-                    };
+                    let response = WsResponse::Error { message: "Workspace name cannot be empty".to_string() };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                     continue;
                 }
-
-                let repo = {
-                    let repos = state.repositories.read();
-                    match repos.get(&repo_id).cloned() {
-                        Some(repo) => repo,
-                        None => {
-                            let response = WsResponse::Error {
-                                message: "Repository not found".to_string(),
-                            };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                            continue;
-                        }
-                    }
-                };
-
-                let branch = format!("workspace/{}", trimmed.to_lowercase().replace(' ', "-"));
-                let worktrees_dir = PathBuf::from(&repo.path).join(".worktrees");
-                if let Err(err) = std::fs::create_dir_all(&worktrees_dir) {
-                    let response = WsResponse::Error {
-                        message: format!("Failed to create worktrees directory: {}", err),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                let worktree_path = worktrees_dir.join(trimmed);
-                let worktree_path_str = worktree_path.to_string_lossy().to_string();
-                if let Err(err) = create_worktree(&repo.path, &worktree_path_str, &branch, &repo.default_branch) {
-                    let response = WsResponse::Error {
-                        message: format!("Failed to create workspace: {}", err),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-
-                let workspace = Workspace {
-                    id: new_id(),
-                    repo_id: repo_id.clone(),
-                    name: trimmed.to_string(),
-                    branch,
-                    worktree_path: worktree_path_str,
-                    status: WorkspaceStatus::Idle,
-                    last_activity: None,
-                    pr_url: None,
-                    unread: 0,
-                    display_order: 0,
-                    pinned_at: None,
-                    notes: None,
-                };
-                if let Err(err) = state.db.insert_workspace(&workspace) {
-                    let response = WsResponse::Error {
-                        message: format!("Failed to save workspace: {}", err),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                {
-                    let mut workspaces = state.workspaces.write();
-                    workspaces.insert(workspace.id.clone(), workspace.clone());
-                }
-
-                let response = WsResponse::WorkspaceCreated {
-                    workspace: to_workspace_info(&workspace, false),
+                let response = match commands::workspace::create_workspace(&state, repo_id, trimmed.to_string()) {
+                    Ok(ws) => WsResponse::WorkspaceCreated { workspace: to_workspace_info(&ws, false) },
+                    Err(e) => WsResponse::Error { message: e },
                 };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-            ServerCommand::RenameWorkspace {
-                workspace_id,
-                name,
-                response_tx,
-            } => {
-                let trimmed = name.trim();
-                if trimmed.is_empty() {
-                    let response = WsResponse::Error {
-                        message: "Workspace name cannot be empty".to_string(),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-
-                let updated = {
-                    let mut workspaces = state.workspaces.write();
-                    match workspaces.get_mut(&workspace_id) {
-                        Some(workspace) => {
-                            workspace.name = trimmed.to_string();
-                            workspace.clone()
-                        }
-                        None => {
-                            let response = WsResponse::Error {
-                                message: ERR_WORKSPACE_NOT_FOUND.to_string(),
-                            };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                            continue;
-                        }
+            ServerCommand::RenameWorkspace { workspace_id, name, response_tx } => {
+                let response = match commands::workspace::rename_workspace(&state, workspace_id.clone(), name) {
+                    Ok(ws) => {
+                        let has_agent = state.agents.read().values().any(|a| a.workspace_id == workspace_id);
+                        WsResponse::WorkspaceRenamed { workspace: to_workspace_info(&ws, has_agent) }
                     }
-                };
-
-                if let Err(err) = state.db.update_workspace_name(&workspace_id, trimmed) {
-                    let response = WsResponse::Error {
-                        message: format!("Failed to rename workspace: {}", err),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-
-                let has_agent = {
-                    let agents = state.agents.read();
-                    agents.values().any(|a| a.workspace_id == workspace_id)
-                };
-                let response = WsResponse::WorkspaceRenamed {
-                    workspace: to_workspace_info(&updated, has_agent),
+                    Err(e) => WsResponse::Error { message: e },
                 };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-            ServerCommand::RemoveWorkspace {
-                workspace_id,
-                response_tx,
-            } => {
-                let (repo_path, worktree_path) = {
-                    let workspaces = state.workspaces.read();
-                    let workspace = match workspaces.get(&workspace_id) {
-                        Some(workspace) => workspace,
-                        None => {
-                            let response = WsResponse::Error {
-                                message: ERR_WORKSPACE_NOT_FOUND.to_string(),
-                            };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                            continue;
-                        }
-                    };
-
-                    let repos = state.repositories.read();
-                    let repo = match repos.get(&workspace.repo_id) {
-                        Some(repo) => repo,
-                        None => {
-                            let response = WsResponse::Error {
-                                message: "Repository not found".to_string(),
-                            };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                            continue;
-                        }
-                    };
-
-                    (repo.path.clone(), workspace.worktree_path.clone())
+            ServerCommand::RemoveWorkspace { workspace_id, response_tx } => {
+                let response = match commands::workspace::remove_workspace(&state, workspace_id.clone()) {
+                    Ok(()) => WsResponse::WorkspaceRemoved { workspace_id },
+                    Err(e) => WsResponse::Error { message: e },
                 };
-
-                if let Err(e) = remove_worktree(&repo_path, &worktree_path) {
-                    tracing::warn!("git worktree remove failed for {}: {}", worktree_path, e);
-                }
-                if let Err(err) = remove_workspace_directory(&repo_path, &worktree_path) {
-                    let response = WsResponse::Error {
-                        message: format!("Failed to remove workspace directory: {}", err),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                if let Err(err) = state.db.delete_workspace(&workspace_id) {
-                    let response = WsResponse::Error {
-                        message: format!("Failed to delete workspace: {}", err),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                {
-                    let mut workspaces = state.workspaces.write();
-                    workspaces.remove(&workspace_id);
-                }
-                {
-                    let mut agents = state.agents.write();
-                    let dead: Vec<String> = agents
-                        .iter()
-                        .filter_map(|(id, agent)| {
-                            if agent.workspace_id == workspace_id {
-                                Some(id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    for agent_id in dead {
-                        agents.remove(&agent_id);
-                    }
-                }
-
-                let response = WsResponse::WorkspaceRemoved { workspace_id };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-
             ServerCommand::GetMessages { workspace_id, response_tx } => {
-                match state.db.get_messages_by_workspace(&workspace_id) {
+                let response = match commands::agent::get_agent_messages(&state, workspace_id.clone()) {
                     Ok(messages) => {
-                        let mapped: Vec<MessageInfo> = messages
-                            .into_iter()
-                            .map(|m| MessageInfo {
-                                agent_id: m.agent_id,
-                                role: m.role,
-                                content: m.content,
-                                is_error: m.is_error,
-                                timestamp: m.timestamp,
-                            })
-                            .collect();
-                        let response = WsResponse::MessageHistory {
-                            workspace_id,
-                            messages: mapped,
-                        };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
+                        let mapped: Vec<MessageInfo> = messages.into_iter().map(|m| MessageInfo {
+                            agent_id: m.agent_id, role: m.role, content: m.content,
+                            is_error: m.is_error, timestamp: m.timestamp,
+                        }).collect();
+                        WsResponse::MessageHistory { workspace_id, messages: mapped }
                     }
-                    Err(e) => {
-                        let response = WsResponse::Error {
-                            message: format!("Failed to load messages: {}", e),
-                        };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    }
-                }
+                    Err(e) => WsResponse::Error { message: e },
+                };
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-
             ServerCommand::ListFiles { workspace_id, relative_path, response_tx } => {
-                let root_path = {
-                    let workspaces = state.workspaces.read();
-                    match workspaces.get(&workspace_id) {
-                        Some(ws) => ws.worktree_path.clone(),
-                        None => {
-                            let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                            continue;
-                        }
-                    }
-                };
-                let root = match std::fs::canonicalize(&root_path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let response = WsResponse::Error { message: format!("Failed to resolve workspace path: {}", e) };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        continue;
-                    }
-                };
                 let rel = relative_path.unwrap_or_default();
-                let target = if rel.is_empty() { root.clone() } else { root.join(&rel) };
-                let canonical_target = match std::fs::canonicalize(&target) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let response = WsResponse::Error { message: format!("Failed to resolve target path: {}", e) };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        continue;
+                let response = match commands::files::list_workspace_files(&state, workspace_id.clone(), Some(rel.clone())) {
+                    Ok(file_entries) => {
+                        let entries: Vec<FileEntryInfo> = file_entries.into_iter().map(|e| FileEntryInfo {
+                            name: e.name, path: e.path, is_dir: e.is_dir,
+                        }).collect();
+                        WsResponse::FilesList { workspace_id, relative_path: rel, entries }
                     }
-                };
-                if !canonical_target.starts_with(&root) {
-                    let response = WsResponse::Error { message: "Path is outside workspace root".to_string() };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                let read_dir = match std::fs::read_dir(&canonical_target) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let response = WsResponse::Error { message: format!("Failed to read directory: {}", e) };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        continue;
-                    }
-                };
-                let mut entries: Vec<FileEntryInfo> = Vec::new();
-                for item in read_dir {
-                    if let Ok(entry) = item {
-                        if let Ok(file_type) = entry.file_type() {
-                            let entry_path = entry.path();
-                            if let Ok(relative) = entry_path.strip_prefix(&root) {
-                                entries.push(FileEntryInfo {
-                                    name: entry.file_name().to_string_lossy().to_string(),
-                                    path: relative.to_string_lossy().replace('\\', "/"),
-                                    is_dir: file_type.is_dir(),
-                                });
-                            }
-                        }
-                    }
-                }
-                entries.sort_by(|a, b| {
-                    use std::cmp::Ordering;
-                    match (a.is_dir, b.is_dir) {
-                        (true, false) => Ordering::Less,
-                        (false, true) => Ordering::Greater,
-                        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                    }
-                });
-                let response = WsResponse::FilesList {
-                    workspace_id,
-                    relative_path: rel,
-                    entries,
+                    Err(e) => WsResponse::Error { message: e },
                 };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-
             ServerCommand::ReadFile { workspace_id, relative_path, max_bytes, response_tx } => {
-                let root_path = {
-                    let workspaces = state.workspaces.read();
-                    match workspaces.get(&workspace_id) {
-                        Some(ws) => ws.worktree_path.clone(),
-                        None => {
-                            let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                            continue;
-                        }
-                    }
+                let response = match commands::files::read_workspace_file(&state, workspace_id.clone(), relative_path.clone(), max_bytes) {
+                    Ok(content) => WsResponse::FileContent { workspace_id, path: relative_path, content },
+                    Err(e) => WsResponse::Error { message: e },
                 };
-                let root = match std::fs::canonicalize(&root_path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let response = WsResponse::Error { message: format!("Failed to resolve workspace path: {}", e) };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        continue;
-                    }
-                };
-                let target = root.join(&relative_path);
-                let canonical_target = match std::fs::canonicalize(&target) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let response = WsResponse::Error { message: format!("Failed to resolve file path: {}", e) };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        continue;
-                    }
-                };
-                if !canonical_target.starts_with(&root) {
-                    let response = WsResponse::Error { message: "Path is outside workspace root".to_string() };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-                let limit = max_bytes.unwrap_or(MAX_FILE_READ_BYTES);
-                let bytes = match std::fs::read(&canonical_target) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let response = WsResponse::Error { message: format!("Failed to read file: {}", e) };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        continue;
-                    }
-                };
-                let (slice, truncated) = if bytes.len() > limit {
-                    (&bytes[..limit], true)
-                } else {
-                    (&bytes[..], false)
-                };
-                let mut content = String::from_utf8_lossy(slice).to_string();
-                if truncated {
-                    content.push_str("\n\n[truncated]");
-                }
-                let response = WsResponse::FileContent { workspace_id, path: relative_path, content };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-
             ServerCommand::ListChanges { workspace_id, response_tx } => {
-                let (workspace_root, default_branch) = {
-                    let workspaces = state.workspaces.read();
-                    match workspaces.get(&workspace_id) {
-                        Some(ws) => {
-                            let repos = state.repositories.read();
-                            match repos.get(&ws.repo_id) {
-                                Some(repo) => (ws.worktree_path.clone(), repo.default_branch.clone()),
-                                None => {
-                                    let response = WsResponse::Error { message: "Repository not found".to_string() };
-                                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                                    continue;
-                                }
-                            }
-                        }
-                        None => {
-                            let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                            continue;
-                        }
+                let response = match commands::files::list_workspace_changes(&state, workspace_id.clone()) {
+                    Ok(entries) => {
+                        let changes: Vec<ChangeInfo> = entries.into_iter().map(|c| ChangeInfo {
+                            status: c.status, path: c.path, old_path: c.old_path,
+                        }).collect();
+                        WsResponse::ChangesList { workspace_id, changes }
                     }
+                    Err(e) => WsResponse::Error { message: e },
                 };
-                let compare_ref = format!("origin/{}", default_branch);
-                let mut changes = Vec::new();
-
-                // Get all changes relative to origin/<default_branch>
-                let diff_output = match Command::new("git")
-                    .args(["diff", "--name-status", &compare_ref])
-                    .current_dir(&workspace_root)
-                    .output()
-                {
-                    Ok(o) => o,
-                    Err(e) => {
-                        let response = WsResponse::Error { message: format!("Failed to run git diff: {}", e) };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        continue;
-                    }
-                };
-                if diff_output.status.success() {
-                    let stdout = String::from_utf8_lossy(&diff_output.stdout);
-                    for line in stdout.lines() {
-                        let line = line.trim();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let parts: Vec<&str> = line.splitn(3, '\t').collect();
-                        if parts.len() >= 2 {
-                            let status_code = parts[0].to_string();
-                            if status_code.starts_with('R') && parts.len() == 3 {
-                                changes.push(ChangeInfo { status: "R ".to_string(), path: parts[2].to_string(), old_path: Some(parts[1].to_string()) });
-                            } else {
-                                let status = match status_code.as_str() {
-                                    "M" => " M".to_string(),
-                                    "A" => "A ".to_string(),
-                                    "D" => " D".to_string(),
-                                    other => format!("{: <2}", other),
-                                };
-                                changes.push(ChangeInfo { status, path: parts[1].to_string(), old_path: None });
-                            }
-                        }
-                    }
-                }
-
-                // Also pick up untracked files
-                if let Ok(untracked_output) = Command::new("git")
-                    .args(["ls-files", "--others", "--exclude-standard"])
-                    .current_dir(&workspace_root)
-                    .output()
-                {
-                    if untracked_output.status.success() {
-                        let stdout = String::from_utf8_lossy(&untracked_output.stdout);
-                        for line in stdout.lines() {
-                            let path = line.trim().to_string();
-                            if !path.is_empty() && !changes.iter().any(|c| c.path == path) {
-                                changes.push(ChangeInfo { status: "??".to_string(), path, old_path: None });
-                            }
-                        }
-                    }
-                }
-
-                let response = WsResponse::ChangesList { workspace_id, changes };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-
             ServerCommand::RunChecks { workspace_id, response_tx } => {
-                let workspace_root = {
-                    let workspaces = state.workspaces.read();
-                    match workspaces.get(&workspace_id) {
-                        Some(ws) => ws.worktree_path.clone(),
-                        None => {
-                            let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                            continue;
-                        }
+                let response = match commands::checks::run_workspace_checks(&state, workspace_id.clone()) {
+                    Ok(results) => {
+                        let checks: Vec<CheckInfo> = results.into_iter().map(|c| CheckInfo {
+                            name: c.name, command: c.command, success: c.success,
+                            exit_code: c.exit_code, stdout: c.stdout, stderr: c.stderr,
+                            duration_ms: c.duration_ms, skipped: c.skipped,
+                        }).collect();
+                        WsResponse::ChecksResult { workspace_id, checks }
                     }
+                    Err(e) => WsResponse::Error { message: e },
                 };
-                let checks = detect_workspace_checks(&workspace_root);
-                let mut results: Vec<CheckInfo> = Vec::new();
-                if checks.is_empty() {
-                    results.push(CheckInfo {
-                        name: "No configured checks".to_string(),
-                        command: "-".to_string(),
-                        success: true,
-                        exit_code: Some(0),
-                        stdout: "No known check commands were detected for this workspace.".to_string(),
-                        stderr: String::new(),
-                        duration_ms: 0,
-                        skipped: true,
-                    });
-                } else {
-                    for check in checks {
-                        let mut parts = check.command.split_whitespace();
-                        let Some(bin) = parts.next() else {
-                            results.push(CheckInfo {
-                                name: check.name.clone(),
-                                command: check.command.clone(),
-                                success: false,
-                                exit_code: None,
-                                stdout: String::new(),
-                                stderr: "Invalid check command configuration.".to_string(),
-                                duration_ms: 0,
-                                skipped: false,
-                            });
-                            continue;
-                        };
-                        let args: Vec<String> = parts.map(|arg| arg.to_string()).collect();
-                        let started = Instant::now();
-                        match Command::new(bin).args(&args).current_dir(&workspace_root).output() {
-                            Ok(output) => {
-                                results.push(CheckInfo {
-                                    name: check.name.clone(),
-                                    command: check.command.clone(),
-                                    success: output.status.success(),
-                                    exit_code: output.status.code(),
-                                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                                    duration_ms: started.elapsed().as_millis(),
-                                    skipped: false,
-                                });
-                            }
-                            Err(e) => {
-                                results.push(CheckInfo {
-                                    name: check.name.clone(),
-                                    command: check.command.clone(),
-                                    success: false,
-                                    exit_code: None,
-                                    stdout: String::new(),
-                                    stderr: format!("Failed to execute check: {}", e),
-                                    duration_ms: started.elapsed().as_millis(),
-                                    skipped: false,
-                                });
-                            }
-                        }
-                    }
-                }
-                let response = WsResponse::ChecksResult { workspace_id, checks: results };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-            
             ServerCommand::SendMessage {
                 workspace_id,
                 message,
@@ -5650,6 +3152,7 @@ async fn handle_ws_commands(
                                     &message,
                                     &workspace_id_clone,
                                     &agent_id_clone,
+                                    HTTP_SERVER_PORT,
                                 );
 
                                 if interactive {
@@ -6546,7 +4049,6 @@ async fn handle_ws_commands(
             }
             
             ServerCommand::StopAgent { workspace_id, response_tx } => {
-                // Find and stop agent
                 let agent_id = {
                     let agents = state.agents.read();
                     agents.values()
@@ -6555,38 +4057,9 @@ async fn handle_ws_commands(
                 };
 
                 if let Some(agent_id) = agent_id {
-                    let (workspace_id, session_id) = {
-                        let mut agents = state.agents.write();
-                        if let Some(agent) = agents.remove(&agent_id) {
-                            (Some(agent.workspace_id), agent.session_id)
-                        } else {
-                            (None, None)
-                        }
-                    };
-
-                    if let Some(sid) = session_id {
-                        let now = now_rfc3339();
-                        let _ = state.db.end_session(&sid, &now);
-                    }
-
-                    if let Some(ws_id) = workspace_id {
-                        let next_status = {
-                            let mut workspaces = state.workspaces.write();
-                            if let Some(workspace) = workspaces.get_mut(&ws_id) {
-                                let next = status_for_agent_stop(&workspace.status);
-                                workspace.status = next.clone();
-                                Some(next)
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some(status) = next_status {
-                            let _ = state.db.update_workspace_status(&ws_id, &status, None);
-                        }
-
-                        let response = WsResponse::AgentStopped { workspace_id: ws_id };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    }
+                    let _ = commands::agent::stop_agent(&state, agent_id);
+                    let response = WsResponse::AgentStopped { workspace_id };
+                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 } else {
                     let response = WsResponse::Error { message: "No agent found for workspace".to_string() };
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
@@ -6641,7 +4114,7 @@ async fn handle_ws_commands(
                         .map(|a| a.id.clone())
                 };
                 if let Some(agent_id) = agent_id {
-                    match send_permission_response(&state, &agent_id, &request_id, allow, deny_message) {
+                    match commands::agent::respond_to_permission(&state, agent_id, request_id, allow, deny_message, None) {
                         Ok(()) => {
                             let resp = serde_json::json!({ "type": "ok" });
                             let _ = response_tx.send(serde_json::to_string(&resp).unwrap());
@@ -6658,77 +4131,31 @@ async fn handle_ws_commands(
             }
 
             ServerCommand::SetWorkspaceStatus { workspace_id, status, response_tx } => {
-                let new_status = match status.as_str() {
-                    "idle" => WorkspaceStatus::Idle,
-                    "running" => WorkspaceStatus::Running,
-                    "inReview" => WorkspaceStatus::InReview,
-                    "merged" => WorkspaceStatus::Merged,
-                    _ => {
-                        let response = WsResponse::Error { message: format!("Unknown status: {}", status) };
-                        let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        continue;
-                    }
-                };
-                let workspace_info = {
-                    let mut workspaces = state.workspaces.write();
-                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
-                        workspace.status = new_status.clone();
-                        workspace.last_activity = Some(now_rfc3339());
+                let response = match commands::workspace::set_workspace_status(&state, workspace_id.clone(), status) {
+                    Ok(ws) => {
                         let has_agent = state.agents.read().values().any(|a| a.workspace_id == workspace_id);
-                        Some(to_workspace_info(workspace, has_agent))
-                    } else {
-                        None
+                        let info = to_workspace_info(&ws, has_agent);
+                        if let Some(ws_server) = &state.ws_server {
+                            ws_server.broadcast_all(&WsResponse::WorkspaceUpdated { workspace: info.clone() });
+                        }
+                        WsResponse::WorkspaceUpdated { workspace: info }
                     }
+                    Err(e) => WsResponse::Error { message: e },
                 };
-                if let Some(info) = workspace_info {
-                    let now = now_rfc3339();
-                    let _ = state.db.update_workspace_status(&workspace_id, &new_status, Some(&now));
-                    let response = WsResponse::WorkspaceUpdated { workspace: info.clone() };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    // Broadcast to other clients
-                    if let Some(ws_server) = &state.ws_server {
-                        ws_server.broadcast_all(&WsResponse::WorkspaceUpdated { workspace: info });
-                    }
-                } else {
-                    let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                }
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-
             ServerCommand::ToggleWorkspacePin { workspace_id, response_tx } => {
-                let workspace_info = {
-                    let mut workspaces = state.workspaces.write();
-                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
-                        if workspace.pinned_at.is_some() {
-                            workspace.pinned_at = None;
-                        } else {
-                            workspace.pinned_at = Some(now_rfc3339());
-                        }
+                let response = match commands::workspace::toggle_workspace_pinned(&state, workspace_id.clone()) {
+                    Ok(ws) => {
                         let has_agent = state.agents.read().values().any(|a| a.workspace_id == workspace_id);
-                        Some(to_workspace_info(workspace, has_agent))
-                    } else {
-                        None
+                        WsResponse::WorkspaceUpdated { workspace: to_workspace_info(&ws, has_agent) }
                     }
+                    Err(e) => WsResponse::Error { message: e },
                 };
-                if let Some(info) = workspace_info {
-                    let _ = state.db.update_workspace_pinned(&workspace_id, info.pinned_at.as_deref());
-                    let response = WsResponse::WorkspaceUpdated { workspace: info };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                } else {
-                    let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                }
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-
             ServerCommand::UpdateWorkspaceNotes { workspace_id, notes, response_tx } => {
-                let notes_opt = if notes.trim().is_empty() { None } else { Some(notes.as_str()) };
-                {
-                    let mut workspaces = state.workspaces.write();
-                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
-                        workspace.notes = notes_opt.map(String::from);
-                    }
-                }
-                let _ = state.db.update_workspace_notes(&workspace_id, notes_opt);
+                let _ = commands::workspace::update_workspace_notes(&state, workspace_id.clone(), notes);
                 let workspace_info = {
                     let workspaces = state.workspaces.read();
                     workspaces.get(&workspace_id).map(|ws| {
@@ -6741,15 +4168,8 @@ async fn handle_ws_commands(
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 }
             }
-
             ServerCommand::UpdateWorkspaceOrder { workspace_id, display_order, response_tx } => {
-                {
-                    let mut workspaces = state.workspaces.write();
-                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
-                        workspace.display_order = display_order;
-                    }
-                }
-                let _ = state.db.update_workspace_display_order(&workspace_id, display_order);
+                let _ = commands::workspace::update_workspace_display_order(&state, workspace_id.clone(), display_order);
                 let workspace_info = {
                     let workspaces = state.workspaces.read();
                     workspaces.get(&workspace_id).map(|ws| {
@@ -6762,59 +4182,24 @@ async fn handle_ws_commands(
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                 }
             }
-
             ServerCommand::ReadChangeDiff { workspace_id, file_path, response_tx } => {
-                let workspace_root = {
-                    let workspaces = state.workspaces.read();
-                    workspaces.get(&workspace_id).map(|ws| ws.worktree_path.clone())
+                let response = match commands::files::read_workspace_change_diff(&state, workspace_id.clone(), file_path.clone(), None, None) {
+                    Ok(diff) => WsResponse::ChangeDiff { workspace_id, file_path, diff },
+                    Err(e) => WsResponse::Error { message: e },
                 };
-                if let Some(root) = workspace_root {
-                    let output = Command::new("git")
-                        .args(["diff", "HEAD", "--", &file_path])
-                        .current_dir(&root)
-                        .output();
-                    let diff = match output {
-                        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-                        Err(e) => format!("Failed to get diff: {}", e),
-                    };
-                    let response = WsResponse::ChangeDiff { workspace_id, file_path, diff };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                } else {
-                    let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                }
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
-
             ServerCommand::RunTerminalCommand { workspace_id, command, response_tx } => {
-                let workspace_root = {
-                    let workspaces = state.workspaces.read();
-                    workspaces.get(&workspace_id).map(|ws| ws.worktree_path.clone())
+                let response = match commands::workspace::run_workspace_terminal_command(&state, workspace_id.clone(), command, None) {
+                    Ok(result) => WsResponse::TerminalOutput {
+                        workspace_id,
+                        stdout: result.stdout,
+                        stderr: result.stderr,
+                        exit_code: result.exit_code,
+                    },
+                    Err(e) => WsResponse::Error { message: e },
                 };
-                if let Some(root) = workspace_root {
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-                    let output = Command::new(shell)
-                        .args(["-lc", &command])
-                        .current_dir(&root)
-                        .output();
-                    match output {
-                        Ok(o) => {
-                            let response = WsResponse::TerminalOutput {
-                                workspace_id,
-                                stdout: String::from_utf8_lossy(&o.stdout).to_string(),
-                                stderr: String::from_utf8_lossy(&o.stderr).to_string(),
-                                exit_code: o.status.code(),
-                            };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        }
-                        Err(e) => {
-                            let response = WsResponse::Error { message: format!("Failed to execute: {}", e) };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                        }
-                    }
-                } else {
-                    let response = WsResponse::Error { message: ERR_WORKSPACE_NOT_FOUND.to_string() };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                }
+                let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
         }
     }
