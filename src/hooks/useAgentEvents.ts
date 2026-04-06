@@ -23,6 +23,8 @@ interface UseAgentEventsParams {
   setUnreadByWorkspace: Dispatch<SetStateAction<Record<string, number>>>;
   setCredentialErrorWorkspaces: Dispatch<SetStateAction<Set<string>>>;
   setWorkspaces: Dispatch<SetStateAction<Workspace[]>>;
+  setGodChildWorkspaces: Dispatch<SetStateAction<Workspace[]>>;
+  setGodWorkspaces: Dispatch<SetStateAction<Workspace[]>>;
   setPendingPermissions: Dispatch<SetStateAction<Record<string, PermissionRequestEvent[]>>>;
   setQueuedMessagesByWorkspace: Dispatch<SetStateAction<Record<string, QueuedMessage[]>>>;
   persistUnread: (workspaceId: string, count: number) => void;
@@ -50,6 +52,8 @@ export function useAgentEvents(params: UseAgentEventsParams): void {
     setUnreadByWorkspace,
     setCredentialErrorWorkspaces,
     setWorkspaces,
+    setGodChildWorkspaces,
+    setGodWorkspaces,
     setPendingPermissions,
     setQueuedMessagesByWorkspace,
     persistUnread,
@@ -93,13 +97,15 @@ export function useAgentEvents(params: UseAgentEventsParams): void {
         const prUrl = extractPullRequestUrl(event.payload.content);
         if (prUrl && detectedPrUrlByWorkspaceRef.current[messageWorkspaceId] !== prUrl) {
           detectedPrUrlByWorkspaceRef.current[messageWorkspaceId] = prUrl;
-          setWorkspaces((prev) =>
+          const prUpdater = (prev: Workspace[]) =>
             prev.map((workspace) =>
               workspace.id === messageWorkspaceId
-                ? { ...workspace, status: workspace.status === "merged" ? "merged" : "inReview", prUrl }
+                ? { ...workspace, status: workspace.status === "merged" ? "merged" : "inReview" as Workspace["status"], prUrl }
                 : workspace,
-            ),
-          );
+            );
+          setWorkspaces(prUpdater);
+          setGodChildWorkspaces(prUpdater);
+          setGodWorkspaces(prUpdater);
           invoke("mark_workspace_in_review", { workspaceId: messageWorkspaceId, prUrl }).catch((err) => {
             console.error("Failed to mark workspace in review:", err);
           });

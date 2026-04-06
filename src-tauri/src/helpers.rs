@@ -15,3 +15,19 @@ pub fn now_rfc3339() -> String {
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
+
+/// Constant-time byte comparison to prevent timing side-channels on secret tokens.
+///
+/// Returns false immediately if lengths differ — this is safe when both operands
+/// are always the same fixed format (e.g. UUID v4, 36 bytes). Do NOT use for
+/// variable-length secrets where the length itself is sensitive.
+pub fn fixed_length_constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}

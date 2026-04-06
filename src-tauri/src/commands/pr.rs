@@ -232,7 +232,7 @@ pub fn mark_workspace_in_review(
         return Err("PR URL cannot be empty.".to_string());
     }
 
-    {
+    let final_status = {
         let mut workspaces = state.workspaces.write();
         let workspace = workspaces
             .get_mut(&workspace_id)
@@ -241,11 +241,12 @@ pub fn mark_workspace_in_review(
             workspace.status = WorkspaceStatus::InReview;
         }
         workspace.pr_url = Some(trimmed_pr_url.to_string());
-    }
+        workspace.status.clone()
+    };
 
     state
         .db
-        .update_workspace_pr_url(&workspace_id, trimmed_pr_url, &WorkspaceStatus::InReview)
+        .update_workspace_pr_url(&workspace_id, trimmed_pr_url, &final_status)
         .map_err(|e| format!("Failed to persist PR URL: {}", e))?;
 
     Ok(())

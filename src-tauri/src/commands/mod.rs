@@ -2,6 +2,7 @@ pub mod repository;
 pub mod files;
 pub mod checks;
 pub mod workspace;
+pub mod god_workspace;
 pub mod skills;
 pub mod pr;
 pub mod agent;

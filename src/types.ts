@@ -21,6 +21,8 @@ export interface Workspace {
   displayOrder: number;
   pinnedAt?: string | null;
   notes?: string | null;
+  parentGodWorkspaceId?: string | null;
+  isGod?: boolean;
 }
 
 export interface Agent {
@@ -290,6 +292,7 @@ export interface SortableWorkspaceItemProps {
   workspace: Workspace;
   isSelected: boolean;
   unreadCount: number;
+  repoName?: string;
   onSelect: (id: string) => void;
   onTogglePin: (id: string) => void;
   onRename: (ws: Workspace) => void;

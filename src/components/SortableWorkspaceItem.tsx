@@ -7,6 +7,7 @@ const SortableWorkspaceItem = memo(function SortableWorkspaceItem({
   workspace,
   isSelected,
   unreadCount,
+  repoName,
   onSelect,
   onTogglePin,
   onRename,
@@ -68,6 +69,9 @@ const SortableWorkspaceItem = memo(function SortableWorkspaceItem({
           )}
         </div>
         <p className="mt-1 truncate md-body-small md-text-muted">{workspace.branch}</p>
+        {repoName && (
+          <p className="mt-0.5 truncate text-[10px] md-text-dim">{repoName}</p>
+        )}
       </button>
       <div className="flex items-center gap-1">
         <button

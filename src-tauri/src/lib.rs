@@ -57,11 +57,26 @@ pub struct AppState {
     ws_server_running: RwLock<bool>,
     ws_connected_clients: RwLock<usize>,
     pairing_code: Arc<RwLock<Option<String>>>,
+    /// Bearer token for the God workspace orchestrator API.
+    /// Persisted in the database so it survives app restarts — a god agent
+    /// that was started in a prior session will still have the correct token.
+    pub(crate) api_token: String,
 }
 
 impl AppState {
     fn new(db: Database) -> Self {
         let db = Arc::new(db);
+
+        // Load or generate a persistent API token so god agents survive app restarts
+        let api_token = match db.get_setting("api_token") {
+            Ok(Some(token)) => token,
+            _ => {
+                let token = new_id();
+                let _ = db.set_setting("api_token", &token);
+                token
+            }
+        };
+
         let mut state = Self {
             db: db.clone(),
             repositories: RwLock::new(HashMap::new()),
@@ -75,8 +90,9 @@ impl AppState {
             ws_server_running: RwLock::new(false),
             ws_connected_clients: RwLock::new(0),
             pairing_code: Arc::new(RwLock::new(None)),
+            api_token,
         };
-        
+
         // Load persisted data
         state.load_from_db();
         state
@@ -91,8 +107,8 @@ impl AppState {
             }
         }
         
-        // Load workspaces
-        if let Ok(workspaces) = self.db.get_all_workspaces() {
+        // Load all workspaces (regular + god + children) into memory
+        if let Ok(workspaces) = self.db.get_all_workspaces_unfiltered() {
             let mut ws_map = self.workspaces.write();
             for ws in workspaces {
                 ws_map.insert(ws.id.clone(), ws);
@@ -109,23 +125,13 @@ impl AppState {
     }
 }
 
-fn workspace_status_to_ws(status: &WorkspaceStatus) -> String {
-    match status {
-        WorkspaceStatus::Idle => "idle".to_string(),
-        WorkspaceStatus::Running => "running".to_string(),
-        WorkspaceStatus::InReview => "inReview".to_string(),
-        WorkspaceStatus::Merged => "merged".to_string(),
-        WorkspaceStatus::Initializing => "initializing".to_string(),
-    }
-}
-
 fn to_workspace_info(workspace: &Workspace, has_agent: bool) -> WorkspaceInfo {
     WorkspaceInfo {
         id: workspace.id.clone(),
         repo_id: workspace.repo_id.clone(),
         name: workspace.name.clone(),
         branch: workspace.branch.clone(),
-        status: workspace_status_to_ws(&workspace.status),
+        status: workspace.status.as_str().to_string(),
         has_agent,
         pinned_at: workspace.pinned_at.clone(),
         notes: workspace.notes.clone(),
@@ -236,7 +242,8 @@ async fn start_remote_server(
     // now upgrade it to also serve the web client.
     if let Some(http) = &state.http_server {
         let pending = state.pending_permission_requests.clone();
-        http.start(pending, app, true).await
+        let app_state_clone: Arc<AppState> = state.inner().clone();
+        http.start(pending, app, app_state_clone, true).await
             .map_err(|e| format!("Failed to start HTTP server with web client: {}", e))?;
     }
 
@@ -262,7 +269,8 @@ async fn stop_remote_server(
     // but keep the /api/permission endpoint alive for the MCP bridge.
     if let Some(http) = &state.http_server {
         let pending = state.pending_permission_requests.clone();
-        if let Err(e) = http.start(pending, app, false).await {
+        let app_state_clone: Arc<AppState> = state.inner().clone();
+        if let Err(e) = http.start(pending, app, app_state_clone, false).await {
             tracing::warn!("Failed to restart HTTP server in API-only mode: {}", e);
         }
     }
@@ -464,28 +472,80 @@ async fn run_workspace_terminal_command(
     commands::workspace::run_workspace_terminal_command(&state, workspace_id, command, env_overrides)
 }
 
+// ─── God Workspace Commands ─────────────────────────────────────────
+
+#[tauri::command]
+async fn create_god_workspace(
+    repo_id: String,
+    name: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Workspace, String> {
+    commands::god_workspace::create_god_workspace(&state, repo_id, name)
+}
+
+#[tauri::command]
+async fn list_god_workspaces(state: State<'_, Arc<AppState>>) -> Result<Vec<Workspace>, String> {
+    commands::god_workspace::list_god_workspaces(&state)
+}
+
+#[tauri::command]
+async fn remove_god_workspace(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    commands::god_workspace::remove_god_workspace(&state, id)
+}
+
+#[tauri::command]
+async fn list_god_child_workspaces(
+    god_workspace_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<Workspace>, String> {
+    commands::god_workspace::list_god_child_workspaces(&state, god_workspace_id)
+}
+
+#[tauri::command]
+async fn create_god_child_workspace(
+    god_workspace_id: String,
+    repo_id: String,
+    name: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Workspace, String> {
+    commands::god_workspace::create_god_child_workspace(&state, god_workspace_id, repo_id, name)
+}
+
+// ─── Agent Commands ─────────────────────────────────────────────────
+
 #[tauri::command]
 async fn list_agents(state: State<'_, Arc<AppState>>) -> Result<Vec<Agent>, String> {
     commands::agent::list_agents(&state)
 }
 
-#[tauri::command]
-async fn start_agent(
+/// Core start_agent logic — callable from both Tauri commands and HTTP handlers.
+pub(crate) fn start_agent_core(
+    state: &Arc<AppState>,
+    app: tauri::AppHandle,
     workspace_id: String,
     env_overrides: Option<HashMap<String, String>>,
-    app: tauri::AppHandle,
-    state: State<'_, Arc<AppState>>,
 ) -> Result<Agent, String> {
+    // Guard: reject if an agent is already running in this workspace
+    {
+        let agents = state.agents.read();
+        if agents.values().any(|a| a.workspace_id == workspace_id) {
+            return Err("An agent is already running in this workspace".to_string());
+        }
+    }
+
     // Get workspace info
     let workspace = {
         let workspaces = state.workspaces.read();
         workspaces.get(&workspace_id).cloned()
             .ok_or(ERR_WORKSPACE_NOT_FOUND)?
     };
-    
+
     let agent_id = new_id();
     let session_id = new_id();
-    
+
     // Try to resume the most recent Claude session for this workspace so that
     // conversations survive app restarts.  Falls back to a fresh session if
     // no prior session exists.
@@ -493,12 +553,12 @@ async fn start_agent(
         .db
         .get_latest_claude_session_id(&workspace_id)
         .unwrap_or(None);
-    
+
     // Create session in database
     let now = now_rfc3339();
     state.db.insert_session(&session_id, &workspace_id, claude_session_id.as_deref(), &now)
         .map_err(|e| format!("Failed to create session: {}", e))?;
-    
+
     // Create agent record
     let agent = Agent {
         id: agent_id.clone(),
@@ -506,13 +566,14 @@ async fn start_agent(
         status: AgentStatus::Running,
         session_id: Some(session_id.clone()),
         claude_session_id: claude_session_id.clone(),
+        processing: false,
     };
-    
+
     {
         let mut agents = state.agents.write();
         agents.insert(agent_id.clone(), agent.clone());
     }
-    
+
     // Update workspace status
     let next_status = {
         let mut workspaces = state.workspaces.write();
@@ -525,7 +586,7 @@ async fn start_agent(
             None
         }
     };
-    
+
     // Update database
     if let Some(status) = next_status {
         let now = now_rfc3339();
@@ -533,10 +594,10 @@ async fn start_agent(
             .db
             .update_workspace_status(&workspace_id, &status, Some(&now));
     }
-    
+
     // Get WebSocket server for broadcasting
     let ws_server = state.ws_server.clone();
-    
+
     // Spawn Claude CLI in background thread
     let workspace_path = workspace.worktree_path.clone();
     let workspace_name = workspace.name.clone();
@@ -544,7 +605,15 @@ async fn start_agent(
     let db = state.db.clone();
     let session_id_clone = session_id.clone();
     let workspace_id_clone = workspace_id.clone();
-    let env_overrides_clone = env_overrides.unwrap_or_default();
+    let mut env_overrides_clone = env_overrides.unwrap_or_default();
+
+    // Inject God workspace identity into the agent's environment so the
+    // bundled skill can reference $GOD_WORKSPACE_ID in curl commands.
+    if workspace.is_god {
+        env_overrides_clone.insert("GOD_WORKSPACE_ID".to_string(), workspace_id.clone());
+        env_overrides_clone.insert("GOD_WORKSPACE_REPO_ID".to_string(), workspace.repo_id.clone());
+        env_overrides_clone.insert("ORCHESTRATOR_API_TOKEN".to_string(), state.api_token.clone());
+    }
 
     std::thread::spawn(move || {
         run_claude_cli(
@@ -560,8 +629,18 @@ async fn start_agent(
             env_overrides_clone,
         );
     });
-    
+
     Ok(agent)
+}
+
+#[tauri::command]
+async fn start_agent(
+    workspace_id: String,
+    env_overrides: Option<HashMap<String, String>>,
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Agent, String> {
+    start_agent_core(state.inner(), app, workspace_id, env_overrides)
 }
 
 
@@ -1242,6 +1321,22 @@ impl Drop for RunStateGuard {
     }
 }
 
+/// Guard that resets `Agent.processing = false` when dropped.
+/// Ensures the HTTP API's busy flag is always cleared, even on early returns or panics.
+struct ProcessingGuard {
+    app_state: Arc<AppState>,
+    agent_id: String,
+}
+
+impl Drop for ProcessingGuard {
+    fn drop(&mut self) {
+        let mut agents = self.app_state.agents.write();
+        if let Some(a) = agents.get_mut(&self.agent_id) {
+            a.processing = false;
+        }
+    }
+}
+
 fn summarize_tool_call(tool_name: &str, input_json: &str) -> Option<String> {
     let parsed = serde_json::from_str::<Value>(input_json).ok();
     let lower = tool_name.to_lowercase();
@@ -1855,26 +1950,28 @@ async fn answer_agent_question(
     Ok(())
 }
 
-#[tauri::command]
-async fn send_message_to_agent(
+/// Core send_message logic — callable from both Tauri commands and HTTP handlers.
+pub(crate) fn send_message_core(
+    app_state: &std::sync::Arc<AppState>,
+    app: tauri::AppHandle,
     agent_id: String,
     message: String,
     env_overrides: Option<HashMap<String, String>>,
     permission_mode: Option<String>,
     model: Option<String>,
     effort: Option<String>,
-    app: tauri::AppHandle,
-    state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let app_state = state.inner().clone();
-    // Get workspace path and session info for this agent
-    let (workspace_id, workspace_path, session_id, claude_session_id) = {
+    // Get workspace path and session info for this agent.
+    // Acquire locks sequentially (never hold agents + workspaces simultaneously).
+    let (workspace_id, session_id, claude_session_id) = {
         let agents = app_state.agents.read();
         let agent = agents.get(&agent_id).ok_or("Agent not found")?;
-        
+        (agent.workspace_id.clone(), agent.session_id.clone(), agent.claude_session_id.clone())
+    };
+    let (workspace_path, is_god) = {
         let workspaces = app_state.workspaces.read();
-        let workspace = workspaces.get(&agent.workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
-        (agent.workspace_id.clone(), workspace.worktree_path.clone(), agent.session_id.clone(), agent.claude_session_id.clone())
+        let workspace = workspaces.get(&workspace_id).ok_or(ERR_WORKSPACE_NOT_FOUND)?;
+        (workspace.worktree_path.clone(), workspace.is_god)
     };
     
     let session_id = session_id.ok_or("No active session")?;
@@ -1898,7 +1995,21 @@ async fn send_message_to_agent(
     let message_clone = message.clone();
     let db = app_state.db.clone();
     let app_state_for_pids = app_state.clone();
-    let env_overrides = env_overrides.unwrap_or_default();
+    let mut env_overrides = env_overrides.unwrap_or_default();
+
+    // Inject God workspace env vars so the agent can make curl calls to the
+    // orchestrator API. Same vars as start_agent_core — needed here because
+    // send_message_core spawns a fresh CLI process for each message.
+    if is_god {
+        env_overrides.insert("GOD_WORKSPACE_ID".to_string(), workspace_id.clone());
+        env_overrides.insert("ORCHESTRATOR_API_TOKEN".to_string(), app_state.api_token.clone());
+        // GOD_WORKSPACE_REPO_ID requires an extra workspace field read, but the
+        // god agent rarely needs it during message sends (only during create).
+        // Inject it if available for completeness.
+        if let Some(repo_id) = app_state.workspaces.read().get(&workspace_id).map(|w| w.repo_id.clone()) {
+            env_overrides.insert("GOD_WORKSPACE_REPO_ID".to_string(), repo_id);
+        }
+    }
     let requested_permission_mode = normalize_permission_mode(permission_mode.as_deref()).to_string();
     let requested_model = normalize_model(model.as_deref());
     let requested_effort = normalize_effort(effort.as_deref()).map(str::to_string);
@@ -1918,6 +2029,11 @@ async fn send_message_to_agent(
             workspace_id.clone(),
             agent_id_clone.clone(),
         );
+        // Ensure the per-message processing flag is cleared on all exit paths (including panic).
+        let _processing_guard = ProcessingGuard {
+            app_state: app_state_for_pids.clone(),
+            agent_id: agent_id_clone.clone(),
+        };
         let effective_env = build_effective_cli_env(&env_overrides);
         let claude_path = match find_claude_cli_with_env(Some(&effective_env)) {
             Some(p) => p,
@@ -1978,21 +2094,6 @@ async fn send_message_to_agent(
             &agent_id_clone,
             HTTP_SERVER_PORT,
         );
-        eprintln!(
-            "[orchestrator] CLI: path={} model={:?} effort={:?} resume={:?}",
-            claude_path, model, effort, claude_session_id
-        );
-        // Dump Claude/AWS env vars to diagnose stale model resolution
-        let mut debug_env: Vec<_> = effective_env
-            .iter()
-            .filter(|(k, _)| {
-                k.starts_with("CLAUDE") || k.starts_with("AWS") || k.starts_with("ANTHROPIC")
-            })
-            .collect();
-        debug_env.sort_by_key(|(k, _)| k.as_str());
-        for (k, v) in &debug_env {
-            eprintln!("[orchestrator] env: {}={}", k, v);
-        }
         if interactive {
             cmd.stdin(Stdio::piped());
         } else {
@@ -2122,7 +2223,7 @@ async fn send_message_to_agent(
                         if known_claude_session_id.as_deref() != Some(stream_session_id.as_str()) {
                             known_claude_session_id = Some(stream_session_id.clone());
                             {
-                                let mut agents = app_state.agents.write();
+                                let mut agents = app_state_for_pids.agents.write();
                                 if let Some(agent) = agents.get_mut(&agent_id_clone) {
                                     agent.claude_session_id = Some(stream_session_id.clone());
                                 }
@@ -2756,6 +2857,20 @@ async fn send_message_to_agent(
 }
 
 #[tauri::command]
+async fn send_message_to_agent(
+    agent_id: String,
+    message: String,
+    env_overrides: Option<HashMap<String, String>>,
+    permission_mode: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    send_message_core(state.inner(), app, agent_id, message, env_overrides, permission_mode, model, effort)
+}
+
+#[tauri::command]
 async fn get_agent_messages(
     workspace_id: String,
     state: State<'_, Arc<AppState>>,
@@ -3075,975 +3190,44 @@ async fn handle_ws_commands(
                         .find(|a| a.workspace_id == workspace_id)
                         .map(|a| a.id.clone())
                 };
-                
+
                 if let Some(agent_id) = agent_id {
-                    // Reuse the existing send_message_to_agent logic via a command invocation
-                    // For simplicity, we'll just emit the message directly here
-                    let (workspace_path, session_id, claude_session_id) = {
-                        let agents = state.agents.read();
-                        let agent = match agents.get(&agent_id) {
-                            Some(a) => a,
-                            None => continue,
-                        };
-                        
-                        let workspaces = state.workspaces.read();
-                        let workspace = match workspaces.get(&agent.workspace_id) {
-                            Some(w) => w,
-                            None => continue,
-                        };
-                        (workspace.worktree_path.clone(), agent.session_id.clone(), agent.claude_session_id.clone())
-                    };
-                    
-                    if let Some(session_id) = session_id {
-                        let now = now_rfc3339();
-                        let _ = state.db.insert_message(&session_id, &agent_id, "user", &message, false, &now);
-                        
-                        let ws_server = state.ws_server.clone();
-                        let db = state.db.clone();
-                        let app_clone = app.clone();
-                        let app_state_clone = state.clone();
-                        let workspace_id_clone = workspace_id.clone();
-                        let agent_id_clone = agent_id.clone();
-                        let env_overrides: HashMap<String, String> = HashMap::new();
-                        let requested_permission_mode =
-                            normalize_permission_mode(permission_mode.as_deref()).to_string();
-                        let requested_model = normalize_model(model.as_deref());
-                        let requested_effort = normalize_effort(effort.as_deref()).map(str::to_string);
-                        
-                        std::thread::spawn(move || {
-                            emit_agent_run_state(
-                                &app_clone,
-                                &ws_server,
-                                &workspace_id_clone,
-                                &agent_id_clone,
-                                true,
-                            );
-                            let mut _run_guard = RunStateGuard::new(
-                                app_clone.clone(),
-                                ws_server.clone(),
-                                workspace_id_clone.clone(),
-                                agent_id_clone.clone(),
-                            );
-                            let effective_env = build_effective_cli_env(&env_overrides);
-                            if let Some(claude_path) = find_claude_cli_with_env(Some(&effective_env)) {
-                                let (env_summary, env_hint) = auth_env_feedback(&effective_env);
-                                let permission_mode = requested_permission_mode.as_str();
-                                let is_bedrock = env_truthy(effective_env.get("CLAUDE_CODE_USE_BEDROCK"));
-                                let resolved_model =
-                                    resolve_model_for_runtime(requested_model.as_deref(), is_bedrock);
-                                let model = resolved_model.as_deref();
-                                let effort = requested_effort.as_deref();
-
-                                const MAX_PROMPT_TOO_LONG_RETRIES: u32 = 6;
-                                let mut prompt_too_long_attempts: u32 = 0;
-
-                                'retry: loop {
-
-                                let mut cmd = Command::new(&claude_path);
-                                cmd.current_dir(&workspace_path);
-                                configure_cli_env(&mut cmd, &effective_env);
-                                let interactive = append_claude_request_args(
-                                    &mut cmd,
-                                    &claude_path,
-                                    permission_mode,
-                                    model,
-                                    effort,
-                                    claude_session_id.as_deref(),
-                                    &message,
-                                    &workspace_id_clone,
-                                    &agent_id_clone,
-                                    HTTP_SERVER_PORT,
-                                );
-
-                                if interactive {
-                                    cmd.stdin(Stdio::piped());
-                                } else {
-                                    cmd.stdin(Stdio::null());
-                                }
-                                cmd.stdout(Stdio::piped());
-                                cmd.stderr(Stdio::piped());
-                                let mut child = match cmd.spawn() {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            format!("Error spawning Claude: {}", e),
-                                            true,
-                                            "error",
-                                        );
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            env_summary.clone(),
-                                            true,
-                                            "error",
-                                        );
-                                        if let Some(hint) = env_hint.clone() {
-                                            emit_agent_message(
-                                                &app_clone,
-                                                &db,
-                                                &session_id,
-                                                &agent_id_clone,
-                                                &workspace_id_clone,
-                                                &ws_server,
-                                                format!("Hint: {}", hint),
-                                                true,
-                                                "error",
-                                            );
-                                        }
-                                        // Guard will emit running=false on return.
-                                        return;
-                                    }
-                                };
-
-                                // Store child PID for interrupt support
-                                app_state_clone.child_pids.write().insert(agent_id_clone.clone(), child.id());
-
-                                // Store stdin handle for permission responses
-                                let stdin_handle = child.stdin.take().map(|s| Arc::new(Mutex::new(s)));
-                                if let Some(ref handle) = stdin_handle {
-                                    app_state_clone
-                                        .agent_stdin
-                                        .write()
-                                        .insert(agent_id_clone.clone(), handle.clone());
-                                }
-
-                                // In interactive permission mode, send the user message via stdin
-                                if interactive {
-                                    if let Some(ref handle) = stdin_handle {
-                                        match handle.lock() {
-                                            Ok(mut stdin) => {
-                                                if let Err(e) = write_stdin_user_message(&mut stdin, &message) {
-                                                    eprintln!("[orchestrator] Failed to write user message to stdin: {}", e);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!("[orchestrator] Stdin lock poisoned: {}", e);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let mut assistant_delta_text = String::new();
-                                let mut latest_assistant_snapshot: Option<String> = None;
-                                let mut result_text_fallback: Option<String> = None;
-                                let mut assistant_text_blocks: HashMap<i64, String> = HashMap::new();
-                                let mut assistant_stream_timestamp: Option<String> = None;
-                                let mut assistant_stream_last_emitted: Option<String> = None;
-                                let mut tool_names: HashMap<i64, String> = HashMap::new();
-                                let mut tool_inputs: HashMap<i64, String> = HashMap::new();
-                                let mut known_claude_session_id = claude_session_id.clone();
-                                let allow_init_activity = known_claude_session_id.is_none();
-                                let mut last_activity: Option<String> = None;
-                                let mut last_question: Option<String> = None;
-                                let mut last_plan: Option<String> = None;
-                                let mut error_emitted = false;
-                                let mut saw_credential_error = false;
-                                let mut saw_prompt_too_long = false;
-                                let mut missing_conversation_session_id: Option<String> = None;
-                                let stderr_handle = child.stderr.take().map(|stderr| {
-                                    std::thread::spawn(move || {
-                                        let mut reader = BufReader::new(stderr);
-                                        let mut stderr_buf = String::new();
-                                        let _ = std::io::Read::read_to_string(&mut reader, &mut stderr_buf);
-                                        stderr_buf
-                                    })
-                                });
-
-                                if let Some(stdout) = child.stdout.take() {
-                                    let reader = BufReader::new(stdout);
-                                    for line in reader.lines().flatten() {
-                                        if line.trim().is_empty() {
-                                            continue;
-                                        }
-                                        if let Ok(event) = serde_json::from_str::<Value>(&line) {
-                                            let payload = stream_event_payload(&event);
-                                            if let Some(stream_session_id) = extract_stream_session_id(&event) {
-                                                if known_claude_session_id.as_deref()
-                                                    != Some(stream_session_id.as_str())
-                                                {
-                                                    known_claude_session_id = Some(stream_session_id.clone());
-                                                    {
-                                                        let mut agents = app_state_clone.agents.write();
-                                                        if let Some(agent) = agents.get_mut(&agent_id_clone) {
-                                                            agent.claude_session_id = Some(stream_session_id.clone());
-                                                        }
-                                                    }
-                                                    let _ = db.update_session_claude_id(
-                                                        &session_id,
-                                                        &stream_session_id,
-                                                    );
-                                                }
-                                            }
-
-                                            let payload_type = payload
-                                                .get("type")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("");
-
-                                            if payload_type == "ping" {
-                                                continue;
-                                            }
-
-                                            if payload_type == "control_request" {
-                                                let request = payload.get("request").cloned().unwrap_or(Value::Null);
-                                                let tool_name = request.get("tool_name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-                                                let request_id = payload.get("request_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                if request_id.is_empty() {
-                                                    eprintln!("[orchestrator] control_request missing request_id, skipping");
-                                                    continue;
-                                                }
-                                                let permission_event = PermissionRequestEvent {
-                                                    workspace_id: workspace_id_clone.clone(),
-                                                    agent_id: agent_id_clone.clone(),
-                                                    request_id,
-                                                    tool_name: tool_name.clone(),
-                                                    tool_input: request.get("input").cloned().unwrap_or(Value::Null),
-                                                    tool_use_id: request.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                                };
-                                                let _ = app_clone.emit("permission-request", &permission_event);
-                                                if let Some(ws) = &ws_server {
-                                                    ws.broadcast_to_workspace(&workspace_id_clone, &WsResponse::PermissionRequest(permission_event));
-                                                }
-                                                emit_agent_message(
-                                                    &app_clone,
-                                                    &db,
-                                                    &session_id,
-                                                    &agent_id_clone,
-                                                    &workspace_id_clone,
-                                                    &ws_server,
-                                                    format!("🔒 Permission requested: **{}**", tool_name),
-                                                    false,
-                                                    "system",
-                                                );
-                                                continue;
-                                            }
-
-                                            if let Some(stream_error) = extract_stream_error_text(payload) {
-                                                if missing_conversation_session_id.is_none() {
-                                                    missing_conversation_session_id =
-                                                        extract_missing_conversation_session_id(&stream_error);
-                                                }
-                                                if !saw_prompt_too_long && detect_prompt_too_long(&stream_error) {
-                                                    saw_prompt_too_long = true;
-                                                }
-                                                emit_agent_message(
-                                                    &app_clone,
-                                                    &db,
-                                                    &session_id,
-                                                    &agent_id_clone,
-                                                    &workspace_id_clone,
-                                                    &ws_server,
-                                                    stream_error,
-                                                    true,
-                                                    "error",
-                                                );
-                                                error_emitted = true;
-                                                continue;
-                                            }
-
-                                            if update_text_blocks_from_stream_event(
-                                                payload,
-                                                &mut assistant_text_blocks,
-                                            ) {
-                                                // Updated in-memory streaming text blocks.
-                                            }
-
-                                            for event_item in parse_stream_event_for_activity(
-                                                &event,
-                                                &mut tool_names,
-                                                &mut tool_inputs,
-                                            ) {
-                                                match event_item {
-                                                    ActivityEvent::Activity(activity) => {
-                                                        if !allow_init_activity
-                                                            && activity.starts_with("Claude initialized (")
-                                                        {
-                                                            continue;
-                                                        }
-                                                        if last_activity.as_deref() == Some(activity.as_str()) {
-                                                            continue;
-                                                        }
-                                                        // Reset question dedup so repeated questions aren't dropped.
-                                                        last_question = None;
-                                                        emit_agent_message(
-                                                            &app_clone,
-                                                            &db,
-                                                            &session_id,
-                                                            &agent_id_clone,
-                                                            &workspace_id_clone,
-                                                            &ws_server,
-                                                            activity.clone(),
-                                                            false,
-                                                            "system",
-                                                        );
-                                                        last_activity = Some(activity);
-                                                    }
-                                                    ActivityEvent::Question(json_content) => {
-                                                        if last_question.as_deref()
-                                                            == Some(json_content.as_str())
-                                                        {
-                                                            continue;
-                                                        }
-                                                        emit_agent_message(
-                                                            &app_clone,
-                                                            &db,
-                                                            &session_id,
-                                                            &agent_id_clone,
-                                                            &workspace_id_clone,
-                                                            &ws_server,
-                                                            json_content.clone(),
-                                                            false,
-                                                            "question",
-                                                        );
-                                                        last_question = Some(json_content);
-                                                    }
-                                                    ActivityEvent::Plan(plan_content) => {
-                                                        let normalized_plan =
-                                                            normalize_text_for_dedupe(&plan_content);
-                                                        if normalized_plan.is_empty()
-                                                            || last_plan.as_deref()
-                                                                == Some(normalized_plan.as_str())
-                                                        {
-                                                            continue;
-                                                        }
-                                                        emit_agent_message(
-                                                            &app_clone,
-                                                            &db,
-                                                            &session_id,
-                                                            &agent_id_clone,
-                                                            &workspace_id_clone,
-                                                            &ws_server,
-                                                            plan_content.clone(),
-                                                            false,
-                                                            "assistant",
-                                                        );
-                                                        last_plan = Some(normalized_plan);
-                                                    }
-                                                }
-                                            }
-
-                                            if let Some(text) = extract_assistant_message_text(&event) {
-                                                latest_assistant_snapshot = Some(text);
-                                            }
-
-                                            if payload_type == "content_block_delta" {
-                                                if payload
-                                                    .get("delta")
-                                                    .and_then(|d| d.get("type"))
-                                                    .and_then(|v| v.as_str())
-                                                    == Some("text_delta")
-                                                {
-                                                    if let Some(chunk) = payload
-                                                        .get("delta")
-                                                        .and_then(|d| d.get("text"))
-                                                        .and_then(|v| v.as_str())
-                                                    {
-                                                        assistant_delta_text.push_str(chunk);
-                                                    }
-                                                }
-                                            }
-
-                                            if let Some(stream_text) = choose_streaming_assistant_text(
-                                                &assistant_text_blocks,
-                                                &assistant_delta_text,
-                                                latest_assistant_snapshot.as_ref(),
-                                            ) {
-                                                let normalized_stream =
-                                                    normalize_text_for_dedupe(&stream_text);
-                                                if !normalized_stream.is_empty()
-                                                    && assistant_stream_last_emitted.as_deref()
-                                                        != Some(normalized_stream.as_str())
-                                                    && last_plan.as_deref()
-                                                        != Some(normalized_stream.as_str())
-                                                {
-                                                    if assistant_stream_timestamp.is_none() {
-                                                        assistant_stream_timestamp =
-                                                            Some(now_rfc3339());
-                                                    }
-                                                    emit_agent_message_with_options(
-                                                        &app_clone,
-                                                        &db,
-                                                        &session_id,
-                                                        &agent_id_clone,
-                                                        &workspace_id_clone,
-                                                        &ws_server,
-                                                        stream_text,
-                                                        false,
-                                                        "assistant",
-                                                        assistant_stream_timestamp.as_deref(),
-                                                        false,
-                                                    );
-                                                    assistant_stream_last_emitted =
-                                                        Some(normalized_stream);
-                                                }
-                                            }
-
-                                            if payload_type == "result" {
-                                                if result_text_fallback.is_none() {
-                                                    result_text_fallback = extract_result_text(&event);
-                                                }
-                                                let is_error =
-                                                    payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                if is_error {
-                                                    let errors = payload
-                                                        .get("errors")
-                                                        .and_then(|v| v.as_array())
-                                                        .map(|arr| {
-                                                            arr.iter()
-                                                                .filter_map(|v| v.as_str())
-                                                                .collect::<Vec<_>>()
-                                                                .join("\n")
-                                                        })
-                                                        .filter(|s| !s.trim().is_empty())
-                                                        .or_else(|| extract_result_text(&event))
-                                                        .unwrap_or_else(|| "Claude execution failed".to_string());
-                                                    if missing_conversation_session_id.is_none() {
-                                                        missing_conversation_session_id =
-                                                            extract_missing_conversation_session_id(&errors);
-                                                    }
-                                                    if !saw_prompt_too_long && detect_prompt_too_long(&errors) {
-                                                        saw_prompt_too_long = true;
-                                                    }
-                                                    if detect_credential_error(&errors) {
-                                                        saw_credential_error = true;
-                                                        emit_agent_message(
-                                                            &app_clone,
-                                                            &db,
-                                                            &session_id,
-                                                            &agent_id_clone,
-                                                            &workspace_id_clone,
-                                                            &ws_server,
-                                                            credential_error_message(&errors),
-                                                            true,
-                                                            "credential_error",
-                                                        );
-                                                    }
-                                                    emit_agent_message(
-                                                        &app_clone,
-                                                        &db,
-                                                        &session_id,
-                                                        &agent_id_clone,
-                                                        &workspace_id_clone,
-                                                        &ws_server,
-                                                        errors,
-                                                        true,
-                                                        "error",
-                                                    );
-                                                    error_emitted = true;
-                                                }
-                                                // The `result` event is the CLI's final output. Break out
-                                                // of the stdout loop — MCP bridge may hold pipe FD open.
-                                                break;
-                                            }
-                                        } else {
-                                            let cli_line = format!("cli: {}", line);
-                                            if missing_conversation_session_id.is_none() {
-                                                missing_conversation_session_id =
-                                                    extract_missing_conversation_session_id(&line);
-                                            }
-                                            if !saw_prompt_too_long && detect_prompt_too_long(&line) {
-                                                saw_prompt_too_long = true;
-                                            }
-                                            let line_has_credential_error = detect_credential_error(&cli_line);
-                                            if line_has_credential_error {
-                                                saw_credential_error = true;
-                                                emit_agent_message(
-                                                    &app_clone,
-                                                    &db,
-                                                    &session_id,
-                                                    &agent_id_clone,
-                                                    &workspace_id_clone,
-                                                    &ws_server,
-                                                    credential_error_message(&cli_line),
-                                                    true,
-                                                    "credential_error",
-                                                );
-                                            }
-                                            let line_is_error =
-                                                line_has_credential_error || missing_conversation_session_id.is_some();
-                                            emit_agent_message(
-                                                &app_clone,
-                                                &db,
-                                                &session_id,
-                                                &agent_id_clone,
-                                                &workspace_id_clone,
-                                                &ws_server,
-                                                cli_line,
-                                                line_is_error,
-                                                if line_is_error { "error" } else { "system" },
-                                            );
-                                            if line_is_error {
-                                                error_emitted = true;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Drop stdin handle before wait() to prevent deadlock
-                                drop(stdin_handle);
-                                app_state_clone.agent_stdin.write().remove(&agent_id_clone);
-
-                                let status = match child.wait() {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        app_state_clone.child_pids.write().remove(&agent_id_clone);
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            format!("Error waiting for Claude: {}", e),
-                                            true,
-                                            "error",
-                                        );
-                                        return;
-                                    }
-                                };
-                                let mut stderr_buf = String::new();
-                                if let Some(handle) = stderr_handle {
-                                    if let Ok(collected) = handle.join() {
-                                        stderr_buf = collected;
-                                    }
-                                }
-                                if missing_conversation_session_id.is_none() {
-                                    missing_conversation_session_id =
-                                        extract_missing_conversation_session_id(&stderr_buf);
-                                }
-                                if !saw_prompt_too_long && detect_prompt_too_long(&stderr_buf) {
-                                    saw_prompt_too_long = true;
-                                }
-
-                                app_state_clone.child_pids.write().remove(&agent_id_clone);
-
-                                if let Some(stale_session_id) = missing_conversation_session_id.clone() {
-                                    if saw_credential_error {
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            format!(
-                                                "Claude reported missing session {} while AWS auth failed. Session reset was deferred; complete authentication and resend your last message.",
-                                                stale_session_id
-                                            ),
-                                            true,
-                                            "error",
-                                        );
-                                    } else {
-                                        reset_agent_claude_session(
-                                            &app_state_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                        );
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            format!(
-                                                "Claude session {} is no longer valid for the current auth context. The session was reset automatically; resend your last message.",
-                                                stale_session_id
-                                            ),
-                                            true,
-                                            "error",
-                                        );
-                                    }
-                                    error_emitted = true;
-                                }
-
-                                if let Some(assistant_text) =
-                                    choose_streaming_assistant_text(
-                                        &assistant_text_blocks,
-                                        &assistant_delta_text,
-                                        latest_assistant_snapshot.as_ref(),
-                                    )
-                                {
-                                    let normalized_assistant = normalize_text_for_dedupe(&assistant_text);
-                                    if !normalized_assistant.is_empty()
-                                        && last_plan.as_deref()
-                                            != Some(normalized_assistant.as_str())
-                                    {
-                                        if assistant_stream_timestamp.is_some() {
-                                            emit_agent_message_with_options(
-                                                &app_clone,
-                                                &db,
-                                                &session_id,
-                                                &agent_id_clone,
-                                                &workspace_id_clone,
-                                                &ws_server,
-                                                assistant_text,
-                                                false,
-                                                "assistant",
-                                                assistant_stream_timestamp.as_deref(),
-                                                true,
-                                            );
-                                        } else {
-                                            emit_agent_message(
-                                                &app_clone,
-                                                &db,
-                                                &session_id,
-                                                &agent_id_clone,
-                                                &workspace_id_clone,
-                                                &ws_server,
-                                                assistant_text,
-                                                false,
-                                                "assistant",
-                                            );
-                                        }
-                                    }
-                                } else if let Some(fallback) = result_text_fallback {
-                                    let normalized_fallback = normalize_text_for_dedupe(&fallback);
-                                    if !normalized_fallback.is_empty()
-                                        && last_plan.as_deref()
-                                            != Some(normalized_fallback.as_str())
-                                    {
-                                        if assistant_stream_timestamp.is_some() {
-                                            emit_agent_message_with_options(
-                                                &app_clone,
-                                                &db,
-                                                &session_id,
-                                                &agent_id_clone,
-                                                &workspace_id_clone,
-                                                &ws_server,
-                                                fallback,
-                                                false,
-                                                "assistant",
-                                                assistant_stream_timestamp.as_deref(),
-                                                true,
-                                            );
-                                        } else {
-                                            emit_agent_message(
-                                                &app_clone,
-                                                &db,
-                                                &session_id,
-                                                &agent_id_clone,
-                                                &workspace_id_clone,
-                                                &ws_server,
-                                                fallback,
-                                                false,
-                                                "assistant",
-                                            );
-                                        }
-                                    }
-                                } else if status.success() && !error_emitted {
-                                    emit_agent_message(
-                                        &app_clone,
-                                        &db,
-                                        &session_id,
-                                        &agent_id_clone,
-                                        &workspace_id_clone,
-                                        &ws_server,
-                                        "Claude completed without a text response.".to_string(),
-                                        false,
-                                        "assistant",
-                                    );
-                                }
-
-                                if !status.success() && !error_emitted {
-                                    let error_content = if !stderr_buf.trim().is_empty() {
-                                        stderr_buf
-                                    } else {
-                                        format!("Claude exited with status: {:?}", status.code())
-                                    };
-                                    if let Some(suggested_model) = extract_model_suggestion(&error_content) {
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            format!("Suggested model from Claude: {}", suggested_model),
-                                            true,
-                                            "error",
-                                        );
-                                    }
-                                    if !saw_prompt_too_long && detect_prompt_too_long(&error_content) {
-                                        saw_prompt_too_long = true;
-                                    }
-                                    if detect_credential_error(&error_content) {
-                                        saw_credential_error = true;
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            credential_error_message(&error_content),
-                                            true,
-                                            "credential_error",
-                                        );
-                                    }
-                                    emit_agent_message(
-                                        &app_clone,
-                                        &db,
-                                        &session_id,
-                                        &agent_id_clone,
-                                        &workspace_id_clone,
-                                        &ws_server,
-                                        error_content,
-                                        true,
-                                        "error",
-                                    );
-                                    emit_agent_message(
-                                        &app_clone,
-                                        &db,
-                                        &session_id,
-                                        &agent_id_clone,
-                                        &workspace_id_clone,
-                                        &ws_server,
-                                        env_summary.clone(),
-                                        true,
-                                        "error",
-                                    );
-                                    if let Some(ref hint) = env_hint {
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            format!("Hint: {}", hint),
-                                            true,
-                                            "error",
-                                        );
-                                    }
-                                }
-
-                                // Prompt-too-long retry: the CLI compacts history as a
-                                // side-effect of the failed load, so retrying often works.
-                                if saw_prompt_too_long && missing_conversation_session_id.is_none() {
-                                    if prompt_too_long_attempts < MAX_PROMPT_TOO_LONG_RETRIES {
-                                        prompt_too_long_attempts += 1;
-                                        let delay_secs: u64 = 30;
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            format!(
-                                                "Context window exceeded — the CLI is compacting conversation history. Retrying in {} seconds (attempt {}/{})...",
-                                                delay_secs, prompt_too_long_attempts, MAX_PROMPT_TOO_LONG_RETRIES
-                                            ),
-                                            false,
-                                            "system",
-                                        );
-                                        if !interruptible_sleep(&app_state_clone, &agent_id_clone, delay_secs) {
-                                            break 'retry;
-                                        }
-                                        continue 'retry;
-                                    } else {
-                                        reset_agent_claude_session(
-                                            &app_state_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                        );
-                                        emit_agent_message(
-                                            &app_clone,
-                                            &db,
-                                            &session_id,
-                                            &agent_id_clone,
-                                            &workspace_id_clone,
-                                            &ws_server,
-                                            "Context compaction did not reduce the session enough after multiple attempts. The session was reset — your next message will start a fresh conversation.".to_string(),
-                                            true,
-                                            "error",
-                                        );
-                                    }
-                                }
-
-                                if saw_credential_error {
-                                    if let Some(refresh_result) = run_aws_auth_refresh(&effective_env) {
-                                        match refresh_result {
-                                            Ok(message) => emit_agent_message(
-                                                &app_clone,
-                                                &db,
-                                                &session_id,
-                                                &agent_id_clone,
-                                                &workspace_id_clone,
-                                                &ws_server,
-                                                format!(
-                                                    "{} Resend your last message once browser authentication completes.",
-                                                    message
-                                                ),
-                                                false,
-                                                "system",
-                                            ),
-                                            Err(message) => emit_agent_message(
-                                                &app_clone,
-                                                &db,
-                                                &session_id,
-                                                &agent_id_clone,
-                                                &workspace_id_clone,
-                                                &ws_server,
-                                                message,
-                                                true,
-                                                "error",
-                                            ),
-                                        }
-                                    }
-                                }
-
-                                break; // Normal exit — no retry needed.
-                                } // end 'retry loop
-
-                                // Emit running=false after the retry loop completes.
-                                _run_guard.disarm();
-                                emit_agent_run_state(
-                                    &app_clone,
-                                    &ws_server,
-                                    &workspace_id_clone,
-                                    &agent_id_clone,
-                                    false,
-                                );
-                            } else {
-                                emit_agent_message(
-                                    &app_clone,
-                                    &db,
-                                    &session_id,
-                                    &agent_id_clone,
-                                    &workspace_id_clone,
-                                    &ws_server,
-                                    "Error: Claude CLI not found".to_string(),
-                                    true,
-                                    "error",
-                                );
-                                // Guard will emit running=false on drop.
-                            }
-                        });
+                    // Delegate to send_message_core — the same path used by the Tauri command
+                    // and HTTP handler. This ensures ProcessingGuard, env injection, and retry
+                    // logic are all applied consistently.
+                    if let Err(e) = send_message_core(
+                        &state,
+                        app.clone(),
+                        agent_id,
+                        message,
+                        None, // env_overrides — WS clients don't send these
+                        permission_mode,
+                        model,
+                        effort,
+                    ) {
+                        tracing::warn!("WS SendMessage failed: {}", e);
                     }
                 }
             }
-            
+
             ServerCommand::StartAgent { workspace_id, response_tx } => {
-                // Reuse an existing running agent for this workspace when available.
-                if let Some(existing_agent_id) = {
-                    let agents = state.agents.read();
-                    agents
-                        .values()
-                        .find(|a| a.workspace_id == workspace_id)
-                        .map(|a| a.id.clone())
-                } {
-                    let response = WsResponse::AgentStarted {
+                // Delegate to start_agent_core — handles session resume, god workspace
+                // env injection (ORCHESTRATOR_API_TOKEN, GOD_WORKSPACE_ID), and the
+                // "already running" guard in one place.
+                let response = match start_agent_core(&state, app.clone(), workspace_id.clone(), None) {
+                    Ok(agent) => WsResponse::AgentStarted {
                         workspace_id,
-                        agent_id: existing_agent_id,
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-
-                let workspace = {
-                    let workspaces = state.workspaces.read();
-                    match workspaces.get(&workspace_id) {
-                        Some(ws) => ws.clone(),
-                        None => {
-                            let response = WsResponse::Error {
-                                message: ERR_WORKSPACE_NOT_FOUND.to_string(),
-                            };
-                            let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                            continue;
-                        }
+                        agent_id: agent.id,
+                    },
+                    Err(e) if e.contains("already running") => {
+                        // Return existing agent ID rather than an error
+                        let agent_id = state.agents.read().values()
+                            .find(|a| a.workspace_id == workspace_id)
+                            .map(|a| a.id.clone())
+                            .unwrap_or_default();
+                        WsResponse::AgentStarted { workspace_id, agent_id }
                     }
-                };
-
-                let agent_id = new_id();
-                let session_id = new_id();
-                let claude_session_id: Option<String> = None;
-                let now = now_rfc3339();
-
-                if let Err(e) = state.db.insert_session(
-                    &session_id,
-                    &workspace_id,
-                    claude_session_id.as_deref(),
-                    &now,
-                ) {
-                    let response = WsResponse::Error {
-                        message: format!("Failed to create session: {}", e),
-                    };
-                    let _ = response_tx.send(serde_json::to_string(&response).unwrap());
-                    continue;
-                }
-
-                let agent = Agent {
-                    id: agent_id.clone(),
-                    workspace_id: workspace_id.clone(),
-                    status: AgentStatus::Running,
-                    session_id: Some(session_id.clone()),
-                    claude_session_id: claude_session_id.clone(),
-                };
-
-                {
-                    let mut agents = state.agents.write();
-                    agents.insert(agent_id.clone(), agent);
-                }
-
-                let next_status = {
-                    let mut workspaces = state.workspaces.write();
-                    if let Some(workspace) = workspaces.get_mut(&workspace_id) {
-                        let next = status_for_agent_start(&workspace.status);
-                        workspace.status = next.clone();
-                        workspace.last_activity = Some(now_rfc3339());
-                        Some(next)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(status) = next_status {
-                    let _ = state
-                        .db
-                        .update_workspace_status(&workspace_id, &status, Some(&now));
-                }
-
-                // Spawn Claude bootstrap process for this workspace.
-                let ws_server = state.ws_server.clone();
-                let workspace_path = workspace.worktree_path.clone();
-                let workspace_name = workspace.name.clone();
-                let agent_id_clone = agent_id.clone();
-                let db = state.db.clone();
-                let session_id_clone = session_id.clone();
-                let workspace_id_clone = workspace_id.clone();
-                let app_clone = app.clone();
-
-                std::thread::spawn(move || {
-                    run_claude_cli(
-                        app_clone,
-                        agent_id_clone,
-                        workspace_path,
-                        workspace_name,
-                        claude_session_id,
-                        db,
-                        session_id_clone,
-                        ws_server,
-                        workspace_id_clone,
-                        HashMap::new(),
-                    );
-                });
-
-                let response = WsResponse::AgentStarted {
-                    workspace_id,
-                    agent_id,
+                    Err(e) => WsResponse::Error { message: e },
                 };
                 let _ = response_tx.send(serde_json::to_string(&response).unwrap());
             }
@@ -4091,8 +3275,8 @@ async fn handle_ws_commands(
 
             ServerCommand::RespondToPermission { workspace_id, request_id, allow, deny_message, response_tx } => {
                 // Try the MCP bridge path first (HTTP long-poll oneshot channel).
-                let pending_tx = state.pending_permission_requests.write().remove(&request_id);
-                if let Some(tx) = pending_tx {
+                let pending_entry = state.pending_permission_requests.write().remove(&request_id);
+                if let Some((_ws_id, tx)) = pending_entry {
                     let response = if allow {
                         serde_json::json!({ "behavior": "allow" })
                     } else {
@@ -4318,8 +3502,9 @@ pub fn run() {
                 let pending = startup_state.pending_permission_requests.clone();
                 let http_app_handle = app_handle.clone();
                 let http = http.clone();
+                let http_app_state = startup_state.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = http.start(pending, http_app_handle, false).await {
+                    if let Err(e) = http.start(pending, http_app_handle, http_app_state, false).await {
                         tracing::warn!("Failed to auto-start HTTP server: {}", e);
                     }
                 });
@@ -4357,6 +3542,11 @@ pub fn run() {
             toggle_workspace_pinned,
             update_workspace_notes,
             set_workspace_status,
+            create_god_workspace,
+            list_god_workspaces,
+            remove_god_workspace,
+            list_god_child_workspaces,
+            create_god_child_workspace,
             list_agents,
             start_agent,
             stop_agent,

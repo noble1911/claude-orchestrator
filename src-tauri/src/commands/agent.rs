@@ -39,13 +39,12 @@ pub fn stop_agent(state: &AppState, agent_id: String) -> Result<(), String> {
         let _ = state.db.end_session(&sid, &now);
     }
 
-    // Drop any pending permission requests for this agent. Dropping the
-    // oneshot senders causes the HTTP handler to auto-deny (channel recv error).
-    {
+    // Drop pending permission requests that belong to *this* agent's workspace.
+    // Dropping the oneshot senders causes the HTTP handler to auto-deny (channel recv error).
+    // Other agents' permissions are left intact.
+    if let Some(ref ws_id) = workspace_id {
         let mut pending = state.pending_permission_requests.write();
-        if !pending.is_empty() {
-            pending.clear();
-        }
+        pending.retain(|_req_id, (pending_ws_id, _sender)| pending_ws_id != ws_id);
     }
 
     if let Some(ws_id) = workspace_id.clone() {
@@ -156,11 +155,11 @@ pub fn respond_to_permission(
     updated_input: Option<serde_json::Value>,
 ) -> Result<(), String> {
     // Try the MCP bridge path first (permission requested via HTTP long-poll).
-    let pending_tx = state
+    let pending_entry = state
         .pending_permission_requests
         .write()
         .remove(&request_id);
-    if let Some(tx) = pending_tx {
+    if let Some((_ws_id, tx)) = pending_entry {
         let response = if allow {
             let mut r = serde_json::json!({ "behavior": "allow" });
             if let Some(ref input) = updated_input {
