@@ -152,6 +152,11 @@ function App() {
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
   const [defaultRepoId, setDefaultRepoId] = useState<string | null>(null);
   const [defaultRepoInitialized, setDefaultRepoInitialized] = useState(false);
+  const [godWorkspaces, setGodWorkspaces] = useState<Workspace[]>([]);
+  const [godChildWorkspaces, setGodChildWorkspaces] = useState<Workspace[]>([]);
+  const [selectedGodWorkspace, setSelectedGodWorkspace] = useState<string | null>(null);
+  const [showCreateGodWorkspace, setShowCreateGodWorkspace] = useState(false);
+  const [godWorkspaceName, setGodWorkspaceName] = useState("");
   const [selectedWorkspace, setSelectedWorkspace] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -334,10 +339,14 @@ function App() {
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const chatTextareaRef = useRef<HTMLTextAreaElement>(null);
   const lastWorkspaceByRepoRef = useRef<Record<string, string>>({});
+  const lastChildByGodWorkspaceRef = useRef<Record<string, string>>({});
   const pendingWorkspaceRestoreRef = useRef<string | null>(null);
   const repoSwitchGenRef = useRef(0);
+  const godSwitchGenRef = useRef(0);
   const selectedRepoRef = useRef(selectedRepo);
   selectedRepoRef.current = selectedRepo;
+  const selectedGodWorkspaceRef = useRef(selectedGodWorkspace);
+  selectedGodWorkspaceRef.current = selectedGodWorkspace;
   const terminalInputRef = useRef<HTMLInputElement>(null);
   const bedrockEnabled = useMemo(
     () => isTruthyEnvValue(parseEnvOverrides(envOverridesText)[BEDROCK_ENV_KEY]),
@@ -438,6 +447,8 @@ function App() {
     setUnreadByWorkspace,
     setCredentialErrorWorkspaces,
     setWorkspaces,
+    setGodChildWorkspaces,
+    setGodWorkspaces,
     setPendingPermissions,
     setQueuedMessagesByWorkspace,
     persistUnread,
@@ -523,7 +534,11 @@ function App() {
   }, [selectedWorkspace]);
 
   useEffect(() => {
-    const validWorkspaceIds = new Set(workspaces.map((workspace) => workspace.id));
+    const validWorkspaceIds = new Set([
+      ...workspaces.map((workspace) => workspace.id),
+      ...godChildWorkspaces.map((workspace) => workspace.id),
+      ...godWorkspaces.map((workspace) => workspace.id),
+    ]);
     setUnreadByWorkspace((prev) => {
       let changed = false;
       const next: Record<string, number> = {};
@@ -569,7 +584,7 @@ function App() {
     // stale entries are harmless and cleaning them here causes selections to be
     // lost when switching repos (loadWorkspaces replaces the list with only the
     // current repo's workspaces, purging other repo entries).
-  }, [workspaces]);
+  }, [workspaces, godChildWorkspaces, godWorkspaces]);
 
   useEffect(() => {
     const unreadTotal = Object.values(unreadByWorkspace).reduce((sum, count) => sum + count, 0);
@@ -714,33 +729,33 @@ function App() {
     setAttachedFiles([]);
     // Skip backend calls for optimistic workspaces that don't exist in the backend yet.
     // The effect will re-fire when selectedWorkspace changes from tempId to the real ID.
-    const ws = workspaces.find((w) => w.id === selectedWorkspace);
+    const ws = workspaces.find((w) => w.id === selectedWorkspace) ?? godChildWorkspaces.find((w) => w.id === selectedWorkspace) ?? godWorkspaces.find((w) => w.id === selectedWorkspace);
     if (!ws || ws.status === "initializing") return;
     loadWorkspaceFiles(selectedWorkspace, "");
   }, [selectedWorkspace]);
 
   useEffect(() => {
     if (!selectedWorkspace) return;
-    const ws = workspaces.find((w) => w.id === selectedWorkspace);
+    const ws = workspaces.find((w) => w.id === selectedWorkspace) ?? godChildWorkspaces.find((w) => w.id === selectedWorkspace) ?? godWorkspaces.find((w) => w.id === selectedWorkspace);
     if (!ws || ws.status === "initializing") return;
     if (activeRightTab === "changes") {
       loadWorkspaceChanges(selectedWorkspace);
     }
-  }, [activeRightTab, selectedWorkspace, workspaces]);
+  }, [activeRightTab, selectedWorkspace, workspaces, godChildWorkspaces, godWorkspaces]);
 
   useEffect(() => {
     if (!selectedWorkspace) return;
-    const ws = workspaces.find((w) => w.id === selectedWorkspace);
+    const ws = workspaces.find((w) => w.id === selectedWorkspace) ?? godChildWorkspaces.find((w) => w.id === selectedWorkspace) ?? godWorkspaces.find((w) => w.id === selectedWorkspace);
     if (!ws || ws.status === "initializing") return;
     if (activeRightTab === "checks") {
       loadWorkspaceCheckDefinitions(selectedWorkspace);
     }
-  }, [activeRightTab, selectedWorkspace, workspaces]);
+  }, [activeRightTab, selectedWorkspace, workspaces, godChildWorkspaces, godWorkspaces]);
 
   useEffect(() => {
     if (!selectedWorkspace) return;
     void ensureAgentForWorkspace(selectedWorkspace);
-  }, [selectedWorkspace, workspaces]);
+  }, [selectedWorkspace, workspaces, godChildWorkspaces, godWorkspaces]);
 
   useEffect(() => {
     if (!selectedWorkspace) return;
@@ -827,6 +842,9 @@ function App() {
       
       const ag = await invoke<Agent[]>("list_agents");
       setAgents(ag);
+
+      const gws = await invoke<Workspace[]>("list_god_workspaces");
+      setGodWorkspaces(gws);
     } catch (err) {
       console.error("Failed to load initial state:", err);
       setError(String(err));
@@ -884,7 +902,10 @@ function App() {
   const handleTogglePin = useCallback(async (workspaceId: string) => {
     try {
       const updated = await invoke<Workspace>("toggle_workspace_pinned", { workspaceId });
-      setWorkspaces((prev) => prev.map((w) => (w.id === updated.id ? updated : w)));
+      const updater = (prev: Workspace[]) => prev.map((w) => (w.id === updated.id ? updated : w));
+      setWorkspaces(updater);
+      setGodChildWorkspaces(updater);
+      setGodWorkspaces(updater);
     } catch (err) {
       console.error("Failed to toggle pin:", err);
     }
@@ -941,7 +962,10 @@ function App() {
             workspaceId: activeId,
             status: newStatus,
           });
-          setWorkspaces((prev) => prev.map((w) => (w.id === updated.id ? updated : w)));
+          const updater = (prev: Workspace[]) => prev.map((w) => (w.id === updated.id ? updated : w));
+          setWorkspaces(updater);
+          setGodChildWorkspaces(updater);
+          setGodWorkspaces(updater);
           setWorkspaceGroupOverrides((prev) => {
             if (!prev[activeId]) return prev;
             const next = { ...prev };
@@ -964,10 +988,13 @@ function App() {
         reordered.forEach((w, idx) => {
           invoke("update_workspace_display_order", { workspaceId: w.id, displayOrder: idx }).catch(() => {});
         });
-        setWorkspaces((prev) => {
+        const reorderUpdater = (prev: Workspace[]) => {
           const updated = new Map(reordered.map((w, idx) => [w.id, idx]));
           return prev.map((w) => (updated.has(w.id) ? { ...w, displayOrder: updated.get(w.id)! } : w));
-        });
+        };
+        setWorkspaces(reorderUpdater);
+        setGodChildWorkspaces(reorderUpdater);
+        setGodWorkspaces(reorderUpdater);
       }
     }
   }
@@ -982,9 +1009,11 @@ function App() {
   async function saveWorkspaceNotes(workspaceId: string, notes: string) {
     try {
       await invoke("update_workspace_notes", { workspaceId, notes });
-      setWorkspaces((prev) =>
-        prev.map((w) => (w.id === workspaceId ? { ...w, notes: notes || null } : w)),
-      );
+      const updater = (prev: Workspace[]) =>
+        prev.map((w) => (w.id === workspaceId ? { ...w, notes: notes || null } : w));
+      setWorkspaces(updater);
+      setGodChildWorkspaces(updater);
+      setGodWorkspaces(updater);
     } catch (err) {
       console.error("Failed to save notes:", err);
     }
@@ -1066,8 +1095,12 @@ function App() {
     }
   }
 
+  const isGodMode = selectedGodWorkspace !== null;
+
   function handleSelectRepository(repoId: string) {
-    if (repoId === selectedRepo) return;
+    if (repoId === selectedRepo && !isGodMode) return;
+    // Exit god mode when selecting a repo
+    setSelectedGodWorkspace(null);
     // Save current workspace for the repo we're leaving
     if (selectedRepo && selectedWorkspace) {
       lastWorkspaceByRepoRef.current[selectedRepo] = selectedWorkspace;
@@ -1084,6 +1117,140 @@ function App() {
     pendingWorkspaceRestoreRef.current = repoId;
   }
 
+  function handleSelectGodWorkspace(godWsId: string) {
+    if (godWsId === selectedGodWorkspace) return;
+    // Save current selection for the god workspace we're leaving — including
+    // the god workspace's own ID, which is a valid selection (its chat panel).
+    if (selectedGodWorkspace && selectedWorkspace) {
+      lastChildByGodWorkspaceRef.current[selectedGodWorkspace] = selectedWorkspace;
+    }
+    // Save state for normal mode restoration
+    if (selectedRepo && selectedWorkspace) {
+      lastWorkspaceByRepoRef.current[selectedRepo] = selectedWorkspace;
+    }
+    setSelectedGodWorkspace(godWsId);
+    setSelectedRepo(null);
+    // Restore last-selected child, or default to the god workspace itself
+    const remembered = lastChildByGodWorkspaceRef.current[godWsId];
+    setSelectedWorkspace(remembered || godWsId);
+    setMessages([]);
+    // Invalidate any in-flight loadGodChildWorkspaces calls from a prior god workspace
+    godSwitchGenRef.current += 1;
+    setGodChildWorkspaces([]);
+    void loadGodChildWorkspaces(godWsId);
+  }
+
+  function handleSelectMyWorkspaces() {
+    if (!isGodMode) return;
+    setSelectedGodWorkspace(null);
+    setGodChildWorkspaces([]);
+    setMessages([]);
+    setSelectedWorkspace(null);
+    // Prefer the user's default repo; fall back to the last-selected repo,
+    // then to the first available repository.
+    const restoreRepo = defaultRepoId || selectedRepoRef.current || (repositories.length > 0 ? repositories[0].id : null);
+    if (restoreRepo) {
+      handleSelectRepository(restoreRepo);
+    }
+  }
+
+  async function loadGodChildWorkspaces(godWsId: string) {
+    const gen = godSwitchGenRef.current;
+    try {
+      const children = await invoke<Workspace[]>("list_god_child_workspaces", { godWorkspaceId: godWsId });
+      // Discard results if user switched god workspaces while we were loading
+      if (godSwitchGenRef.current !== gen) return;
+      setGodChildWorkspaces((prev) => {
+        // Preserve optimistic entries (status=initializing) not yet in the DB,
+        // matching the same pattern used in loadWorkspaces.
+        const dbIds = new Set(children.map((w) => w.id));
+        const optimistic = prev.filter((w) => w.status === "initializing" && !dbIds.has(w.id));
+        return optimistic.length > 0 ? [...children, ...optimistic] : children;
+      });
+      // Three-Array Rule: also patch child entries that live in workspaces
+      const updatedMap = new Map(children.map((w) => [w.id, w]));
+      setWorkspaces((prev) => prev.map((w) => updatedMap.get(w.id) ?? w));
+    } catch (err) {
+      if (godSwitchGenRef.current !== gen) return;
+      setError(String(err));
+    }
+  }
+
+  async function handleCreateGodWorkspace() {
+    const trimmed = godWorkspaceName.trim();
+    if (!trimmed) return;
+    if (!defaultRepoId) {
+      setError("Please star a default repository first");
+      return;
+    }
+    try {
+      const gw = await invoke<Workspace>("create_god_workspace", { repoId: defaultRepoId, name: trimmed });
+      setGodWorkspaces((prev) => [gw, ...prev]);
+      setGodWorkspaceName("");
+      setShowCreateGodWorkspace(false);
+      // Auto-select and start the agent so the god workspace is immediately usable
+      handleSelectGodWorkspace(gw.id);
+      await startAgent(gw.id);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function handleRemoveGodWorkspace(id: string) {
+    const gw = godWorkspaces.find((g) => g.id === id);
+    if (!window.confirm(`Delete god workspace "${gw?.name ?? id}" and all its child workspaces?`)) return;
+    try {
+      // Collect child IDs from both arrays (godChildWorkspaces only holds the
+      // currently-selected god workspace's children, so also check workspaces
+      // which contains children added during this session).
+      const childIds = new Set([
+        ...godChildWorkspaces.filter((w) => w.parentGodWorkspaceId === id).map((w) => w.id),
+        ...workspaces.filter((w) => w.parentGodWorkspaceId === id).map((w) => w.id),
+      ]);
+      // Include the god workspace itself for agent/timer cleanup
+      const allRemovedIds = new Set([...childIds, id]);
+
+      await invoke("remove_god_workspace", { id });
+
+      setGodWorkspaces((prev) => prev.filter((gw) => gw.id !== id));
+      setGodChildWorkspaces((prev) => prev.filter((w) => w.parentGodWorkspaceId !== id));
+      setWorkspaces((prev) => prev.filter((w) => !allRemovedIds.has(w.id)));
+      setAgents((prev) => prev.filter((a) => !allRemovedIds.has(a.workspaceId)));
+      setThinkingSinceByWorkspace((prev) => {
+        const next = { ...prev };
+        for (const wid of allRemovedIds) delete next[wid];
+        return next;
+      });
+      setPendingAutoPromptsByWorkspace((prev) => {
+        const next = { ...prev };
+        for (const wid of allRemovedIds) delete next[wid];
+        return next;
+      });
+      setSelectedModelByWorkspace((prev) => {
+        let changed = false;
+        for (const wid of allRemovedIds) { if (wid in prev) { changed = true; break; } }
+        if (!changed) return prev;
+        const next = { ...prev };
+        for (const wid of allRemovedIds) delete next[wid];
+        return next;
+      });
+      setWorkspaceGroupOverrides((prev) => {
+        let changed = false;
+        for (const wid of allRemovedIds) { if (wid in prev) { changed = true; break; } }
+        if (!changed) return prev;
+        const next = { ...prev };
+        for (const wid of allRemovedIds) delete next[wid];
+        return next;
+      });
+
+      if (selectedGodWorkspace === id) {
+        handleSelectMyWorkspaces();
+      }
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
   function setDefaultRepository(repoId: string) {
     setDefaultRepoId(repoId);
     handleSelectRepository(repoId);
@@ -1091,15 +1258,20 @@ function App() {
 
   async function removeRepository(repoId: string) {
     try {
-      const removedWorkspaceIds = new Set(
-        workspaces.filter((workspace) => workspace.repoId === repoId).map((workspace) => workspace.id),
-      );
+      // Collect IDs from all three workspace arrays for downstream cleanup
+      const removedWorkspaceIds = new Set([
+        ...workspaces.filter((w) => w.repoId === repoId).map((w) => w.id),
+        ...godChildWorkspaces.filter((w) => w.repoId === repoId).map((w) => w.id),
+        ...godWorkspaces.filter((w) => w.repoId === repoId).map((w) => w.id),
+      ]);
 
       await invoke("remove_repository", { repoId });
 
       const remainingRepos = repositories.filter((repo) => repo.id !== repoId);
       setRepositories(remainingRepos);
       setWorkspaces((prev) => prev.filter((workspace) => workspace.repoId !== repoId));
+      setGodChildWorkspaces((prev) => prev.filter((workspace) => workspace.repoId !== repoId));
+      setGodWorkspaces((prev) => prev.filter((workspace) => workspace.repoId !== repoId));
       setAgents((prev) => prev.filter((agent) => !removedWorkspaceIds.has(agent.workspaceId)));
       setPendingAutoPromptsByWorkspace((prev) => {
         const next = { ...prev };
@@ -1133,6 +1305,34 @@ function App() {
   }
 
   async function createWorkspace(inputName: string) {
+    // In God mode, create a child workspace
+    if (isGodMode && selectedGodWorkspace) {
+      if (!inputName.trim() || !defaultRepoId) {
+        setError("Please star a default repository first");
+        return;
+      }
+      try {
+        const workspace = await invoke<Workspace>("create_god_child_workspace", {
+          godWorkspaceId: selectedGodWorkspace,
+          repoId: defaultRepoId,
+          name: inputName.trim(),
+        });
+        setGodChildWorkspaces((prev) => [...prev, workspace]);
+        // Also add to workspaces so event handlers and lookups that only scan
+        // workspaces (e.g. agent-run-state, removeWorkspaceImplRef) can find it.
+        setWorkspaces((prev) => [...prev, workspace]);
+        setSelectedWorkspace(workspace.id);
+        if (selectedGodWorkspace) {
+          lastChildByGodWorkspaceRef.current[selectedGodWorkspace] = workspace.id;
+        }
+        void loadConfigRef.current(workspace.id);
+        setShowCreateForm(false);
+      } catch (err) {
+        setError(String(err));
+      }
+      return;
+    }
+
     if (!inputName.trim() || !selectedRepo) return;
 
     // Check if git is busy (Conductor pattern: git-busy-check)
@@ -1214,7 +1414,10 @@ function App() {
       }
 
       await invoke("remove_workspace", { workspaceId });
+      // Remove from all three workspace arrays (harmless no-op on the "wrong" arrays)
       setWorkspaces(prev => prev.filter(w => w.id !== workspaceId));
+      setGodChildWorkspaces(prev => prev.filter(w => w.id !== workspaceId));
+      setGodWorkspaces(prev => prev.filter(w => w.id !== workspaceId));
       setThinkingSinceByWorkspace((prev) => {
         const next = { ...prev };
         delete next[workspaceId];
@@ -1238,7 +1441,8 @@ function App() {
         return next;
       });
       if (selectedWorkspace === workspaceId) {
-        const remaining = workspaces.filter(w => w.id !== workspaceId);
+        const sourceList = isGodMode ? godChildWorkspaces : workspaces;
+        const remaining = sourceList.filter(w => w.id !== workspaceId);
         const next = remaining.length > 0 ? remaining[0].id : null;
         setSelectedWorkspace(next);
         if (!next) setMessages([]);
@@ -1266,7 +1470,10 @@ function App() {
         workspaceId: renameDialogWorkspace.id,
         name: newName.trim(),
       });
-      setWorkspaces((prev) => prev.map((workspace) => (workspace.id === updated.id ? updated : workspace)));
+      const updater = (prev: Workspace[]) => prev.map((workspace) => (workspace.id === updated.id ? updated : workspace));
+      setWorkspaces(updater);
+      setGodChildWorkspaces(updater);
+      setGodWorkspaces(updater);
       setRenameDialogWorkspace(null);
     } catch (err) {
       console.error("Failed to rename workspace:", err);
@@ -1282,7 +1489,12 @@ function App() {
       });
       setAgents(prev => [...prev, agent]);
       const currentRepo = selectedRepoRef.current;
-      if (currentRepo) await loadWorkspaces(currentRepo);
+      const currentGodWs = selectedGodWorkspaceRef.current;
+      if (currentRepo) {
+        await loadWorkspaces(currentRepo);
+      } else if (currentGodWs) {
+        await loadGodChildWorkspaces(currentGodWs);
+      }
     } catch (err) {
       console.error("Failed to start agent:", err);
       setError(String(err));
@@ -1290,7 +1502,7 @@ function App() {
   }
 
   async function ensureAgentForWorkspace(workspaceId: string) {
-    const workspace = workspaces.find((w) => w.id === workspaceId);
+    const workspace = workspaces.find((w) => w.id === workspaceId) ?? godChildWorkspaces.find((w) => w.id === workspaceId) ?? godWorkspaces.find((w) => w.id === workspaceId);
     if (!workspace || workspace.status === "initializing") return;
 
     const hasRunningAgent = agents.some(
@@ -1317,7 +1529,12 @@ function App() {
         setThinkingSinceByWorkspace((prev) => ({ ...prev, [stoppedWorkspaceId]: null }));
       }
       const currentRepo = selectedRepoRef.current;
-      if (currentRepo) await loadWorkspaces(currentRepo);
+      const currentGodWs = selectedGodWorkspaceRef.current;
+      if (currentRepo) {
+        await loadWorkspaces(currentRepo);
+      } else if (currentGodWs) {
+        await loadGodChildWorkspaces(currentGodWs);
+      }
     } catch (err) {
       console.error("Failed to stop agent:", err);
       setError(String(err));
@@ -1626,7 +1843,7 @@ function App() {
       }
     }
 
-    const workspace = workspaces.find((item) => item.id === effectiveWorkspaceId);
+    const workspace = workspaces.find((item) => item.id === effectiveWorkspaceId) ?? godChildWorkspaces.find((item) => item.id === effectiveWorkspaceId) ?? godWorkspaces.find((item) => item.id === effectiveWorkspaceId);
     if (!workspace) {
       setError("Workspace not found");
       return false;
@@ -1739,8 +1956,9 @@ function App() {
 
   const handleSelectWorkspace = useCallback((workspaceId: string) => {
     setSelectedWorkspace(workspaceId);
-    // Remember this workspace for the current repo so we can restore it later
+    // Remember this workspace for the current repo/god-workspace so we can restore it later
     if (selectedRepoRef.current) lastWorkspaceByRepoRef.current[selectedRepoRef.current] = workspaceId;
+    if (selectedGodWorkspaceRef.current) lastChildByGodWorkspaceRef.current[selectedGodWorkspaceRef.current] = workspaceId;
     // Close the sidebar overlay on mobile; leave it open on desktop
     if (window.innerWidth < 1024) setIsLeftPanelOpen(false);
     void ensureAgentRef.current(workspaceId);
@@ -1793,7 +2011,7 @@ function App() {
   }
 
   async function addFilesToComposer() {
-    const workspace = workspaces.find((item) => item.id === selectedWorkspace);
+    const workspace = workspaces.find((item) => item.id === selectedWorkspace) ?? godChildWorkspaces.find((item) => item.id === selectedWorkspace) ?? godWorkspaces.find((item) => item.id === selectedWorkspace);
     if (!workspace) return;
 
     try {
@@ -2265,10 +2483,11 @@ function App() {
 
   const workspaceGroups = useMemo(
     () => {
+      const displayedWorkspaces = isGodMode ? godChildWorkspaces : workspaces;
       const claimed = new Set<string>();
       // Pass 1: assign workspaces with overrides or matching statuses
       const groups = workspaceGroupConfig.map((group) => {
-        const items = workspaces.filter((ws) => {
+        const items = displayedWorkspaces.filter((ws) => {
           if (claimed.has(ws.id)) return false;
           // If workspace has an explicit group override, respect it
           const override = workspaceGroupOverrides[ws.id];
@@ -2286,7 +2505,7 @@ function App() {
         return { key: group.id, label: group.label, statuses: group.statuses, items, itemIds: [...items.map((w) => w.id), `group:${group.id}`] };
       });
       // Pass 2: put unclaimed workspaces into the first status-free group (catch-all)
-      const unclaimed = workspaces.filter((ws) => !claimed.has(ws.id));
+      const unclaimed = displayedWorkspaces.filter((ws) => !claimed.has(ws.id));
       if (unclaimed.length > 0) {
         const catchAll = groups.find((g) => g.statuses.length === 0);
         if (catchAll) {
@@ -2296,7 +2515,7 @@ function App() {
       }
       return groups;
     },
-    [workspaces, workspaceGroupConfig, workspaceGroupOverrides],
+    [workspaces, godChildWorkspaces, isGodMode, workspaceGroupConfig, workspaceGroupOverrides],
   );
 
   // Keyboard shortcuts that depend on workspaceGroups (visual order) and repositories
@@ -2339,7 +2558,10 @@ function App() {
   }, [workspaceGroups, selectedWorkspace, repositories, resolvedShortcuts]);
 
   const currentRepo = useMemo(() => repositories.find(r => r.id === selectedRepo), [repositories, selectedRepo]);
-  const currentWorkspace = useMemo(() => workspaces.find(w => w.id === selectedWorkspace), [workspaces, selectedWorkspace]);
+  // Unified lookup across all workspace arrays — used by effects and handlers
+  // that need to find a workspace by ID regardless of whether it's regular, god, or god-child.
+  const allWorkspaces = useMemo(() => [...workspaces, ...godChildWorkspaces, ...godWorkspaces], [workspaces, godChildWorkspaces, godWorkspaces]);
+  const currentWorkspace = useMemo(() => allWorkspaces.find(w => w.id === selectedWorkspace), [allWorkspaces, selectedWorkspace]);
   const workspaceAgents = useMemo(() => agents.filter(a => a.workspaceId === selectedWorkspace), [agents, selectedWorkspace]);
   const isAutoStartingCurrentWorkspace = autoStartingWorkspaceId === selectedWorkspace;
   const currentThinkingSince = selectedWorkspace
@@ -2663,6 +2885,89 @@ function App() {
         </div>
 
         <div className="flex-1 overflow-y-auto md-px-4 md-py-4" style={{ zoom: sidebarFontSize / 12 }}>
+          {/* Mode Switcher: My Workspaces + God Workspaces */}
+          <div className="mb-4">
+            <div className="space-y-1">
+              <div
+                className={`md-list-item flex cursor-pointer items-center gap-2 md-px-2 md-py-1.5 ${
+                  !isGodMode ? "md-list-item-active" : ""
+                }`}
+                onClick={handleSelectMyWorkspaces}
+                onKeyDown={(e) => e.key === "Enter" && handleSelectMyWorkspaces()}
+                role="button"
+                tabIndex={0}
+              >
+                <span className="material-symbols-rounded !text-[16px]">home</span>
+                <p className="truncate text-xs md-text-primary">My Workspaces</p>
+              </div>
+              {godWorkspaces.map((gw) => (
+                <div
+                  key={gw.id}
+                  className={`md-list-item flex cursor-pointer items-center gap-2 md-px-2 md-py-1.5 ${
+                    selectedGodWorkspace === gw.id ? "md-list-item-active" : ""
+                  }`}
+                  onClick={() => handleSelectGodWorkspace(gw.id)}
+                  onKeyDown={(e) => e.key === "Enter" && handleSelectGodWorkspace(gw.id)}
+                  role="button"
+                  tabIndex={0}
+                >
+                  <span className="material-symbols-rounded !text-[16px]">hub</span>
+                  <p className="min-w-0 flex-1 truncate text-xs md-text-primary">{gw.name}</p>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleRemoveGodWorkspace(gw.id);
+                    }}
+                    className="md-icon-plain md-icon-plain-danger"
+                    title="Remove god workspace"
+                    aria-label={`Remove ${gw.name}`}
+                  >
+                    <span className="material-symbols-rounded !text-[16px]">delete</span>
+                  </button>
+                </div>
+              ))}
+              {showCreateGodWorkspace ? (
+                <form
+                  className="flex items-center gap-1 md-px-2 md-py-1"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void handleCreateGodWorkspace();
+                  }}
+                >
+                  <input
+                    type="text"
+                    value={godWorkspaceName}
+                    onChange={(e) => setGodWorkspaceName(e.target.value)}
+                    placeholder="God workspace name"
+                    className="min-w-0 flex-1 rounded border px-2 py-1 text-xs md-outline md-surface-variant md-text-primary"
+                    autoFocus
+                    onBlur={() => {
+                      if (!godWorkspaceName.trim()) setShowCreateGodWorkspace(false);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setShowCreateGodWorkspace(false);
+                    }}
+                  />
+                  <button type="submit" className="md-icon-plain" title="Create">
+                    <span className="material-symbols-rounded !text-[16px]">check</span>
+                  </button>
+                </form>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setShowCreateGodWorkspace(true)}
+                  className="flex w-full items-center gap-2 md-px-2 md-py-1.5 text-xs md-text-muted hover:md-text-primary"
+                >
+                  <span className="material-symbols-rounded !text-[16px]">add</span>
+                  God Workspace
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Repositories — hidden in God mode */}
+          {!isGodMode && (
           <div className="mb-4">
             <div className="mb-2 flex items-center justify-between md-px-1">
               <h2 className="md-title-small">Repositories</h2>
@@ -2729,6 +3034,7 @@ function App() {
               </div>
             )}
           </div>
+          )}
 
           <div className="mb-4 flex items-center justify-between md-px-1">
             <h2 className="md-title-small">Workspaces</h2>
@@ -2746,9 +3052,9 @@ function App() {
                 type="button"
                 onClick={openCreateWorkspaceForm}
                 className="md-icon-plain rounded-full border md-outline disabled:cursor-not-allowed disabled:opacity-45"
-                disabled={!selectedRepo}
-                title={selectedRepo ? "Add workspace" : "Select a repository first"}
-                aria-label={selectedRepo ? "Add workspace" : "Select a repository first"}
+                disabled={!selectedRepo && !isGodMode}
+                title={selectedRepo || isGodMode ? "Add workspace" : "Select a repository first"}
+                aria-label={selectedRepo || isGodMode ? "Add workspace" : "Select a repository first"}
               >
                 <span className="material-symbols-rounded !text-[18px]">add</span>
               </button>
@@ -2785,6 +3091,7 @@ function App() {
                         workspace={workspace}
                         isSelected={selectedWorkspace === workspace.id}
                         unreadCount={unreadByWorkspace[workspace.id] || 0}
+                        repoName={isGodMode ? repositories.find((r) => r.id === workspace.repoId)?.name : undefined}
                         onSelect={handleSelectWorkspace}
                         onTogglePin={handleTogglePin}
                         onRename={openRenameWorkspaceForm}
@@ -2801,7 +3108,8 @@ function App() {
             ))}
             <DragOverlay>
               {dragActiveId ? (() => {
-                const ws = workspaces.find((w) => w.id === dragActiveId);
+                const displayedWs = isGodMode ? godChildWorkspaces : workspaces;
+                const ws = displayedWs.find((w) => w.id === dragActiveId);
                 return ws ? (
                   <div className="rounded-lg border md-outline md-surface-container-high px-3 py-2 shadow-lg">
                     <span className="md-body-small md-text-primary">{ws.name}</span>

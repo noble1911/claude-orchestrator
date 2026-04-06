@@ -12,11 +12,48 @@ use crate::helpers::*;
 use crate::types::*;
 use crate::AppState;
 
+/// Validate that a workspace name is safe for use as a directory name and git branch component.
+/// Rejects path traversal attempts, git-invalid characters, and reserved patterns.
+pub fn validate_workspace_name(name: &str) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Workspace name cannot be empty".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        return Err("Workspace name must not contain '/', '\\', or '..'".to_string());
+    }
+    if trimmed.starts_with('.') {
+        return Err("Workspace name must not start with '.'".to_string());
+    }
+    // Characters invalid in git ref names (git check-ref-format):
+    // control chars (0x00–0x1F, 0x7F) and specific git-invalid punctuation
+    for ch in trimmed.chars() {
+        if ch.is_ascii_control() {
+            return Err("Workspace name must not contain control characters".to_string());
+        }
+        if matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | ' ' | '\t') {
+            return Err(format!("Workspace name contains invalid character: '{}'", ch));
+        }
+    }
+    if trimmed.ends_with('.') {
+        return Err("Workspace name must not end with '.'".to_string());
+    }
+    if trimmed.ends_with(".lock") || trimmed.contains("@{") {
+        return Err("Workspace name contains a reserved git pattern".to_string());
+    }
+    Ok(())
+}
+
 pub fn list_workspaces(state: &AppState, repo_id: Option<String>) -> Result<Vec<Workspace>, String> {
     let workspaces = state.workspaces.read();
     let result: Vec<Workspace> = workspaces
         .values()
-        .filter(|w| repo_id.as_ref().map_or(true, |id| &w.repo_id == id))
+        .filter(|w| {
+            // Exclude child workspaces and god workspaces from normal listing
+            !w.is_god
+                && w.parent_god_workspace_id.is_none()
+                && repo_id.as_ref().map_or(true, |id| &w.repo_id == id)
+        })
         .cloned()
         .collect();
     Ok(result)
@@ -94,6 +131,8 @@ pub fn create_workspace(
     repo_id: String,
     name: String,
 ) -> Result<Workspace, String> {
+    validate_workspace_name(&name)?;
+
     let repo = {
         let repos = state.repositories.read();
         repos.get(&repo_id).cloned().ok_or("Repository not found")?
@@ -108,61 +147,92 @@ pub fn create_workspace(
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
     create_worktree(&repo.path, &worktree_path_str, &branch, &repo.default_branch)?;
 
-    let workspace = Workspace {
-        id: new_id(),
-        repo_id,
-        name,
-        branch,
-        worktree_path: worktree_path_str,
-        status: WorkspaceStatus::Idle,
-        last_activity: None,
-        pr_url: None,
-        unread: 0,
-        display_order: 0,
-        pinned_at: None,
-        notes: None,
-    };
+    // Keep a clone for cleanup since worktree_path_str moves into the Workspace struct
+    let worktree_path_str_clone = worktree_path_str.clone();
+    let repo_path = repo.path.clone();
 
-    state
-        .db
-        .insert_workspace(&workspace)
-        .map_err(|e| format!("Failed to save workspace: {}", e))?;
+    // Run the remaining fallible steps. If any fail, clean up the worktree.
+    let result = (|| -> Result<Workspace, String> {
+        let workspace = Workspace {
+            id: new_id(),
+            repo_id,
+            name,
+            branch,
+            worktree_path: worktree_path_str,
+            status: WorkspaceStatus::Idle,
+            last_activity: None,
+            pr_url: None,
+            unread: 0,
+            display_order: 0,
+            pinned_at: None,
+            notes: None,
+            parent_god_workspace_id: None,
+            is_god: false,
+        };
 
-    let mut workspaces = state.workspaces.write();
-    workspaces.insert(workspace.id.clone(), workspace.clone());
-    Ok(workspace)
+        state
+            .db
+            .insert_workspace(&workspace)
+            .map_err(|e| format!("Failed to save workspace: {}", e))?;
+
+        let mut workspaces = state.workspaces.write();
+        workspaces.insert(workspace.id.clone(), workspace.clone());
+        Ok(workspace)
+    })();
+
+    if result.is_err() {
+        let _ = remove_worktree(&repo_path, &worktree_path_str_clone);
+        let _ = remove_workspace_directory(&repo_path, &worktree_path_str_clone);
+    }
+
+    result
 }
 
 /// Remove a workspace. Cleans up agents, worktree, and database record.
 /// Bug fix: the original Tauri command was missing agent cleanup.
 pub fn remove_workspace(state: &AppState, workspace_id: String) -> Result<(), String> {
-    let (repo_path, worktree_path) = {
+    let (repo_id, worktree_path) = {
         let workspaces = state.workspaces.read();
         let workspace = workspaces
             .get(&workspace_id)
             .ok_or(ERR_WORKSPACE_NOT_FOUND)?;
+        (workspace.repo_id.clone(), workspace.worktree_path.clone())
+    };
+    let repo_path = {
         let repos = state.repositories.read();
-        let repo = repos
-            .get(&workspace.repo_id)
-            .ok_or("Repository not found")?;
-        (repo.path.clone(), workspace.worktree_path.clone())
+        repos
+            .get(&repo_id)
+            .ok_or("Repository not found")?
+            .path
+            .clone()
     };
 
-    // Clean up agents for this workspace
+    // Stop running agents: send SIGINT to kill the Claude CLI process, then
+    // clean up agent state (end session, update workspace status). Without this,
+    // the spawned CLI thread would keep running as a zombie after removal.
+    let agent_ids: Vec<String> = {
+        let agents = state.agents.read();
+        agents
+            .values()
+            .filter(|a| a.workspace_id == workspace_id)
+            .map(|a| a.id.clone())
+            .collect()
+    };
+    for agent_id in &agent_ids {
+        if let Err(e) = super::agent::interrupt_agent(state, agent_id.clone()) {
+            tracing::warn!("Failed to interrupt agent {} during workspace removal: {}", agent_id, e);
+        }
+        if let Err(e) = super::agent::stop_agent(state, agent_id.clone()) {
+            tracing::warn!("Failed to stop agent {} during workspace removal: {}", agent_id, e);
+        }
+    }
+    // Clean up leaked child_pids and agent_stdin entries
     {
-        let mut agents = state.agents.write();
-        let dead: Vec<String> = agents
-            .iter()
-            .filter_map(|(id, agent)| {
-                if agent.workspace_id == workspace_id {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for agent_id in dead {
-            agents.remove(&agent_id);
+        let mut pids = state.child_pids.write();
+        let mut stdin = state.agent_stdin.write();
+        for agent_id in &agent_ids {
+            pids.remove(agent_id);
+            stdin.remove(agent_id);
         }
     }
 

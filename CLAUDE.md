@@ -26,9 +26,17 @@ claude-orchestrator/
 │   │   │   └── runner.rs        # Shared execution loop (run_claude_message)
 │   │   ├── git.rs               # Worktree ops, branch detection, orchestrator config
 │   │   ├── types.rs             # Shared structs/enums (extracted Phase 1)
+│   │   ├── commands/            # Tauri command modules
+│   │   │   ├── mod.rs           # Module root
+│   │   │   ├── agent.rs         # Agent start/stop/interrupt/messages
+│   │   │   ├── workspace.rs     # Workspace CRUD, terminal, scripts
+│   │   │   └── god_workspace.rs # God workspace create/remove/list
 │   │   ├── helpers.rs           # Shared helpers: now_rfc3339(), new_id(), constants
 │   │   ├── database.rs          # SQLite schema & CRUD operations
+│   │   ├── http_server.rs       # HTTP server: REST API (port 3002), permission bridge, web client
 │   │   └── websocket_server.rs  # WebSocket server for mobile/web clients
+│   ├── resources/
+│   │   └── god-workspace-skill.md  # Bundled skill (embedded via include_str!)
 │   ├── Cargo.toml
 │   └── tauri.conf.json
 │
@@ -83,6 +91,15 @@ Claude CLI instances running in a workspace. Agents:
 - Run in background threads to avoid blocking the UI
 - Support configurable model selection (Opus/Sonnet/Haiku) per workspace
 - Support plan mode vs normal mode per workspace
+
+### God Workspaces
+A meta-workspace (`is_god = true`) that orchestrates child workspaces via an HTTP REST API on port 3002.
+- Lives in `<repo>/.worktrees/god-<name>/` with branch `god/<name>`
+- Has its own Claude agent that uses `curl` to control child workspace agents
+- Bearer token auth (UUID stored in `app_settings` DB table, injected as `ORCHESTRATOR_API_TOKEN` env var)
+- Bundled skill file installed to `~/.claude/skills/god-workspace/SKILL.md` (user-level, not worktree)
+- **Three workspace arrays in React state**: `workspaces`, `godChildWorkspaces`, `godWorkspaces`
+- **HTTP server**: `src-tauri/src/http_server.rs` — REST API + MCP permission bridge + optional web client
 
 ### Sessions
 Persist Claude conversation state across app restarts using stored session IDs.
@@ -173,8 +190,12 @@ When an agent is busy (thinking), new messages are queued and sent automatically
 | `src-tauri/src/claude/` | Claude CLI integration: discovery, env, models, stream, runner (~1,900 lines) |
 | `src-tauri/src/git.rs` | Git worktree ops, branch detection, orchestrator config (~170 lines) |
 | `src-tauri/src/types.rs` | Shared structs/enums (extracted Phase 1) |
-| `src-tauri/src/helpers.rs` | Shared helpers: `now_rfc3339()`, `new_id()`, constants |
-| `src-tauri/src/database.rs` | SQLite schema and CRUD operations |
+| `src-tauri/src/commands/god_workspace.rs` | God workspace create/remove/list, skill installation |
+| `src-tauri/src/commands/agent.rs` | Agent start/stop/interrupt, permission handling |
+| `src-tauri/src/commands/workspace.rs` | Workspace CRUD, terminal, orchestrator scripts |
+| `src-tauri/src/helpers.rs` | Shared helpers: `now_rfc3339()`, `new_id()`, `fixed_length_constant_time_eq` |
+| `src-tauri/src/database.rs` | SQLite schema, CRUD operations, `app_settings` key-value store |
+| `src-tauri/src/http_server.rs` | HTTP REST API (port 3002), MCP permission bridge, web client |
 | `src-tauri/src/websocket_server.rs` | WebSocket server for remote clients |
 | `src/types.ts` | All shared TypeScript interfaces & type aliases |
 | `src/constants.ts` | Storage keys, defaults, model options |
@@ -211,13 +232,29 @@ Mobile clients connect to `ws://localhost:3001` and can send:
 {"type": "stop_agent", "workspace_id": "<uuid>"}
 ```
 
+## HTTP REST API (God Workspace)
+
+God workspace agents interact with the orchestrator via `http://localhost:3002`. All orchestrator endpoints require bearer token auth (`Authorization: Bearer <token>`). Body size limit: 512 KB.
+
+```
+GET  /api/workspaces?god_workspace_id=<id>   # List child workspaces (god_workspace_id required)
+POST /api/workspaces/create                   # Create child workspace
+POST /api/workspace/start-agent               # Start agent in workspace
+POST /api/workspace/send                      # Send message to agent (409 if busy)
+POST /api/workspace/stop-agent                # Stop agent
+GET  /api/workspace/messages?workspace_id=<id># Get message history
+GET  /api/workspace/status?workspace_id=<id>  # Get workspace status
+POST /api/permission                          # MCP permission bridge (no token required)
+```
+
 ## Database Schema
 
 ```sql
 -- repositories: Added git repos
--- workspaces: Isolated worktrees per repo (with status, displayOrder, pinnedAt, notes, prUrl)
+-- workspaces: Isolated worktrees per repo (with status, displayOrder, pinnedAt, notes, prUrl, isGod, parentGodWorkspaceId)
 -- sessions: Claude conversation sessions
 -- messages: Full conversation history
+-- app_settings: Key-value store (e.g., api_token for HTTP bearer auth)
 ```
 
 ## Common Tasks
@@ -258,6 +295,7 @@ Mobile clients connect to `ws://localhost:3001` and can send:
 
 ## Anti-Patterns
 
+### General
 - Don't use `tokio::spawn` for Claude CLI - use `std::thread::spawn` (avoids runtime conflicts)
 - Don't hold RwLock guards across await points
 - Don't block the main thread with synchronous operations
@@ -269,6 +307,30 @@ Mobile clients connect to `ws://localhost:3001` and can send:
 - Don't add new modal dialogs inline in `App.tsx` — use `<Modal>` component in `components/dialogs/`
 - Don't hardcode magic numbers — define named constants (e.g., `MAX_FILE_READ_BYTES`, `WORKTREES_DIR`)
 - Don't add new `setError(String(err))` catch blocks — use `wrapCommand()` helper (once extracted)
+
+### Three-Array Rule (God Workspaces)
+Every `setWorkspaces(prev => prev.map(...))` or `prev.filter(...)` call **must also call `setGodChildWorkspaces` and `setGodWorkspaces`** with the same updater. The updater is a harmless no-op on arrays that don't contain a matching ID (React skips re-render when the reference is unchanged). Forgetting one of the three causes ghost entries that persist in the UI after deletion, or stale data after renames/pins/status changes.
+
+**Affected handlers** (non-exhaustive): `handleTogglePin`, `handleDragEnd`, `saveWorkspaceNotes`, `handleRenameWorkspace`, `removeWorkspaceImplRef`, `removeRepository`, PR URL detection in `useAgentEvents`.
+
+### Rust Lock Ordering
+- Never hold two `RwLock` guards (`workspaces` + `agents`, `workspaces` + `repos`) simultaneously — collect data, drop the first lock, then acquire the second
+- If you must read from two maps, clone the data from the first into a `Vec`/`HashMap`, drop the guard, then acquire the second
+
+### Agent Status vs Processing
+- `Agent.status` (`Running`/`Stopped`/`Starting`/`Error`) tracks **lifecycle** — whether the agent process exists. It does NOT track per-message busy state.
+- `Agent.processing` (`bool`, `#[serde(skip)]`) tracks whether the agent is **currently processing a message** from the HTTP API. Only the HTTP handler sets it `true`; the `ProcessingGuard` drop resets it.
+- Don't use `Agent.status` to detect if an agent is busy between messages — it stays `Running` from creation until `stop_agent`.
+
+### Optimistic State Preservation
+When loading workspace lists from the backend (`loadWorkspaces`, `loadGodChildWorkspaces`), use `setX(prev => ...)` and preserve any entries with `status === "initializing"` that aren't in the fresh DB result. Without this, a concurrent load wipes optimistic entries before `create_workspace` returns.
+
+### Security
+- Never log or `eprintln!` environment variables that may contain secrets (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`, `ORCHESTRATOR_API_TOKEN`, etc.)
+- Use `fixed_length_constant_time_eq` for token comparison — do NOT use `==` on secret strings
+- HTTP API endpoints that accept POST bodies must have an explicit `DefaultBodyLimit`
+- Skill files go to user-level `~/.claude/skills/`, not worktree-level `.claude/skills/` — worktree placement pollutes `git status` and risks accidental commits
+- HTTP API endpoints must scope results by `god_workspace_id` — all god workspaces share a single bearer token, so unscoped endpoints leak data across god workspace boundaries
 
 ## Refactoring Roadmap
 

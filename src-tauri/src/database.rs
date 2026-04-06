@@ -58,6 +58,19 @@ impl Database {
                 FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
             );
 
+            -- Legacy table: kept only so the Phase 3 migration can copy
+            -- existing rows into the workspaces table (is_god = 1).
+            -- New god workspaces are created directly in `workspaces`.
+            CREATE TABLE IF NOT EXISTS god_workspaces (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
+                worktree_path TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'idle',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (repo_id) REFERENCES repositories(id)
+            );
+
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -67,6 +80,11 @@ impl Database {
                 is_error INTEGER NOT NULL DEFAULT 0,
                 timestamp TEXT NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             "#,
         )?;
@@ -102,6 +120,35 @@ impl Database {
         if conn.prepare("SELECT notes FROM workspaces LIMIT 0").is_err() {
             conn.execute_batch("ALTER TABLE workspaces ADD COLUMN notes TEXT")?;
         }
+
+        // God workspace support: link child workspaces to their parent god workspace
+        if conn.prepare("SELECT parent_god_workspace_id FROM workspaces LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE workspaces ADD COLUMN parent_god_workspace_id TEXT")?;
+        }
+
+        // God workspace unification: is_god flag on workspaces table
+        if conn.prepare("SELECT is_god FROM workspaces LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE workspaces ADD COLUMN is_god INTEGER DEFAULT 0")?;
+        }
+
+        // Migrate any existing god_workspaces into the workspaces table
+        let has_god_table = conn
+            .prepare("SELECT id FROM god_workspaces LIMIT 0")
+            .is_ok();
+        if has_god_table {
+            // Copy god_workspaces that aren't already in workspaces
+            conn.execute_batch(
+                r#"
+                INSERT OR IGNORE INTO workspaces (id, repo_id, name, branch, worktree_path, status, is_god)
+                SELECT id, repo_id, name, 'god/' || REPLACE(LOWER(name), ' ', '-'), worktree_path, status, 1
+                FROM god_workspaces
+                WHERE id NOT IN (SELECT id FROM workspaces);
+                "#,
+            )?;
+        }
+
+        // Backfill: normalize NULL is_god to 0 so queries can use simple `is_god = 0`
+        conn.execute("UPDATE workspaces SET is_god = 0 WHERE is_god IS NULL", [])?;
 
         // Session enhancements
         if conn.prepare("SELECT unread_count FROM sessions LIMIT 0").is_err() {
@@ -167,14 +214,15 @@ impl Database {
         let conn = self.conn.lock();
         let status_str = workspace_status_to_str(&ws.status);
         conn.execute(
-            "INSERT OR REPLACE INTO workspaces (id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![ws.id, ws.repo_id, ws.name, ws.branch, ws.worktree_path, status_str, ws.last_activity, ws.pr_url, ws.unread, ws.display_order, ws.pinned_at, ws.notes],
+            "INSERT OR REPLACE INTO workspaces (id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![ws.id, ws.repo_id, ws.name, ws.branch, ws.worktree_path, status_str, ws.last_activity, ws.pr_url, ws.unread, ws.display_order, ws.pinned_at, ws.notes, ws.parent_god_workspace_id, ws.is_god as i32],
         )?;
         Ok(())
     }
 
     fn workspace_from_row(row: &rusqlite::Row) -> rusqlite::Result<Workspace> {
         let status_str: String = row.get(5)?;
+        let is_god_int: i32 = row.get(13).unwrap_or(0);
         Ok(Workspace {
             id: row.get(0)?,
             repo_id: row.get(1)?,
@@ -188,13 +236,15 @@ impl Database {
             display_order: row.get(9)?,
             pinned_at: row.get(10)?,
             notes: row.get(11)?,
+            parent_god_workspace_id: row.get(12)?,
+            is_god: is_god_int != 0,
         })
     }
 
     pub fn get_workspaces_by_repo(&self, repo_id: &str) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes FROM workspaces WHERE repo_id = ?1 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces WHERE repo_id = ?1 AND parent_god_workspace_id IS NULL AND is_god = 0 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
         )?;
 
         let workspaces = stmt.query_map(params![repo_id], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
@@ -202,13 +252,36 @@ impl Database {
         Ok(workspaces)
     }
 
-    pub fn get_all_workspaces(&self) -> Result<Vec<Workspace>> {
+    /// Returns all workspaces from the database without any filtering.
+    /// Used by `load_from_db` to populate the full in-memory state.
+    pub fn get_all_workspaces_unfiltered(&self) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes FROM workspaces ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
+        )?;
+        let workspaces = stmt.query_map([], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
+        Ok(workspaces)
+    }
+
+    /// Returns only regular (non-god, non-child) workspaces.
+    pub fn get_regular_workspaces(&self) -> Result<Vec<Workspace>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces WHERE parent_god_workspace_id IS NULL AND is_god = 0 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
         )?;
 
         let workspaces = stmt.query_map([], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
+
+        Ok(workspaces)
+    }
+
+    pub fn get_child_workspaces(&self, god_workspace_id: &str) -> Result<Vec<Workspace>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces WHERE parent_god_workspace_id = ?1 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
+        )?;
+
+        let workspaces = stmt.query_map(params![god_workspace_id], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
 
         Ok(workspaces)
     }
@@ -266,6 +339,12 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_workspace_parent_god(&self, id: &str, parent_god_workspace_id: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE workspaces SET parent_god_workspace_id = ?1 WHERE id = ?2", params![parent_god_workspace_id, id])?;
+        Ok(())
+    }
+
     pub fn delete_workspace(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock();
         // Delete associated messages
@@ -278,6 +357,44 @@ impl Database {
         // Delete workspace
         conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // God Workspace queries (unified — god workspaces live in the workspaces table with is_god = 1)
+    pub fn get_god_workspaces(&self) -> Result<Vec<Workspace>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces WHERE is_god = 1 ORDER BY name"
+        )?;
+        let workspaces = stmt.query_map([], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
+        Ok(workspaces)
+    }
+
+    pub fn delete_god_workspace(&self, id: &str) -> Result<()> {
+        let mut conn = self.conn.lock();
+        // Wrap in a transaction so the cascade is atomic — a partial failure
+        // won't leave orphaned child records in the database.
+        let tx = conn.transaction()?;
+        // Safety net: clean up any child records that weren't already deleted by
+        // the per-child remove_workspace calls. These are typically no-ops but
+        // guard against partial failures during god workspace removal.
+        tx.execute(
+            "DELETE FROM messages WHERE session_id IN (SELECT s.id FROM sessions s JOIN workspaces w ON s.workspace_id = w.id WHERE w.parent_god_workspace_id = ?1)",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM sessions WHERE workspace_id IN (SELECT id FROM workspaces WHERE parent_god_workspace_id = ?1)",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM workspaces WHERE parent_god_workspace_id = ?1", params![id])?;
+        // Delete the god workspace's own messages and sessions
+        tx.execute(
+            "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE workspace_id = ?1)",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE workspace_id = ?1", params![id])?;
+        // Delete the god workspace itself
+        tx.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
+        tx.commit()
     }
 
     // Session CRUD
@@ -374,8 +491,10 @@ impl Database {
     pub fn get_messages_by_session(&self, session_id: &str, limit: Option<u32>) -> Result<Vec<AgentMessage>> {
         let conn = self.conn.lock();
         let query = match limit {
+            // Fetch the N most recent messages (DESC) then re-sort ascending so
+            // callers always receive chronological order regardless of limit.
             Some(l) => format!(
-                "SELECT agent_id, role, content, is_error, timestamp FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT {}",
+                "SELECT agent_id, role, content, is_error, timestamp FROM (SELECT id, agent_id, role, content, is_error, timestamp FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT {}) ORDER BY id ASC",
                 l
             ),
             None => "SELECT agent_id, role, content, is_error, timestamp FROM messages WHERE session_id = ?1 ORDER BY id".to_string(),
@@ -429,6 +548,27 @@ impl Database {
         })?.collect::<Result<Vec<_>>>()?;
 
         Ok(messages)
+    }
+
+    // App Settings
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT value FROM app_settings WHERE key = ?1")?;
+        let result = stmt.query_row(params![key], |row| row.get::<_, String>(0));
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
     }
 }
 

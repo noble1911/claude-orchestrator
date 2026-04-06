@@ -64,6 +64,8 @@ pub struct Workspace {
     pub display_order: i32,
     pub pinned_at: Option<String>,
     pub notes: Option<String>,
+    pub parent_god_workspace_id: Option<String>,
+    pub is_god: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +79,21 @@ pub enum WorkspaceStatus {
     Initializing,
 }
 
+impl WorkspaceStatus {
+    /// Return the serde-canonical JSON string for this status.
+    /// Matches the `#[serde(rename)]` attributes so the HTTP API is
+    /// consistent with the Tauri frontend serialization.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::InReview => "inReview",
+            Self::Merged => "merged",
+            Self::Initializing => "initializing",
+        }
+    }
+}
+
 // ─── Agent ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,15 +104,30 @@ pub struct Agent {
     pub status: AgentStatus,
     pub session_id: Option<String>,
     pub claude_session_id: Option<String>,
+    /// True while a message is being processed by the background CLI thread.
+    /// Used by the HTTP API to reject concurrent sends (409 Conflict).
+    #[serde(skip)]
+    pub processing: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
     Starting,
     Running,
     Stopped,
     Error,
+}
+
+impl AgentStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Error => "error",
+        }
+    }
 }
 
 // ─── Server & App Status ────────────────────────────────────────────
