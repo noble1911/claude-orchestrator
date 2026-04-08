@@ -67,6 +67,7 @@ import {
   THINKING_MODE_OPTIONS,
   PERMISSION_MODE_OPTIONS,
   PERMISSION_MODE_STORAGE_KEY,
+  PERMISSION_MODE_BY_WORKSPACE_STORAGE_KEY,
   CUSTOM_CHECKS_STORAGE_KEY,
 } from "./constants";
 import {
@@ -260,12 +261,16 @@ function App() {
     THINKING_MODE_STORAGE_KEY, "off", (v) => v,
     (raw) => (raw === "off" || raw === "low" || raw === "medium" || raw === "high") ? raw : "off",
   );
-  const [permissionMode, setPermissionMode] = usePersistedState<string>(
+  const [defaultPermissionMode, setDefaultPermissionMode] = usePersistedState<string>(
     PERMISSION_MODE_STORAGE_KEY, "dangerouslySkipPermissions", (v) => v,
     (raw) => {
       const validModes = ["dangerouslySkipPermissions", "bypassPermissions", "auto", "acceptEdits", "default", "dontAsk", "plan"];
       return validModes.includes(raw) ? raw : "dangerouslySkipPermissions";
     },
+  );
+  const [permissionModeByWorkspace, setPermissionModeByWorkspace] = usePersistedState<Record<string, string>>(
+    PERMISSION_MODE_BY_WORKSPACE_STORAGE_KEY, {},
+    (v) => Object.keys(v).length > 0 ? JSON.stringify(v) : null,
   );
   const [workspaceGroupConfig, setWorkspaceGroupConfig] = usePersistedState<WorkspaceGroup[]>(
     WORKSPACE_GROUPS_STORAGE_KEY, DEFAULT_WORKSPACE_GROUPS, JSON.stringify,
@@ -352,13 +357,15 @@ function App() {
     () => isTruthyEnvValue(parseEnvOverrides(envOverridesText)[BEDROCK_ENV_KEY]),
     [envOverridesText],
   );
-  const allSkills = useMemo(() => [...projectSkills, ...userSkills], [projectSkills, userSkills]);
   const availableThemes = useMemo(() => getAllThemes(customThemes), [customThemes]);
   const themeOptions = useMemo(() => getThemeOptions(availableThemes), [availableThemes]);
   const inputMessage = selectedWorkspace ? (inputMessageByWorkspace[selectedWorkspace] ?? "") : "";
   const selectedModel = selectedWorkspace
     ? (selectedModelByWorkspace[selectedWorkspace] ?? defaultModel)
     : defaultModel;
+  const permissionMode = selectedWorkspace
+    ? (permissionModeByWorkspace[selectedWorkspace] ?? defaultPermissionMode)
+    : defaultPermissionMode;
 
   const resolvedShortcuts = useMemo(
     () => resolveShortcuts(DEFAULT_SHORTCUTS, shortcutOverrides),
@@ -1097,6 +1104,15 @@ function App() {
 
   const isGodMode = selectedGodWorkspace !== null;
 
+  // Filter the god-workspace skill out of user skills when not in god mode.
+  // The skill contains HTTP API docs and bearer token patterns that are
+  // irrelevant (and potentially dangerous) in regular workspace contexts.
+  const filteredUserSkills = useMemo(
+    () => isGodMode ? userSkills : userSkills.filter((s) => s.relativePath !== "god-workspace"),
+    [userSkills, isGodMode],
+  );
+  const allSkills = useMemo(() => [...projectSkills, ...filteredUserSkills], [projectSkills, filteredUserSkills]);
+
   function handleSelectRepository(repoId: string) {
     if (repoId === selectedRepo && !isGodMode) return;
     // Exit god mode when selecting a repo
@@ -1227,6 +1243,14 @@ function App() {
         return next;
       });
       setSelectedModelByWorkspace((prev) => {
+        let changed = false;
+        for (const wid of allRemovedIds) { if (wid in prev) { changed = true; break; } }
+        if (!changed) return prev;
+        const next = { ...prev };
+        for (const wid of allRemovedIds) delete next[wid];
+        return next;
+      });
+      setPermissionModeByWorkspace((prev) => {
         let changed = false;
         for (const wid of allRemovedIds) { if (wid in prev) { changed = true; break; } }
         if (!changed) return prev;
@@ -1388,6 +1412,12 @@ function App() {
         delete next[tempId];
         return next;
       });
+      setPermissionModeByWorkspace((prev) => {
+        if (!(tempId in prev)) return prev;
+        const next = { ...prev, [workspace.id]: prev[tempId] };
+        delete next[tempId];
+        return next;
+      });
 
       // Handle auto-run prompts with real workspace ID
       if (autoRunPrompts.length > 0) {
@@ -1429,6 +1459,12 @@ function App() {
         return next;
       });
       setSelectedModelByWorkspace((prev) => {
+        if (!(workspaceId in prev)) return prev;
+        const next = { ...prev };
+        delete next[workspaceId];
+        return next;
+      });
+      setPermissionModeByWorkspace((prev) => {
         if (!(workspaceId in prev)) return prev;
         const next = { ...prev };
         delete next[workspaceId];
@@ -3568,7 +3604,13 @@ function App() {
                         <ToolbarDropdown
                           value={permissionMode}
                           options={PERMISSION_MODE_OPTIONS}
-                          onChange={setPermissionMode}
+                          onChange={(v) => {
+                            if (selectedWorkspace) {
+                              setPermissionModeByWorkspace((prev) => ({ ...prev, [selectedWorkspace]: v }));
+                            } else {
+                              setDefaultPermissionMode(v);
+                            }
+                          }}
                           icon="shield"
                           ariaLabel="Permission mode"
                         />
@@ -3845,7 +3887,7 @@ function App() {
                     <span className="material-symbols-rounded !text-[16px] md-text-muted">
                       {userSkillsExpanded ? "expand_more" : "chevron_right"}
                     </span>
-                    <span className="md-label-medium">User Skills ({userSkills.length})</span>
+                    <span className="md-label-medium">User Skills ({filteredUserSkills.length})</span>
                   </button>
                   <div className="flex items-center">
                     <button
@@ -3871,11 +3913,11 @@ function App() {
                 {userSkillsExpanded && (
                   <div>
                     {isSkillsLoading && <p className="py-1 text-xs md-text-muted">Loading user skills...</p>}
-                    {!isSkillsLoading && userSkills.length === 0 && (
+                    {!isSkillsLoading && filteredUserSkills.length === 0 && (
                       <p className="py-1 text-xs md-text-muted">No user skills found.</p>
                     )}
                     {!isSkillsLoading &&
-                      userSkills.map((skill) => (
+                      filteredUserSkills.map((skill) => (
                         <SkillSidebarCard
                           key={skill.id}
                           skill={skill}

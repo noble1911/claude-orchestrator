@@ -11,19 +11,41 @@ use crate::AppState;
 /// git status with untracked files that could be accidentally committed.
 const GOD_WORKSPACE_SKILL: &str = include_str!("../../resources/god-workspace-skill.md");
 
+/// Resolve the path to the God workspace skill directory: `~/.claude/skills/god-workspace/`.
+fn god_skill_dir() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    Ok(home.join(".claude").join("skills").join("god-workspace"))
+}
+
 /// Install the bundled God workspace skill into `~/.claude/skills/god-workspace/SKILL.md`.
 /// Idempotent — overwrites on every god workspace creation to ensure the skill stays current.
 fn install_god_skill() -> Result<(), String> {
-    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-    let skill_dir = home
-        .join(".claude")
-        .join("skills")
-        .join("god-workspace");
+    let skill_dir = god_skill_dir()?;
     std::fs::create_dir_all(&skill_dir)
         .map_err(|e| format!("Failed to create skill directory: {}", e))?;
     std::fs::write(skill_dir.join("SKILL.md"), GOD_WORKSPACE_SKILL)
         .map_err(|e| format!("Failed to write skill file: {}", e))?;
     Ok(())
+}
+
+/// Remove the God workspace skill directory if no god workspaces remain.
+/// Called after a god workspace is deleted to avoid leaking the skill into
+/// regular workspace contexts.
+fn uninstall_god_skill_if_unused(state: &AppState) {
+    let any_remaining = {
+        let workspaces = state.workspaces.read();
+        workspaces.values().any(|w| w.is_god)
+    };
+    if any_remaining {
+        return;
+    }
+    if let Ok(skill_dir) = god_skill_dir() {
+        if skill_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&skill_dir) {
+                tracing::warn!("Failed to remove god workspace skill directory: {}", e);
+            }
+        }
+    }
 }
 
 /// Create a new god workspace using the default (favourited) repository.
@@ -207,6 +229,10 @@ pub fn remove_god_workspace(state: &AppState, id: String) -> Result<(), String> 
         let mut agents = state.agents.write();
         agents.retain(|_, a| !affected_workspace_ids.contains(&a.workspace_id));
     }
+
+    // Clean up the user-level skill file if this was the last god workspace.
+    // This prevents the god-workspace skill from leaking into regular workspace contexts.
+    uninstall_god_skill_if_unused(state);
 
     Ok(())
 }
