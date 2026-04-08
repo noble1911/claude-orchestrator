@@ -53,6 +53,7 @@ export const MODEL_STORAGE_KEY = "claude_orchestrator_model";
 export const MODEL_BY_WORKSPACE_STORAGE_KEY = "claude_orchestrator_model_by_workspace";
 export const THINKING_MODE_STORAGE_KEY = "claude_orchestrator_thinking_mode";
 export const PERMISSION_MODE_STORAGE_KEY = "claude_orchestrator_permission_mode";
+export const PERMISSION_MODE_BY_WORKSPACE_STORAGE_KEY = "claude_orchestrator_permission_mode_by_workspace";
 export const DEFAULT_REPOSITORY_STORAGE_KEY = "claude_orchestrator_default_repository";
 export const BEDROCK_ENV_KEY = "CLAUDE_CODE_USE_BEDROCK";
 export const WORKSPACE_GROUPS_STORAGE_KEY = "claude_orchestrator_workspace_groups";
