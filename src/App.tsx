@@ -1550,6 +1550,20 @@ function App() {
     setAutoStartingWorkspaceId(workspaceId);
     try {
       await startAgent(workspaceId);
+      // Drain the first queued message for this workspace — a freshly started
+      // agent won't emit agent-run-state(false) until after its first message,
+      // so the normal queue drain in useAgentEvents won't fire yet.
+      const queue = queuedMessagesByWorkspaceRef.current[workspaceId];
+      if (queue && queue.length > 0) {
+        const [next, ...rest] = queue;
+        setQueuedMessagesByWorkspace((prev) => ({
+          ...prev,
+          [workspaceId]: rest,
+        }));
+        setTimeout(() => {
+          void sendMessageRef.current(next.text, next.visible, workspaceId);
+        }, 300);
+      }
     } finally {
       startingWorkspaceIdsRef.current.delete(workspaceId);
       setAutoStartingWorkspaceId((prev) => (prev === workspaceId ? null : prev));
@@ -1850,11 +1864,26 @@ function App() {
 
     const workspaceAgents = agents.filter(a => a.workspaceId === effectiveWorkspaceId);
     if (workspaceAgents.length === 0) {
-      setError("No active agent in this workspace");
-      if (effectiveWorkspaceId) {
-        setThinkingSinceByWorkspace((prev) => ({ ...prev, [effectiveWorkspaceId]: null }));
+      if (!effectiveWorkspaceId) return false;
+      // No agent yet — queue the message so it's sent once the agent starts.
+      // ensureAgentForWorkspace (fired by useEffect) will start the agent and
+      // drain the queue after it's ready.
+      const queued: QueuedMessage = {
+        id: crypto.randomUUID(),
+        text: composedInput,
+        visible: visibleOverride ?? composedInput,
+        queuedAt: Date.now(),
+      };
+      setQueuedMessagesByWorkspace((prev) => ({
+        ...prev,
+        [effectiveWorkspaceId]: [...(prev[effectiveWorkspaceId] || []), queued],
+      }));
+      if (!rawMessage) {
+        setInputMessageByWorkspace((prev) => ({ ...prev, [effectiveWorkspaceId]: "" }));
       }
-      return false;
+      // Kick off agent start if not already in progress
+      void ensureAgentForWorkspace(effectiveWorkspaceId);
+      return true;
     }
 
     const agent = workspaceAgents[0];
@@ -3072,6 +3101,28 @@ function App() {
           </div>
           )}
 
+          {isGodMode && selectedGodWorkspace && (
+            <div
+              className={`mb-3 flex cursor-pointer items-center gap-2 rounded-lg md-px-2 md-py-1.5 ${
+                selectedWorkspace === selectedGodWorkspace ? "md-surface-container-highest" : "hover:md-surface-container-high"
+              }`}
+              onClick={() => handleSelectWorkspace(selectedGodWorkspace)}
+              onKeyDown={(e) => e.key === "Enter" && handleSelectWorkspace(selectedGodWorkspace)}
+              role="button"
+              tabIndex={0}
+            >
+              <span className="material-symbols-rounded !text-[16px]">hub</span>
+              <span className="min-w-0 flex-1 truncate text-xs font-medium md-text-primary">
+                {godWorkspaces.find((gw) => gw.id === selectedGodWorkspace)?.name ?? "Orchestrator"} Chat
+              </span>
+              {(unreadByWorkspace[selectedGodWorkspace] || 0) > 0 && selectedWorkspace !== selectedGodWorkspace && (
+                <span className="flex h-4 min-w-[16px] items-center justify-center rounded-full bg-sky-500 px-1 text-[10px] font-bold text-white">
+                  {unreadByWorkspace[selectedGodWorkspace]}
+                </span>
+              )}
+            </div>
+          )}
+
           <div className="mb-4 flex items-center justify-between md-px-1">
             <h2 className="md-title-small">Workspaces</h2>
             <div className="flex items-center gap-1">
@@ -3470,7 +3521,7 @@ function App() {
                 </div>
               </div>
 
-              {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && selectedWorkspace && credentialErrorWorkspaces.has(selectedWorkspace) && (
+              {activeCenterTab.type === "chat" && selectedWorkspace && credentialErrorWorkspaces.has(selectedWorkspace) && (
                 <div className="border-t border-amber-700/50 bg-amber-950/40 px-4 py-3">
                   <div className="flex items-start gap-3">
                     <span className="material-symbols-rounded text-amber-400 !text-xl mt-0.5">key</span>
@@ -3497,7 +3548,7 @@ function App() {
                 </div>
               )}
 
-              {workspaceAgents.length > 0 && activeCenterTab.type === "chat" && (
+              {selectedWorkspace && activeCenterTab.type === "chat" && (
                 <div className="border-t md-outline md-surface-container md-px-3 md-py-2">
                     {attachedFiles.length > 0 && (
                       <div className="mb-2 rounded-lg border md-outline bg-black/5 p-2">
