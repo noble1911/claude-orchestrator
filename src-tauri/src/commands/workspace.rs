@@ -246,6 +246,8 @@ pub fn remove_workspace(state: &AppState, workspace_id: String) -> Result<(), St
         .delete_workspace(&workspace_id)
         .map_err(|e| format!("Failed to delete workspace: {}", e))?;
 
+    state.last_completion_reason.write().remove(&workspace_id);
+    state.completion_patterns.write().remove(&workspace_id);
     let mut workspaces = state.workspaces.write();
     workspaces.remove(&workspace_id);
     Ok(())

@@ -153,10 +153,7 @@ export function useAgentEvents(params: UseAgentEventsParams): void {
           ...prev,
           [workspaceId]: rest,
         }));
-        // Small delay to let the agent settle before sending the next message
-        setTimeout(() => {
-          void sendMessageRef.current(next.text, next.visible, workspaceId);
-        }, 300);
+        void sendMessageRef.current(next.text, next.visible, workspaceId);
       }
 
       if (selectedWorkspaceRef.current === workspaceId) {

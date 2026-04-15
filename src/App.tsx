@@ -69,6 +69,7 @@ import {
   PERMISSION_MODE_STORAGE_KEY,
   PERMISSION_MODE_BY_WORKSPACE_STORAGE_KEY,
   CUSTOM_CHECKS_STORAGE_KEY,
+  GOD_WORKSPACE_TEMPLATES,
 } from "./constants";
 import {
   compactActivityLines,
@@ -317,6 +318,7 @@ function App() {
   const [terminalTab, setTerminalTab] = useState<"setup" | "remote" | "terminal">("terminal");
   const [pendingAutoPromptsByWorkspace, setPendingAutoPromptsByWorkspace] = useState<Record<string, PromptShortcut[]>>({});
   const autoPromptInFlightRef = useRef<Set<string>>(new Set());
+  const queueDrainInFlightRef = useRef<Set<string>>(new Set());
   const [orchestratorConfig, setOrchestratorConfig] = useState<OrchestratorConfig | null>(null);
   const [isRunningScript, setIsRunningScript] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
@@ -812,6 +814,30 @@ function App() {
     void runAutoPrompt();
   }, [selectedWorkspace, pendingAutoPromptsByWorkspace, thinkingSinceByWorkspace, agents]);
 
+  // Drain the first queued message for any workspace that now has a running agent.
+  // This is the reactive counterpart to the event-driven drain in useAgentEvents —
+  // it handles the case where an agent was just started and hasn't processed a message
+  // yet (so agent-run-state(false) hasn't fired).
+  useEffect(() => {
+    for (const [wsId, queue] of Object.entries(queuedMessagesByWorkspace)) {
+      if (!queue.length) continue;
+      if (queueDrainInFlightRef.current.has(wsId)) continue;
+      const thinkingSince = thinkingSinceByWorkspace[wsId] ?? null;
+      if (thinkingSince !== null) continue;
+      const hasRunningAgent = agents.some(
+        (agent) => agent.workspaceId === wsId && agent.status === "running",
+      );
+      if (!hasRunningAgent) continue;
+
+      const [next, ...rest] = queue;
+      queueDrainInFlightRef.current.add(wsId);
+      setQueuedMessagesByWorkspace((prev) => ({ ...prev, [wsId]: rest }));
+      sendMessageRef.current(next.text, next.visible, wsId).finally(() => {
+        queueDrainInFlightRef.current.delete(wsId);
+      });
+    }
+  }, [queuedMessagesByWorkspace, thinkingSinceByWorkspace, agents]);
+
   async function loadInitialState() {
     try {
       const status = await invoke<AppStatus>("get_app_status");
@@ -1197,7 +1223,7 @@ function App() {
     setShowCreateGodWorkspace(true);
   }
 
-  async function handleCreateGodWorkspace(name: string) {
+  async function handleCreateGodWorkspace(name: string, templateId?: string) {
     const trimmed = name.trim();
     if (!trimmed) return;
     if (!defaultRepoId) {
@@ -1210,9 +1236,24 @@ function App() {
       setGodWorkspaces((prev) => [gw, ...prev]);
       // Auto-select and start the agent so the god workspace is immediately usable
       handleSelectGodWorkspace(gw.id);
-      await startAgent(gw.id);
+      const agent = await invoke<Agent>("start_agent", {
+        workspaceId: gw.id,
+        envOverrides: parseEnvOverrides(envOverridesText),
+      });
+      setAgents(prev => [...prev, agent]);
+
+      // Queue the selected template as an auto-prompt only after successful agent start
+      if (templateId) {
+        const template = GOD_WORKSPACE_TEMPLATES.find((t) => t.id === templateId);
+        if (template) {
+          setPendingAutoPromptsByWorkspace((prev) => ({
+            ...prev,
+            [gw.id]: [{ id: template.id, name: template.name, prompt: template.prompt }],
+          }));
+        }
+      }
     } catch (err) {
-      setError(String(err));
+      setError(`God workspace created but agent failed to start: ${String(err)}`);
     }
   }
 
@@ -1522,22 +1563,17 @@ function App() {
   }
 
   async function startAgent(workspaceId: string) {
-    try {
-      const agent = await invoke<Agent>("start_agent", {
-        workspaceId,
-        envOverrides: parseEnvOverrides(envOverridesText),
-      });
-      setAgents(prev => [...prev, agent]);
-      const currentRepo = selectedRepoRef.current;
-      const currentGodWs = selectedGodWorkspaceRef.current;
-      if (currentRepo) {
-        await loadWorkspaces(currentRepo);
-      } else if (currentGodWs) {
-        await loadGodChildWorkspaces(currentGodWs);
-      }
-    } catch (err) {
-      console.error("Failed to start agent:", err);
-      setError(String(err));
+    const agent = await invoke<Agent>("start_agent", {
+      workspaceId,
+      envOverrides: parseEnvOverrides(envOverridesText),
+    });
+    setAgents(prev => [...prev, agent]);
+    const currentRepo = selectedRepoRef.current;
+    const currentGodWs = selectedGodWorkspaceRef.current;
+    if (currentRepo) {
+      await loadWorkspaces(currentRepo);
+    } else if (currentGodWs) {
+      await loadGodChildWorkspaces(currentGodWs);
     }
   }
 
@@ -1554,20 +1590,15 @@ function App() {
     setAutoStartingWorkspaceId(workspaceId);
     try {
       await startAgent(workspaceId);
-      // Drain the first queued message for this workspace — a freshly started
-      // agent won't emit agent-run-state(false) until after its first message,
-      // so the normal queue drain in useAgentEvents won't fire yet.
-      const queue = queuedMessagesByWorkspaceRef.current[workspaceId];
-      if (queue && queue.length > 0) {
-        const [next, ...rest] = queue;
-        setQueuedMessagesByWorkspace((prev) => ({
-          ...prev,
-          [workspaceId]: rest,
-        }));
-        setTimeout(() => {
-          void sendMessageRef.current(next.text, next.visible, workspaceId);
-        }, 300);
-      }
+    } catch (err) {
+      setError(String(err));
+      // Agent failed to start — discard queued messages so they don't sit forever
+      setQueuedMessagesByWorkspace((prev) => {
+        if (!prev[workspaceId]?.length) return prev;
+        const next = { ...prev };
+        delete next[workspaceId];
+        return next;
+      });
     } finally {
       startingWorkspaceIdsRef.current.delete(workspaceId);
       setAutoStartingWorkspaceId((prev) => (prev === workspaceId ? null : prev));
@@ -1848,8 +1879,7 @@ function App() {
     const workspaceThinkingSince = effectiveWorkspaceId
       ? (thinkingSinceByWorkspace[effectiveWorkspaceId] ?? null)
       : null;
-    if (workspaceThinkingSince !== null && effectiveWorkspaceId) {
-      // Queue the message instead of dropping it
+    function enqueueMessage(wsId: string) {
       const queued: QueuedMessage = {
         id: crypto.randomUUID(),
         text: composedInput,
@@ -1858,34 +1888,22 @@ function App() {
       };
       setQueuedMessagesByWorkspace((prev) => ({
         ...prev,
-        [effectiveWorkspaceId]: [...(prev[effectiveWorkspaceId] || []), queued],
+        [wsId]: [...(prev[wsId] || []), queued],
       }));
       if (!rawMessage) {
-        setInputMessageByWorkspace((prev) => ({ ...prev, [effectiveWorkspaceId]: "" }));
+        setInputMessageByWorkspace((prev) => ({ ...prev, [wsId]: "" }));
       }
+    }
+
+    if (workspaceThinkingSince !== null && effectiveWorkspaceId) {
+      enqueueMessage(effectiveWorkspaceId);
       return true;
     }
 
     const workspaceAgents = agents.filter(a => a.workspaceId === effectiveWorkspaceId);
     if (workspaceAgents.length === 0) {
       if (!effectiveWorkspaceId) return false;
-      // No agent yet — queue the message so it's sent once the agent starts.
-      // ensureAgentForWorkspace (fired by useEffect) will start the agent and
-      // drain the queue after it's ready.
-      const queued: QueuedMessage = {
-        id: crypto.randomUUID(),
-        text: composedInput,
-        visible: visibleOverride ?? composedInput,
-        queuedAt: Date.now(),
-      };
-      setQueuedMessagesByWorkspace((prev) => ({
-        ...prev,
-        [effectiveWorkspaceId]: [...(prev[effectiveWorkspaceId] || []), queued],
-      }));
-      if (!rawMessage) {
-        setInputMessageByWorkspace((prev) => ({ ...prev, [effectiveWorkspaceId]: "" }));
-      }
-      // Kick off agent start if not already in progress
+      enqueueMessage(effectiveWorkspaceId);
       void ensureAgentForWorkspace(effectiveWorkspaceId);
       return true;
     }
@@ -4652,8 +4670,9 @@ function App() {
           initialName={createGodFormInitialName}
           title="Create God Workspace"
           placeholder="God workspace name"
+          templates={GOD_WORKSPACE_TEMPLATES}
           onClose={() => setShowCreateGodWorkspace(false)}
-          onSubmit={(name) => { void handleCreateGodWorkspace(name); }}
+          onSubmit={(name, templateId) => { void handleCreateGodWorkspace(name, templateId); }}
         />
       )}
 

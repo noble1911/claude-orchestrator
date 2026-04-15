@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::mpsc;
 
@@ -61,6 +61,20 @@ pub struct AppState {
     /// Persisted in the database so it survives app restarts — a god agent
     /// that was started in a prior session will still have the correct token.
     pub(crate) api_token: String,
+    /// Broadcast channel for agent completion notifications.
+    /// The wait endpoint subscribes; emit_agent_run_state(false) sends workspace_id.
+    pub(crate) agent_completions: tokio::sync::broadcast::Sender<String>,
+    /// Last completion reason per workspace.
+    /// Written when an agent finishes or is stopped; read by the status/wait endpoints.
+    pub(crate) last_completion_reason: RwLock<HashMap<String, CompletionReason>>,
+    /// Shared artifact store for god workspace orchestration.
+    /// Outer key = god_workspace_id, inner key = artifact key, value = (content, updated_at).
+    /// Ephemeral — lives only for the app session; used for inter-agent data exchange.
+    pub(crate) artifacts: RwLock<HashMap<String, HashMap<String, (String, String)>>>,
+    /// Optional completion patterns per workspace (workspace_id -> compiled regex).
+    /// When set, the status/wait endpoints check the last agent message against the
+    /// pattern and include `completionMatch` in the response.
+    pub(crate) completion_patterns: RwLock<HashMap<String, regex::Regex>>,
 }
 
 impl AppState {
@@ -77,6 +91,8 @@ impl AppState {
             }
         };
 
+        let (completions_tx, _) = tokio::sync::broadcast::channel::<String>(64);
+
         let mut state = Self {
             db: db.clone(),
             repositories: RwLock::new(HashMap::new()),
@@ -91,6 +107,10 @@ impl AppState {
             ws_connected_clients: RwLock::new(0),
             pairing_code: Arc::new(RwLock::new(None)),
             api_token,
+            agent_completions: completions_tx,
+            last_completion_reason: RwLock::new(HashMap::new()),
+            artifacts: RwLock::new(HashMap::new()),
+            completion_patterns: RwLock::new(HashMap::new()),
         };
 
         // Load persisted data
@@ -1285,6 +1305,11 @@ fn emit_agent_run_state(
             },
         );
     }
+    if !running {
+        if let Some(state) = app.try_state::<Arc<AppState>>() {
+            let _ = state.agent_completions.send(workspace_id.to_string());
+        }
+    }
 }
 
 /// Guard that emits `agent-run-state: false` when dropped, even on thread panic.
@@ -1316,6 +1341,18 @@ impl RunStateGuard {
 impl Drop for RunStateGuard {
     fn drop(&mut self) {
         if self.armed {
+            if let Some(state) = self.app.try_state::<Arc<AppState>>() {
+                // Clear processing before broadcasting so wait subscribers
+                // see consistent state (same fix as the normal-exit path).
+                {
+                    let mut agents = state.agents.write();
+                    if let Some(a) = agents.values_mut().find(|a| a.workspace_id == self.workspace_id) {
+                        a.processing = false;
+                    }
+                }
+                state.last_completion_reason.write()
+                    .insert(self.workspace_id.clone(), CompletionReason::Error);
+            }
             emit_agent_run_state(&self.app, &self.ws_server, &self.workspace_id, &self.agent_id, false);
         }
     }
@@ -2074,6 +2111,7 @@ pub(crate) fn send_message_core(
         // so retrying after a delay often succeeds.
         const MAX_PROMPT_TOO_LONG_RETRIES: u32 = 6;
         let mut prompt_too_long_attempts: u32 = 0;
+        let mut last_completion_reason = CompletionReason::Natural;
 
         'retry: loop {
 
@@ -2781,6 +2819,7 @@ pub(crate) fn send_message_core(
                 );
                 if !interruptible_sleep(&app_state_for_pids, &agent_id_clone, delay_secs) {
                     // Agent was stopped during the wait — bail out.
+                    last_completion_reason = CompletionReason::Interrupted;
                     break 'retry;
                 }
                 continue 'retry;
@@ -2838,8 +2877,24 @@ pub(crate) fn send_message_core(
             }
         }
 
+        if saw_credential_error || saw_prompt_too_long || !status.success() {
+            last_completion_reason = CompletionReason::Error;
+        }
         break; // Normal exit — no retry needed.
         } // end 'retry loop
+
+        // Clear the processing flag BEFORE broadcasting completion so that
+        // any wait endpoint subscriber sees processing=false when it wakes up.
+        // ProcessingGuard will also try to clear it on drop, but that's a no-op.
+        {
+            let mut agents = app_state_for_pids.agents.write();
+            if let Some(a) = agents.get_mut(&agent_id_clone) {
+                a.processing = false;
+            }
+        }
+
+        app_state_for_pids.last_completion_reason.write()
+            .insert(workspace_id.clone(), last_completion_reason);
 
         // Emit running=false after the retry loop completes (success or exhausted retries).
         // Deferred so the agent stays "running" during retries.
