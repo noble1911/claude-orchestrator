@@ -3,22 +3,24 @@ import Modal from "../Modal";
 
 interface CreateWorkspaceDialogProps {
   initialName: string;
+  title?: string;
+  placeholder?: string;
   onClose: () => void;
   onSubmit: (name: string) => void;
 }
 
-export default function CreateWorkspaceDialog({ initialName, onClose, onSubmit }: CreateWorkspaceDialogProps) {
+export default function CreateWorkspaceDialog({ initialName, title = "Create New Workspace", placeholder = "Feature name", onClose, onSubmit }: CreateWorkspaceDialogProps) {
   const [name, setName] = useState(initialName);
 
   return (
-    <Modal onClose={onClose} ariaLabel="Create new workspace">
+    <Modal onClose={onClose} ariaLabel={title} dismissable={false}>
       <div className="p-4">
-        <p className="mb-2 text-sm font-medium md-text-primary">Create New Workspace</p>
+        <p className="mb-2 text-sm font-medium md-text-primary">{title}</p>
         <input
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="Feature name"
+          placeholder={placeholder}
           className="md-field"
           onKeyDown={(e) => e.key === "Enter" && onSubmit(name)}
           autoFocus
