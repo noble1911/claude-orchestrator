@@ -222,6 +222,20 @@ pub fn remove_god_workspace(state: &AppState, id: String) -> Result<(), String> 
             workspaces.remove(affected_id);
         }
     }
+    // Clean up ephemeral state — each lock acquired and dropped independently
+    {
+        let mut reasons = state.last_completion_reason.write();
+        for affected_id in &affected_workspace_ids {
+            reasons.remove(affected_id);
+        }
+    }
+    state.artifacts.write().remove(&id);
+    {
+        let mut patterns = state.completion_patterns.write();
+        for affected_id in &affected_workspace_ids {
+            patterns.remove(affected_id);
+        }
+    }
     // Also purge any orphaned agent entries for workspaces that failed to
     // remove cleanly above — without this, ghost agents with no backing
     // workspace linger in state.agents indefinitely.
@@ -306,9 +320,21 @@ pub fn create_god_child_workspace(
         return Err(format!("Failed to link workspace to god parent: {}", e));
     }
 
-    // Patch the in-memory entry
+    // Patch the in-memory entry, re-checking the child count under the write lock
+    // to close the TOCTOU race between the HTTP handler's read-lock check and this insert.
     {
         let mut workspaces = state.workspaces.write();
+        let god_id = workspace.parent_god_workspace_id.as_deref();
+        let child_count = workspaces.values()
+            .filter(|w| w.parent_god_workspace_id.as_deref() == god_id && w.id != workspace.id)
+            .count();
+        if child_count >= MAX_CHILD_WORKSPACES {
+            drop(workspaces);
+            if let Err(e) = super::workspace::remove_workspace(state, workspace.id) {
+                tracing::warn!("Failed to roll back child workspace after limit hit: {}", e);
+            }
+            return Err(format!("Child workspace limit ({}) reached", MAX_CHILD_WORKSPACES));
+        }
         if let Some(ws) = workspaces.get_mut(&workspace.id) {
             ws.parent_god_workspace_id.clone_from(&workspace.parent_god_workspace_id);
         }

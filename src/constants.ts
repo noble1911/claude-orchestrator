@@ -1,4 +1,4 @@
-import type { WorkspaceGroup, ShortcutBinding } from "./types";
+import type { WorkspaceGroup, ShortcutBinding, GodWorkspaceTemplate } from "./types";
 
 export const NAME_ADJECTIVES = [
   "swift",
@@ -44,6 +44,57 @@ export const PERMISSION_MODE_OPTIONS: Array<{ value: string; label: string }> = 
   { value: "default", label: "Default" },
   { value: "dontAsk", label: "Don't Ask" },
   { value: "plan", label: "Plan" },
+];
+
+export const GOD_WORKSPACE_TEMPLATES: GodWorkspaceTemplate[] = [
+  {
+    id: "parallel",
+    name: "Parallel",
+    description: "Split into independent subtasks, run in parallel, synthesize",
+    prompt: `You are orchestrating parallel task decomposition. Follow this strategy:
+
+1. Analyze the user's request and decompose it into independent subtasks that can run concurrently
+2. Create a child workspace for each subtask (use descriptive names like "api-endpoints", "frontend-ui", "test-suite")
+3. Start agents in ALL child workspaces
+4. Send task instructions to each agent simultaneously
+5. Use /api/workspace/wait to block until each agent completes — do NOT poll
+6. Once all agents finish, read their lastAgentMessage from the wait responses
+7. Synthesize the results and report back to the user
+
+Wait for the user's task before creating any workspaces.`,
+  },
+  {
+    id: "sequential",
+    name: "Sequential Pipeline",
+    description: "Chain stages where each builds on the previous output",
+    prompt: `You are orchestrating a sequential pipeline. Follow this strategy:
+
+1. Analyze the user's request and break it into ordered stages where each depends on the previous
+2. Create workspace for stage 1, start its agent, send the task
+3. Use /api/workspace/wait to block until the agent finishes
+4. Read the output from lastAgentMessage or the messages endpoint
+5. Create workspace for stage 2, include stage 1's output in the task description
+6. Repeat until all stages are complete
+7. Synthesize the final result and report back
+
+Wait for the user's task before creating any workspaces.`,
+  },
+  {
+    id: "review-loop",
+    name: "Implement + Review",
+    description: "One agent implements, another reviews, iterate until approved",
+    prompt: `You are orchestrating an implement-review loop. Follow this strategy:
+
+1. Analyze the user's request
+2. Create two workspaces: one for implementation (e.g., "implement-feature"), one for review (e.g., "review-feature")
+3. Start the implementation agent, send it the task, wait for completion
+4. Read the implementation output, then send it to the review agent for code review
+5. If the reviewer identifies issues, send the feedback back to the implementer to fix
+6. Repeat the implement-review cycle (max 3 iterations) until the reviewer approves
+7. Report the final result to the user
+
+Wait for the user's task before creating any workspaces.`,
+  },
 ];
 
 export const PROMPT_SHORTCUTS_STORAGE_KEY = "claude_orchestrator_prompt_shortcuts";

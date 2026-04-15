@@ -151,6 +151,13 @@ export interface PromptShortcut {
   autoRunOnCreate?: boolean;
 }
 
+export interface GodWorkspaceTemplate {
+  id: string;
+  name: string;
+  description: string;
+  prompt: string;
+}
+
 export interface SkillShortcut {
   id: string;
   scope: "project" | "user";

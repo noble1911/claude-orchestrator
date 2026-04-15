@@ -550,6 +550,47 @@ impl Database {
         Ok(messages)
     }
 
+    pub fn get_workspace_message_count(&self, workspace_id: &str) -> Result<i64> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM messages m
+             JOIN sessions s ON m.session_id = s.id
+             WHERE s.workspace_id = ?1"
+        )?;
+        stmt.query_row(params![workspace_id], |row| row.get(0))
+    }
+
+    pub fn get_last_assistant_message(&self, workspace_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT m.content FROM messages m
+             JOIN sessions s ON m.session_id = s.id
+             WHERE s.workspace_id = ?1 AND m.role = 'assistant'
+             ORDER BY m.id DESC LIMIT 1"
+        )?;
+        let result = stmt.query_row(params![workspace_id], |row| row.get::<_, String>(0));
+        match result {
+            Ok(content) => Ok(Some(content)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Combined query: message count + last assistant message in a single DB round-trip.
+    pub fn get_workspace_message_stats(&self, workspace_id: &str) -> Result<(i64, Option<String>)> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT
+               (SELECT COUNT(*) FROM messages m JOIN sessions s ON m.session_id = s.id WHERE s.workspace_id = ?1),
+               (SELECT m.content FROM messages m JOIN sessions s ON m.session_id = s.id WHERE s.workspace_id = ?1 AND m.role = 'assistant' ORDER BY m.id DESC LIMIT 1)"
+        )?;
+        stmt.query_row(params![workspace_id], |row| {
+            let count: i64 = row.get(0)?;
+            let last_msg: Option<String> = row.get(1)?;
+            Ok((count, last_msg))
+        })
+    }
+
     // App Settings
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock();
