@@ -157,7 +157,7 @@ function App() {
   const [godChildWorkspaces, setGodChildWorkspaces] = useState<Workspace[]>([]);
   const [selectedGodWorkspace, setSelectedGodWorkspace] = useState<string | null>(null);
   const [showCreateGodWorkspace, setShowCreateGodWorkspace] = useState(false);
-  const [godWorkspaceName, setGodWorkspaceName] = useState("");
+  const [createGodFormInitialName, setCreateGodFormInitialName] = useState("");
   const [selectedWorkspace, setSelectedWorkspace] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -1192,18 +1192,22 @@ function App() {
     }
   }
 
-  async function handleCreateGodWorkspace() {
-    const trimmed = godWorkspaceName.trim();
+  function openCreateGodWorkspaceForm() {
+    setCreateGodFormInitialName(generateWorkspaceName());
+    setShowCreateGodWorkspace(true);
+  }
+
+  async function handleCreateGodWorkspace(name: string) {
+    const trimmed = name.trim();
     if (!trimmed) return;
     if (!defaultRepoId) {
       setError("Please star a default repository first");
       return;
     }
     try {
+      setShowCreateGodWorkspace(false);
       const gw = await invoke<Workspace>("create_god_workspace", { repoId: defaultRepoId, name: trimmed });
       setGodWorkspaces((prev) => [gw, ...prev]);
-      setGodWorkspaceName("");
-      setShowCreateGodWorkspace(false);
       // Auto-select and start the agent so the god workspace is immediately usable
       handleSelectGodWorkspace(gw.id);
       await startAgent(gw.id);
@@ -2963,42 +2967,14 @@ function App() {
                   </button>
                 </div>
               ))}
-              {showCreateGodWorkspace ? (
-                <form
-                  className="flex items-center gap-1 md-px-2 md-py-1"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    void handleCreateGodWorkspace();
-                  }}
-                >
-                  <input
-                    type="text"
-                    value={godWorkspaceName}
-                    onChange={(e) => setGodWorkspaceName(e.target.value)}
-                    placeholder="God workspace name"
-                    className="min-w-0 flex-1 rounded border px-2 py-1 text-xs md-outline md-surface-variant md-text-primary"
-                    autoFocus
-                    onBlur={() => {
-                      if (!godWorkspaceName.trim()) setShowCreateGodWorkspace(false);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Escape") setShowCreateGodWorkspace(false);
-                    }}
-                  />
-                  <button type="submit" className="md-icon-plain" title="Create">
-                    <span className="material-symbols-rounded !text-[16px]">check</span>
-                  </button>
-                </form>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setShowCreateGodWorkspace(true)}
-                  className="flex w-full items-center gap-2 md-px-2 md-py-1.5 text-xs md-text-muted hover:md-text-primary"
-                >
-                  <span className="material-symbols-rounded !text-[16px]">add</span>
-                  God Workspace
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={openCreateGodWorkspaceForm}
+                className="flex w-full items-center gap-2 md-px-2 md-py-1.5 text-xs md-text-muted hover:md-text-primary"
+              >
+                <span className="material-symbols-rounded !text-[16px]">add</span>
+                God Workspace
+              </button>
             </div>
           </div>
 
@@ -4617,6 +4593,16 @@ function App() {
           initialName={createFormInitialName}
           onClose={() => setShowCreateForm(false)}
           onSubmit={(name) => { void createWorkspace(name); }}
+        />
+      )}
+
+      {showCreateGodWorkspace && (
+        <CreateWorkspaceDialog
+          initialName={createGodFormInitialName}
+          title="Create God Workspace"
+          placeholder="God workspace name"
+          onClose={() => setShowCreateGodWorkspace(false)}
+          onSubmit={(name) => { void handleCreateGodWorkspace(name); }}
         />
       )}
 

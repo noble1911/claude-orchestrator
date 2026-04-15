@@ -5,26 +5,27 @@ interface ModalProps {
   maxWidth?: string;
   children: ReactNode;
   ariaLabel?: string;
+  dismissable?: boolean;
 }
 
-export default function Modal({ onClose, maxWidth = "max-w-md", children, ariaLabel }: ModalProps) {
+export default function Modal({ onClose, maxWidth = "max-w-md", children, ariaLabel, dismissable = true }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") {
+      if (e.key === "Escape" && dismissable) {
         e.stopPropagation();
         onClose();
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [onClose, dismissable]);
 
   return (
     <div
       className="md-dialog-scrim fixed inset-0 z-50 flex items-center justify-center"
-      onClick={onClose}
+      onClick={dismissable ? onClose : undefined}
       role="presentation"
     >
       <div
