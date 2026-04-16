@@ -150,6 +150,11 @@ impl Database {
         // Backfill: normalize NULL is_god to 0 so queries can use simple `is_god = 0`
         conn.execute("UPDATE workspaces SET is_god = 0 WHERE is_god IS NULL", [])?;
 
+        // Cross-workspace session continuity
+        if conn.prepare("SELECT source_claude_session_id FROM workspaces LIMIT 0").is_err() {
+            conn.execute_batch("ALTER TABLE workspaces ADD COLUMN source_claude_session_id TEXT")?;
+        }
+
         // Session enhancements
         if conn.prepare("SELECT unread_count FROM sessions LIMIT 0").is_err() {
             conn.execute_batch("ALTER TABLE sessions ADD COLUMN unread_count INTEGER DEFAULT 0")?;
@@ -214,8 +219,8 @@ impl Database {
         let conn = self.conn.lock();
         let status_str = workspace_status_to_str(&ws.status);
         conn.execute(
-            "INSERT OR REPLACE INTO workspaces (id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![ws.id, ws.repo_id, ws.name, ws.branch, ws.worktree_path, status_str, ws.last_activity, ws.pr_url, ws.unread, ws.display_order, ws.pinned_at, ws.notes, ws.parent_god_workspace_id, ws.is_god as i32],
+            "INSERT OR REPLACE INTO workspaces (id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god, source_claude_session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![ws.id, ws.repo_id, ws.name, ws.branch, ws.worktree_path, status_str, ws.last_activity, ws.pr_url, ws.unread, ws.display_order, ws.pinned_at, ws.notes, ws.parent_god_workspace_id, ws.is_god as i32, ws.source_claude_session_id],
         )?;
         Ok(())
     }
@@ -238,13 +243,14 @@ impl Database {
             notes: row.get(11)?,
             parent_god_workspace_id: row.get(12)?,
             is_god: is_god_int != 0,
+            source_claude_session_id: row.get(14).unwrap_or(None),
         })
     }
 
     pub fn get_workspaces_by_repo(&self, repo_id: &str) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces WHERE repo_id = ?1 AND parent_god_workspace_id IS NULL AND is_god = 0 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god, source_claude_session_id FROM workspaces WHERE repo_id = ?1 AND parent_god_workspace_id IS NULL AND is_god = 0 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
         )?;
 
         let workspaces = stmt.query_map(params![repo_id], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
@@ -257,7 +263,7 @@ impl Database {
     pub fn get_all_workspaces_unfiltered(&self) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god, source_claude_session_id FROM workspaces ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
         )?;
         let workspaces = stmt.query_map([], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
         Ok(workspaces)
@@ -267,7 +273,7 @@ impl Database {
     pub fn get_regular_workspaces(&self) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces WHERE parent_god_workspace_id IS NULL AND is_god = 0 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god, source_claude_session_id FROM workspaces WHERE parent_god_workspace_id IS NULL AND is_god = 0 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
         )?;
 
         let workspaces = stmt.query_map([], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
@@ -278,7 +284,7 @@ impl Database {
     pub fn get_child_workspaces(&self, god_workspace_id: &str) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces WHERE parent_god_workspace_id = ?1 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god, source_claude_session_id FROM workspaces WHERE parent_god_workspace_id = ?1 ORDER BY pinned_at IS NULL, pinned_at DESC, display_order, name"
         )?;
 
         let workspaces = stmt.query_map(params![god_workspace_id], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
@@ -363,7 +369,7 @@ impl Database {
     pub fn get_god_workspaces(&self) -> Result<Vec<Workspace>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god FROM workspaces WHERE is_god = 1 ORDER BY name"
+            "SELECT id, repo_id, name, branch, worktree_path, status, last_activity, pr_url, unread, display_order, pinned_at, notes, parent_god_workspace_id, is_god, source_claude_session_id FROM workspaces WHERE is_god = 1 ORDER BY name"
         )?;
         let workspaces = stmt.query_map([], Self::workspace_from_row)?.collect::<Result<Vec<_>>>()?;
         Ok(workspaces)

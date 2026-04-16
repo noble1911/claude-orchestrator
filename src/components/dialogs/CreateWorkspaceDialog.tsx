@@ -1,19 +1,27 @@
 import { useState } from "react";
 import Modal from "../Modal";
-import type { GodWorkspaceTemplate } from "../../types";
+import type { GodWorkspaceTemplate, Workspace } from "../../types";
 
 interface CreateWorkspaceDialogProps {
   initialName: string;
   title?: string;
   placeholder?: string;
   templates?: GodWorkspaceTemplate[];
+  continueFromWorkspaces?: Workspace[];
+  initialSourceWorkspaceId?: string | null;
   onClose: () => void;
-  onSubmit: (name: string, templateId?: string) => void;
+  onSubmit: (name: string, secondaryId?: string) => void;
 }
 
-export default function CreateWorkspaceDialog({ initialName, title = "Create New Workspace", placeholder = "Feature name", templates, onClose, onSubmit }: CreateWorkspaceDialogProps) {
+export default function CreateWorkspaceDialog({ initialName, title = "Create New Workspace", placeholder = "Feature name", templates, continueFromWorkspaces, initialSourceWorkspaceId, onClose, onSubmit }: CreateWorkspaceDialogProps) {
   const [name, setName] = useState(initialName);
   const [selectedTemplate, setSelectedTemplate] = useState<string | undefined>(undefined);
+  const [sourceWorkspaceId, setSourceWorkspaceId] = useState<string | undefined>(
+    initialSourceWorkspaceId ?? undefined
+  );
+
+  const hasWorkspaces = continueFromWorkspaces && continueFromWorkspaces.length > 0;
+  const secondaryId = templates ? selectedTemplate : sourceWorkspaceId;
 
   return (
     <Modal onClose={onClose} ariaLabel={title} dismissable={false}>
@@ -25,7 +33,7 @@ export default function CreateWorkspaceDialog({ initialName, title = "Create New
           onChange={(e) => setName(e.target.value)}
           placeholder={placeholder}
           className="md-field"
-          onKeyDown={(e) => e.key === "Enter" && name.trim() && onSubmit(name, selectedTemplate)}
+          onKeyDown={(e) => e.key === "Enter" && name.trim() && onSubmit(name, secondaryId)}
           autoFocus
         />
         {templates && templates.length > 0 && (
@@ -66,11 +74,26 @@ export default function CreateWorkspaceDialog({ initialName, title = "Create New
             </div>
           </div>
         )}
+        {hasWorkspaces && (
+          <div className="mt-2">
+            <label className="text-xs md-text-secondary block mb-1">Continue conversation from</label>
+            <select
+              value={sourceWorkspaceId ?? ""}
+              onChange={(e) => setSourceWorkspaceId(e.target.value || undefined)}
+              className="md-field text-sm"
+            >
+              <option value="">None (fresh start)</option>
+              {continueFromWorkspaces.map((ws) => (
+                <option key={ws.id} value={ws.id}>{ws.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
         <div className="mt-3 flex gap-2">
           <button onClick={onClose} className="md-btn flex-1">
             Cancel
           </button>
-          <button onClick={() => onSubmit(name, selectedTemplate)} className="md-btn md-btn-tonal flex-1">
+          <button onClick={() => onSubmit(name, secondaryId)} className="md-btn md-btn-tonal flex-1">
             Create
           </button>
         </div>

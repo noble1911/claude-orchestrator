@@ -12,6 +12,7 @@ const SortableWorkspaceItem = memo(function SortableWorkspaceItem({
   onTogglePin,
   onRename,
   onRemove,
+  onContinueFrom,
   getStatusColor,
 }: SortableWorkspaceItemProps) {
   const {
@@ -83,6 +84,16 @@ const SortableWorkspaceItem = memo(function SortableWorkspaceItem({
           disabled={workspace.status === "initializing"}
         >
           <span className="material-symbols-rounded !text-[16px]">{workspace.pinnedAt ? "keep_off" : "keep"}</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => onContinueFrom(workspace.id)}
+          className="md-icon-plain disabled:opacity-30 disabled:cursor-not-allowed"
+          title="Continue conversation in new workspace"
+          aria-label={`Continue from ${workspace.name}`}
+          disabled={workspace.status === "initializing" || !workspace.lastActivity}
+        >
+          <span className="material-symbols-rounded !text-[16px]">fork_right</span>
         </button>
         <button
           type="button"

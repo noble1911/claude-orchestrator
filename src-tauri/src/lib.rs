@@ -416,9 +416,10 @@ async fn run_orchestrator_script(
 async fn create_workspace(
     repo_id: String,
     name: String,
+    source_workspace_id: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Workspace, String> {
-    commands::workspace::create_workspace(&state, repo_id, name)
+    commands::workspace::create_workspace(&state, repo_id, name, source_workspace_id)
 }
 
 #[tauri::command]
@@ -643,12 +644,13 @@ pub(crate) fn start_agent_core(
     let session_id = new_id();
 
     // Try to resume the most recent Claude session for this workspace so that
-    // conversations survive app restarts.  Falls back to a fresh session if
-    // no prior session exists.
+    // conversations survive app restarts.  Falls back to a source workspace's
+    // session (for cross-workspace continuity), or a fresh session if neither exists.
     let claude_session_id: Option<String> = state
         .db
         .get_latest_claude_session_id(&workspace_id)
-        .unwrap_or(None);
+        .unwrap_or(None)
+        .or_else(|| workspace.source_claude_session_id.clone());
 
     // Create session in database
     let now = now_rfc3339();
@@ -3224,7 +3226,7 @@ async fn handle_ws_commands(
                     let _ = response_tx.send(serde_json::to_string(&response).unwrap());
                     continue;
                 }
-                let response = match commands::workspace::create_workspace(&state, repo_id, trimmed.to_string()) {
+                let response = match commands::workspace::create_workspace(&state, repo_id, trimmed.to_string(), None) {
                     Ok(ws) => WsResponse::WorkspaceCreated { workspace: to_workspace_info(&ws, false) },
                     Err(e) => WsResponse::Error { message: e },
                 };

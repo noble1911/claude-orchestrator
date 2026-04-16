@@ -66,6 +66,8 @@ pub struct Workspace {
     pub notes: Option<String>,
     pub parent_god_workspace_id: Option<String>,
     pub is_god: bool,
+    #[serde(skip)]
+    pub source_claude_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -98,6 +98,7 @@ pub fn create_god_workspace(
             notes: None,
             parent_god_workspace_id: None,
             is_god: true,
+            source_claude_session_id: None,
         };
 
         state
@@ -292,7 +293,7 @@ pub fn create_god_child_workspace(
     }
 
     // Create the workspace using existing logic (inserts into DB + in-memory)
-    let mut workspace = super::workspace::create_workspace(state, repo_id, name)?;
+    let mut workspace = super::workspace::create_workspace(state, repo_id, name, None)?;
 
     // Re-verify the god workspace still exists (guards against concurrent deletion)
     {
