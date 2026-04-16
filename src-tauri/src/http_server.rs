@@ -25,10 +25,10 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::helpers::{
-    fixed_length_constant_time_eq, MAX_ARTIFACTS_PER_GOD_WORKSPACE, MAX_CHILD_WORKSPACES,
-    MAX_MESSAGES_PER_CHILD,
+    fixed_length_constant_time_eq, new_id, now_rfc3339, MAX_ARTIFACTS_PER_GOD_WORKSPACE,
+    MAX_CHILD_WORKSPACES, MAX_MESSAGES_PER_CHILD,
 };
-use crate::types::PermissionRequestEvent;
+use crate::types::{OrchestrationEvent, OrchestrationEventKind, PermissionRequestEvent};
 use crate::AppState;
 
 /// Shared map of pending permission requests. The oneshot sender is resolved
@@ -263,6 +263,41 @@ async fn handle_permission_request(
     }
 }
 
+// ─── Orchestration Event Emission ──────────────────────────────────
+
+fn emit_orchestration_event(
+    app_handle: &AppHandle,
+    app_state: &AppState,
+    god_workspace_id: &str,
+    child_workspace_id: Option<&str>,
+    kind: OrchestrationEventKind,
+    summary: String,
+    artifact_key: Option<String>,
+) {
+    let child_name = child_workspace_id.and_then(|id| {
+        app_state.workspaces.read().get(id).map(|ws| ws.name.clone())
+    });
+
+    let summary = if summary.chars().count() > 80 {
+        let truncated: String = summary.chars().take(80).collect();
+        format!("{}…", truncated)
+    } else {
+        summary
+    };
+
+    let event = OrchestrationEvent {
+        id: new_id(),
+        god_workspace_id: god_workspace_id.to_string(),
+        child_workspace_id: child_workspace_id.map(str::to_owned),
+        child_workspace_name: child_name,
+        kind,
+        timestamp: now_rfc3339(),
+        summary,
+        artifact_key,
+    };
+    let _ = app_handle.emit("orchestration-event", &event);
+}
+
 // ─── God Workspace Orchestrator API ─────────────────────────────────
 
 /// GET /api/workspaces?god_workspace_id=<id> — list child workspaces for a god workspace.
@@ -355,6 +390,14 @@ async fn handle_create_child_workspace(
             if let Some(re) = compiled_pattern {
                 state.app_state.completion_patterns.write().insert(ws.id.clone(), re);
             }
+            emit_orchestration_event(
+                &state.app_handle, &state.app_state,
+                ws.parent_god_workspace_id.as_deref().unwrap_or(""),
+                Some(&ws.id),
+                OrchestrationEventKind::WorkspaceCreated,
+                format!("Created: {}", ws.name),
+                None,
+            );
             (StatusCode::CREATED, axum::Json(serde_json::json!({
                 "id": ws.id,
                 "name": ws.name,
@@ -476,6 +519,7 @@ async fn handle_send_message(
     // This is intentional: child agents spawned by the god workspace are controlled
     // programmatically — there is no human to respond to CLI permission prompts.
     // Tool approval, when needed, goes through the MCP permission bridge instead.
+    let msg_summary = req.message.clone();
     match crate::send_message_core(
         &state.app_state,
         state.app_handle.clone(),
@@ -486,10 +530,19 @@ async fn handle_send_message(
         None,  // model — uses workspace default
         None,  // effort — uses workspace default
     ) {
-        Ok(()) => (StatusCode::OK, axum::Json(serde_json::json!({
-            "sent": true,
-            "agentId": agent_id,
-        }))).into_response(),
+        Ok(()) => {
+            emit_orchestration_event(
+                &state.app_handle, &state.app_state,
+                &req.god_workspace_id, Some(&req.workspace_id),
+                OrchestrationEventKind::MessageSent,
+                msg_summary,
+                None,
+            );
+            (StatusCode::OK, axum::Json(serde_json::json!({
+                "sent": true,
+                "agentId": agent_id,
+            }))).into_response()
+        }
         Err(e) => {
             // Reset the processing flag — the background thread was never
             // spawned, so nothing will clear it. Without this reset, all
@@ -517,8 +570,16 @@ async fn handle_start_agent(
     // Token injection for god workspaces is handled inside start_agent_core,
     // so we pass None here to avoid double-injection.
     let workspace_id = req.workspace_id.clone();
+    let god_workspace_id = req.god_workspace_id.clone();
     match crate::start_agent_core(&state.app_state, state.app_handle.clone(), req.workspace_id, None) {
         Ok(agent) => {
+            emit_orchestration_event(
+                &state.app_handle, &state.app_state,
+                &god_workspace_id, Some(&workspace_id),
+                OrchestrationEventKind::AgentStarted,
+                format!("Agent started"),
+                None,
+            );
             (StatusCode::CREATED, axum::Json(serde_json::json!({
                 "status": "started",
                 "agentId": agent.id,
@@ -567,10 +628,19 @@ async fn handle_stop_agent(
     match agent_id {
         Some(id) => {
             match crate::commands::agent::stop_agent(&state.app_state, id.clone()) {
-                Ok(()) => (StatusCode::OK, axum::Json(serde_json::json!({
-                    "stopped": true,
-                    "agentId": id,
-                }))).into_response(),
+                Ok(()) => {
+                    emit_orchestration_event(
+                        &state.app_handle, &state.app_state,
+                        &req.god_workspace_id, Some(&req.workspace_id),
+                        OrchestrationEventKind::AgentStopped,
+                        format!("Agent stopped"),
+                        None,
+                    );
+                    (StatusCode::OK, axum::Json(serde_json::json!({
+                        "stopped": true,
+                        "agentId": id,
+                    }))).into_response()
+                }
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({
                     "error": e,
                 }))).into_response(),
@@ -653,7 +723,16 @@ async fn handle_get_workspace_status(
         return resp.into_response();
     }
     match build_workspace_status(&state.app_state, &req.workspace_id) {
-        Some(status) => (StatusCode::OK, axum::Json(status)).into_response(),
+        Some(status) => {
+            emit_orchestration_event(
+                &state.app_handle, &state.app_state,
+                &req.god_workspace_id, Some(&req.workspace_id),
+                OrchestrationEventKind::StatusPolled,
+                format!("Polled status"),
+                None,
+            );
+            (StatusCode::OK, axum::Json(status)).into_response()
+        }
         None => (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({
             "error": "Workspace not found",
         }))).into_response(),
@@ -681,6 +760,14 @@ async fn handle_wait_workspace(
     }
 
     let timeout_secs = req.timeout.unwrap_or(300).min(300);
+
+    emit_orchestration_event(
+        &state.app_handle, &state.app_state,
+        &req.god_workspace_id, Some(&req.workspace_id),
+        OrchestrationEventKind::WaitStarted,
+        format!("Waiting for completion"),
+        None,
+    );
 
     // Subscribe FIRST so we cannot miss a completion that fires during the check.
     let mut rx = state.app_state.agent_completions.subscribe();
@@ -722,16 +809,27 @@ async fn handle_wait_workspace(
         Err(_) => true,
     };
 
-    match build_workspace_status(&state.app_state, &req.workspace_id) {
-        Some(status) => (StatusCode::OK, axum::Json(serde_json::json!({
-            "waited": true,
-            "timedOut": timed_out,
-            "workspace": status,
-        }))).into_response(),
+    let result = match build_workspace_status(&state.app_state, &req.workspace_id) {
+        Some(status) => {
+            let reason = if timed_out { "timed out" } else { "completed" };
+            emit_orchestration_event(
+                &state.app_handle, &state.app_state,
+                &req.god_workspace_id, Some(&req.workspace_id),
+                OrchestrationEventKind::WaitCompleted,
+                format!("Wait {}", reason),
+                None,
+            );
+            (StatusCode::OK, axum::Json(serde_json::json!({
+                "waited": true,
+                "timedOut": timed_out,
+                "workspace": status,
+            }))).into_response()
+        }
         None => (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({
             "error": "Workspace not found",
         }))).into_response(),
-    }
+    };
+    result
 }
 
 // ─── Shared Artifact Store ────────────────────────────────────────────
@@ -772,13 +870,23 @@ async fn handle_get_artifacts(
 
     match req.key {
         Some(key) => {
-            let entry = store.and_then(|s| s.get(&key));
+            let entry = store.and_then(|s| s.get(&key)).map(|(v, t)| (v.clone(), t.clone()));
             match entry {
-                Some((value, updated_at)) => (StatusCode::OK, axum::Json(serde_json::json!({
-                    "key": key,
-                    "value": value,
-                    "updatedAt": updated_at,
-                }))).into_response(),
+                Some((value, updated_at)) => {
+                    drop(artifacts);
+                    emit_orchestration_event(
+                        &state.app_handle, &state.app_state,
+                        &req.god_workspace_id, None,
+                        OrchestrationEventKind::ArtifactRead,
+                        format!("Read artifact: {}", key),
+                        Some(key.clone()),
+                    );
+                    (StatusCode::OK, axum::Json(serde_json::json!({
+                        "key": key,
+                        "value": value,
+                        "updatedAt": updated_at,
+                    }))).into_response()
+                }
                 None => (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({
                     "error": format!("Artifact '{}' not found", key),
                 }))).into_response(),
@@ -827,6 +935,7 @@ async fn handle_put_artifact(
     }
 
     let updated_at = crate::helpers::now_rfc3339();
+    let god_ws_id = req.god_workspace_id.clone();
     let mut artifacts = state.app_state.artifacts.write();
     let store = artifacts.entry(req.god_workspace_id).or_default();
     if !store.contains_key(&req.key) && store.len() >= MAX_ARTIFACTS_PER_GOD_WORKSPACE {
@@ -835,6 +944,14 @@ async fn handle_put_artifact(
         }))).into_response();
     }
     store.insert(req.key.clone(), (req.value, updated_at.clone()));
+    drop(artifacts);
+    emit_orchestration_event(
+        &state.app_handle, &state.app_state,
+        &god_ws_id, None,
+        OrchestrationEventKind::ArtifactWritten,
+        format!("Wrote artifact: {}", req.key),
+        Some(req.key.clone()),
+    );
     (StatusCode::OK, axum::Json(serde_json::json!({
         "stored": true,
         "key": req.key,
@@ -861,6 +978,14 @@ async fn handle_delete_artifact(
     let mut artifacts = state.app_state.artifacts.write();
     if let Some(store) = artifacts.get_mut(&req.god_workspace_id) {
         if store.remove(&req.key).is_some() {
+            drop(artifacts);
+            emit_orchestration_event(
+                &state.app_handle, &state.app_state,
+                &req.god_workspace_id, None,
+                OrchestrationEventKind::ArtifactDeleted,
+                format!("Deleted artifact: {}", req.key),
+                Some(req.key.clone()),
+            );
             return (StatusCode::OK, axum::Json(serde_json::json!({
                 "deleted": true,
                 "key": req.key,

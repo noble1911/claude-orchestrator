@@ -534,6 +534,82 @@ async fn create_god_child_workspace(
     commands::god_workspace::create_god_child_workspace(&state, god_workspace_id, repo_id, name)
 }
 
+// ─── Orchestration Graph ────────────────────────────────────────────
+
+#[tauri::command]
+fn get_orchestration_state(
+    god_workspace_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<OrchestrationSnapshot, String> {
+    let children_raw: Vec<Workspace> = {
+        let workspaces = state.workspaces.read();
+        match workspaces.get(&god_workspace_id) {
+            Some(ws) if ws.is_god => {}
+            _ => return Err("God workspace not found".to_string()),
+        }
+        workspaces
+            .values()
+            .filter(|w| w.parent_god_workspace_id.as_deref() == Some(&god_workspace_id))
+            .cloned()
+            .collect()
+    };
+
+    let agents_snap: std::collections::HashMap<String, (AgentStatus, bool)> = {
+        let agents = state.agents.read();
+        agents
+            .values()
+            .map(|a| (a.workspace_id.clone(), (a.status.clone(), a.processing)))
+            .collect()
+    };
+
+    let completion_reasons = state.last_completion_reason.read().clone();
+
+    let mut children = Vec::new();
+    for ws in children_raw {
+        let (agent_status, processing) = agents_snap
+            .get(&ws.id)
+            .map(|(s, p)| (Some(s.as_str().to_string()), *p))
+            .unwrap_or((None, false));
+        let (msg_count, _) = state.db.get_workspace_message_stats(&ws.id).unwrap_or((0, None));
+        let completion_reason = completion_reasons.get(&ws.id).map(|r| r.as_str().to_string());
+        children.push(OrchestrationChildStatus {
+            workspace_id: ws.id,
+            name: ws.name,
+            workspace_status: ws.status.as_str().to_string(),
+            agent_status,
+            processing,
+            completion_reason,
+            message_count: msg_count,
+            last_activity: ws.last_activity,
+        });
+    }
+
+    let artifacts: Vec<OrchestrationArtifact> = {
+        let store = state.artifacts.read();
+        store
+            .get(&god_workspace_id)
+            .map(|m| {
+                let mut v: Vec<OrchestrationArtifact> = m
+                    .iter()
+                    .map(|(k, (val, ts))| OrchestrationArtifact {
+                        key: k.clone(),
+                        value: val.clone(),
+                        updated_at: ts.clone(),
+                    })
+                    .collect();
+                v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                v
+            })
+            .unwrap_or_default()
+    };
+
+    Ok(OrchestrationSnapshot {
+        god_workspace_id,
+        children,
+        artifacts,
+    })
+}
+
 // ─── Agent Commands ─────────────────────────────────────────────────
 
 #[tauri::command]
@@ -3602,6 +3678,7 @@ pub fn run() {
             remove_god_workspace,
             list_god_child_workspaces,
             create_god_child_workspace,
+            get_orchestration_state,
             list_agents,
             start_agent,
             stop_agent,

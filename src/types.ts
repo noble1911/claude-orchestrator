@@ -201,11 +201,59 @@ export interface CustomSkillRepo {
 
 export interface CenterTab {
   id: string;
-  type: "chat" | "file" | "diff";
+  type: "chat" | "file" | "diff" | "graph";
   title: string;
   path?: string;
   status?: string;
   oldPath?: string;
+}
+
+// ─── Orchestration Graph ───────────────────────────────────────────
+
+export type OrchestrationEventKind =
+  | "workspaceCreated"
+  | "agentStarted"
+  | "messageSent"
+  | "agentStopped"
+  | "statusPolled"
+  | "waitStarted"
+  | "waitCompleted"
+  | "artifactWritten"
+  | "artifactRead"
+  | "artifactDeleted";
+
+export interface OrchestrationEvent {
+  id: string;
+  godWorkspaceId: string;
+  childWorkspaceId?: string | null;
+  childWorkspaceName?: string | null;
+  kind: OrchestrationEventKind;
+  timestamp: string;
+  summary: string;
+  artifactKey?: string | null;
+}
+
+export interface OrchestrationChildStatus {
+  workspaceId: string;
+  name: string;
+  workspaceStatus: string;
+  agentStatus?: string | null;
+  processing: boolean;
+  completionReason?: string | null;
+  messageCount: number;
+  lastActivity?: string | null;
+}
+
+export interface OrchestrationArtifact {
+  key: string;
+  value: string;
+  updatedAt: string;
+}
+
+export interface OrchestrationSnapshot {
+  godWorkspaceId: string;
+  children: OrchestrationChildStatus[];
+  artifacts: OrchestrationArtifact[];
 }
 
 export type ClaudeMode = "normal" | "plan";
