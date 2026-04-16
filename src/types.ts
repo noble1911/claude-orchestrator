@@ -23,6 +23,7 @@ export interface Workspace {
   notes?: string | null;
   parentGodWorkspaceId?: string | null;
   isGod?: boolean;
+  sourceClaudeSessionId?: string | null;
 }
 
 export interface Agent {
@@ -352,5 +353,6 @@ export interface SortableWorkspaceItemProps {
   onTogglePin: (id: string) => void;
   onRename: (ws: Workspace) => void;
   onRemove: (id: string) => void;
+  onContinueFrom: (id: string) => void;
   getStatusColor: (status: string) => string;
 }

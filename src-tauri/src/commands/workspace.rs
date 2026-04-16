@@ -130,12 +130,24 @@ pub fn create_workspace(
     state: &AppState,
     repo_id: String,
     name: String,
+    source_workspace_id: Option<String>,
 ) -> Result<Workspace, String> {
     validate_workspace_name(&name)?;
 
     let repo = {
         let repos = state.repositories.read();
         repos.get(&repo_id).cloned().ok_or("Repository not found")?
+    };
+
+    let source_claude_session_id = match source_workspace_id {
+        Some(src_id) => {
+            let sid = state.db.get_latest_claude_session_id(&src_id).unwrap_or(None);
+            if sid.is_none() {
+                return Err("Source workspace has no conversation to continue from".to_string());
+            }
+            sid
+        }
+        None => None,
     };
 
     let branch = format!("workspace/{}", name.to_lowercase().replace(' ', "-"));
@@ -168,6 +180,7 @@ pub fn create_workspace(
             notes: None,
             parent_god_workspace_id: None,
             is_god: false,
+            source_claude_session_id,
         };
 
         state

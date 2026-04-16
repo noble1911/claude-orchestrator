@@ -164,6 +164,7 @@ function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [createFormInitialName, setCreateFormInitialName] = useState("");
+  const [createFormSourceWorkspaceId, setCreateFormSourceWorkspaceId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [availableUpdate, setAvailableUpdate] = useState<UpdateInfo | null>(null);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
@@ -1382,7 +1383,7 @@ function App() {
     }
   }
 
-  async function createWorkspace(inputName: string) {
+  async function createWorkspace(inputName: string, sourceWorkspaceId?: string) {
     // In God mode, create a child workspace
     if (isGodMode && selectedGodWorkspace) {
       if (!inputName.trim() || !defaultRepoId) {
@@ -1452,7 +1453,8 @@ function App() {
       // Backend creates actual workspace (git worktree add, etc.)
       const workspace = await invoke<Workspace>("create_workspace", {
         repoId: selectedRepo,
-        name: workspaceName
+        name: workspaceName,
+        sourceWorkspaceId: sourceWorkspaceId ?? null,
       });
 
       // Replace optimistic placeholder with real workspace data
@@ -1599,9 +1601,18 @@ function App() {
     setAutoStartingWorkspaceId(workspaceId);
     try {
       await startAgent(workspaceId);
+      const queue = queuedMessagesByWorkspaceRef.current[workspaceId];
+      if (queue && queue.length > 0) {
+        const [next, ...rest] = queue;
+        setQueuedMessagesByWorkspace((prev) => {
+          const updated = { ...prev, [workspaceId]: rest };
+          queuedMessagesByWorkspaceRef.current = updated;
+          return updated;
+        });
+        void sendMessageRef.current(next.text, next.visible, workspaceId);
+      }
     } catch (err) {
       setError(String(err));
-      // Agent failed to start — discard queued messages so they don't sit forever
       setQueuedMessagesByWorkspace((prev) => {
         if (!prev[workspaceId]?.length) return prev;
         const next = { ...prev };
@@ -1878,6 +1889,22 @@ function App() {
     }
   }
 
+  function enqueueMessage(workspaceId: string, text: string, visible: string, clearInput: boolean) {
+    const queued: QueuedMessage = {
+      id: crypto.randomUUID(),
+      text,
+      visible,
+      queuedAt: Date.now(),
+    };
+    setQueuedMessagesByWorkspace((prev) => ({
+      ...prev,
+      [workspaceId]: [...(prev[workspaceId] || []), queued],
+    }));
+    if (clearInput) {
+      setInputMessageByWorkspace((prev) => ({ ...prev, [workspaceId]: "" }));
+    }
+  }
+
   async function sendMessage(rawMessage?: string, visibleOverride?: string, targetWorkspaceId?: string): Promise<boolean> {
     const effectiveWorkspaceId = targetWorkspaceId ?? selectedWorkspace;
     const composedInput = (rawMessage ?? inputMessage).trim();
@@ -1888,31 +1915,15 @@ function App() {
     const workspaceThinkingSince = effectiveWorkspaceId
       ? (thinkingSinceByWorkspace[effectiveWorkspaceId] ?? null)
       : null;
-    function enqueueMessage(wsId: string) {
-      const queued: QueuedMessage = {
-        id: crypto.randomUUID(),
-        text: composedInput,
-        visible: visibleOverride ?? composedInput,
-        queuedAt: Date.now(),
-      };
-      setQueuedMessagesByWorkspace((prev) => ({
-        ...prev,
-        [wsId]: [...(prev[wsId] || []), queued],
-      }));
-      if (!rawMessage) {
-        setInputMessageByWorkspace((prev) => ({ ...prev, [wsId]: "" }));
-      }
-    }
-
     if (workspaceThinkingSince !== null && effectiveWorkspaceId) {
-      enqueueMessage(effectiveWorkspaceId);
+      enqueueMessage(effectiveWorkspaceId, composedInput, visibleOverride ?? composedInput, !rawMessage);
       return true;
     }
 
     const workspaceAgents = agents.filter(a => a.workspaceId === effectiveWorkspaceId);
     if (workspaceAgents.length === 0) {
       if (!effectiveWorkspaceId) return false;
-      enqueueMessage(effectiveWorkspaceId);
+      enqueueMessage(effectiveWorkspaceId, composedInput, visibleOverride ?? composedInput, !rawMessage);
       void ensureAgentForWorkspace(effectiveWorkspaceId);
       return true;
     }
@@ -2039,8 +2050,9 @@ function App() {
     return `${adjective}-${noun}-${suffix}`;
   }
 
-  function openCreateWorkspaceForm() {
+  function openCreateWorkspaceForm(sourceWorkspaceId?: string) {
     setCreateFormInitialName(generateWorkspaceName());
+    setCreateFormSourceWorkspaceId(sourceWorkspaceId ?? null);
     setShowCreateForm(true);
   }
 
@@ -3140,7 +3152,7 @@ function App() {
               </button>
               <button
                 type="button"
-                onClick={openCreateWorkspaceForm}
+                onClick={() => openCreateWorkspaceForm()}
                 className="md-icon-plain rounded-full border md-outline disabled:cursor-not-allowed disabled:opacity-45"
                 disabled={!selectedRepo && !isGodMode}
                 title={selectedRepo || isGodMode ? "Add workspace" : "Select a repository first"}
@@ -3186,6 +3198,7 @@ function App() {
                         onTogglePin={handleTogglePin}
                         onRename={openRenameWorkspaceForm}
                         onRemove={handleRemoveWorkspace}
+                        onContinueFrom={(id) => openCreateWorkspaceForm(id)}
                         getStatusColor={getStatusColor}
                       />
                     ))}
@@ -3716,7 +3729,7 @@ function App() {
                   Each workspace is an isolated git worktree where Claude can develop features.
                 </p>
                 <button
-                  onClick={openCreateWorkspaceForm}
+                  onClick={() => openCreateWorkspaceForm()}
                   className="md-btn md-btn-tonal mt-4"
                 >
                   Create workspace
@@ -4675,8 +4688,10 @@ function App() {
       {showCreateForm && (
         <CreateWorkspaceDialog
           initialName={createFormInitialName}
-          onClose={() => setShowCreateForm(false)}
-          onSubmit={(name) => { void createWorkspace(name); }}
+          continueFromWorkspaces={workspaces.filter((w) => w.repoId === selectedRepo && !w.isGod && w.status !== "initializing" && w.lastActivity)}
+          initialSourceWorkspaceId={createFormSourceWorkspaceId}
+          onClose={() => { setShowCreateForm(false); setCreateFormSourceWorkspaceId(null); }}
+          onSubmit={(name, sourceWorkspaceId) => { void createWorkspace(name, sourceWorkspaceId); }}
         />
       )}
 
