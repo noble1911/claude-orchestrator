@@ -77,12 +77,13 @@ pub fn stop_agent(state: &AppState, agent_id: String) -> Result<(), String> {
         }
     }
 
-    // Broadcast completion AFTER all state mutations are done so wait
-    // subscribers see the final workspace status (idle) and agent state.
+    // Write the completion reason BEFORE emit_agent_run_state broadcasts on
+    // agent_completions — wait subscribers read last_completion_reason on wakeup.
+    // We don't broadcast here; emit_agent_run_state (called downstream when the
+    // agent thread exits) is the single source of truth for completion signals.
     if let Some(ref ws_id) = workspace_id {
         state.last_completion_reason.write()
             .insert(ws_id.clone(), crate::helpers::CompletionReason::Interrupted);
-        let _ = state.agent_completions.send(ws_id.clone());
     }
 
     Ok(())

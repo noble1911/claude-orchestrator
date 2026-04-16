@@ -1107,14 +1107,14 @@ fn resolve_model_for_runtime(requested_model: Option<&str>, is_bedrock: bool) ->
 
     if is_bedrock {
         match value {
-            "opus" => return Some("global.anthropic.claude-opus-4-6-v1".to_string()),
+            "opus" => return Some("global.anthropic.claude-opus-4-7-v1".to_string()),
             "sonnet" => return Some("global.anthropic.claude-sonnet-4-6".to_string()),
             "haiku" => return Some("global.anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
             _ => {}
         }
     } else {
         match value {
-            "opus" => return Some("claude-opus-4-6".to_string()),
+            "opus" => return Some("claude-opus-4-7".to_string()),
             "sonnet" => return Some("claude-sonnet-4-6".to_string()),
             "haiku" => return Some("claude-haiku-4-5".to_string()),
             _ => {}
@@ -1429,7 +1429,8 @@ impl Drop for RunStateGuard {
                     }
                 }
                 state.last_completion_reason.write()
-                    .insert(self.workspace_id.clone(), CompletionReason::Error);
+                    .entry(self.workspace_id.clone())
+                    .or_insert(CompletionReason::Error);
             }
             emit_agent_run_state(&self.app, &self.ws_server, &self.workspace_id, &self.agent_id, false);
         }
@@ -3791,7 +3792,7 @@ mod tests {
     fn resolve_model_for_runtime_bedrock_aliases() {
         assert_eq!(
             resolve_model_for_runtime(Some("opus"), true),
-            Some("global.anthropic.claude-opus-4-6-v1".to_string())
+            Some("global.anthropic.claude-opus-4-7-v1".to_string())
         );
         assert_eq!(
             resolve_model_for_runtime(Some("sonnet"), true),
@@ -3807,7 +3808,7 @@ mod tests {
     fn resolve_model_for_runtime_api_aliases() {
         assert_eq!(
             resolve_model_for_runtime(Some("opus"), false),
-            Some("claude-opus-4-6".to_string())
+            Some("claude-opus-4-7".to_string())
         );
         assert_eq!(
             resolve_model_for_runtime(Some("sonnet"), false),
@@ -3822,8 +3823,8 @@ mod tests {
     #[test]
     fn resolve_model_for_runtime_full_ids_passthrough() {
         assert_eq!(
-            resolve_model_for_runtime(Some("global.anthropic.claude-opus-4-6-v1"), true),
-            Some("global.anthropic.claude-opus-4-6-v1".to_string())
+            resolve_model_for_runtime(Some("global.anthropic.claude-opus-4-7-v1"), true),
+            Some("global.anthropic.claude-opus-4-7-v1".to_string())
         );
         assert_eq!(
             resolve_model_for_runtime(Some("claude-sonnet-4-6"), false),

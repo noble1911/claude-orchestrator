@@ -59,14 +59,14 @@ pub fn resolve_model_for_runtime(requested_model: Option<&str>, is_bedrock: bool
 
     if is_bedrock {
         match value {
-            "opus" => return Some("global.anthropic.claude-opus-4-6-v1".to_string()),
+            "opus" => return Some("global.anthropic.claude-opus-4-7-v1".to_string()),
             "sonnet" => return Some("global.anthropic.claude-sonnet-4-6".to_string()),
             "haiku" => return Some("global.anthropic.claude-haiku-4-5-20251001-v1:0".to_string()),
             _ => {}
         }
     } else {
         match value {
-            "opus" => return Some("claude-opus-4-6".to_string()),
+            "opus" => return Some("claude-opus-4-7".to_string()),
             "sonnet" => return Some("claude-sonnet-4-6".to_string()),
             "haiku" => return Some("claude-haiku-4-5".to_string()),
             _ => {}
