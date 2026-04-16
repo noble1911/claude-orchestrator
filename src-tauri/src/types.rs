@@ -256,6 +256,65 @@ pub struct SkillListResponse {
     pub user_skills: Vec<SkillEntry>,
 }
 
+// ─── Orchestration Graph ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum OrchestrationEventKind {
+    WorkspaceCreated,
+    AgentStarted,
+    MessageSent,
+    AgentStopped,
+    StatusPolled,
+    WaitStarted,
+    WaitCompleted,
+    ArtifactWritten,
+    ArtifactRead,
+    ArtifactDeleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationEvent {
+    pub id: String,
+    pub god_workspace_id: String,
+    pub child_workspace_id: Option<String>,
+    pub child_workspace_name: Option<String>,
+    pub kind: OrchestrationEventKind,
+    pub timestamp: String,
+    pub summary: String,
+    pub artifact_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationChildStatus {
+    pub workspace_id: String,
+    pub name: String,
+    pub workspace_status: String,
+    pub agent_status: Option<String>,
+    pub processing: bool,
+    pub completion_reason: Option<String>,
+    pub message_count: i64,
+    pub last_activity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationArtifact {
+    pub key: String,
+    pub value: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationSnapshot {
+    pub god_workspace_id: String,
+    pub children: Vec<OrchestrationChildStatus>,
+    pub artifacts: Vec<OrchestrationArtifact>,
+}
+
 // ─── Terminal ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

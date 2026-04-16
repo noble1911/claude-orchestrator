@@ -130,6 +130,7 @@ import QuestionCard from "./components/QuestionCard";
 import PermissionCard from "./components/PermissionCard";
 import SortableWorkspaceItem from "./components/SortableWorkspaceItem";
 import GroupDropZone from "./components/GroupDropZone";
+import OrchestrationGraph from "./components/OrchestrationGraph";
 import ThinkingTimer from "./components/ThinkingTimer";
 import SettingsModal, { type SettingsTab } from "./components/SettingsModal";
 import ToolbarDropdown from "./components/ToolbarDropdown";
@@ -729,7 +730,15 @@ function App() {
     setEditedContentsByPath({});
     setDiffContentsByTab({});
     setLoadingDiffTabId(null);
-    setCenterTabs([{ id: "chat", type: "chat", title: "Chat" }]);
+    const isGodWs = godWorkspaces.some((g) => g.id === selectedWorkspace);
+    setCenterTabs(
+      isGodWs
+        ? [
+            { id: "chat", type: "chat" as const, title: "Chat" },
+            { id: "graph", type: "graph" as const, title: "Graph" },
+          ]
+        : [{ id: "chat", type: "chat" as const, title: "Chat" }],
+    );
     setActiveCenterTabId("chat");
     setWorkspaceChanges([]);
     setCheckResultByKey({});
@@ -3452,6 +3461,12 @@ function App() {
                         />
                       )}
                     </div>
+                  ) : activeCenterTab.type === "graph" && selectedGodWorkspace ? (
+                    <OrchestrationGraph
+                      godWorkspaceId={selectedGodWorkspace}
+                      godWorkspaceName={godWorkspaces.find((g) => g.id === selectedGodWorkspace)?.name ?? "Orchestrator"}
+                      onSelectWorkspace={handleSelectWorkspace}
+                    />
                   ) : (
                     <div>
                       <div className="mb-2 flex flex-wrap items-center gap-2">
