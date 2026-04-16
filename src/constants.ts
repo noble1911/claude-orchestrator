@@ -23,7 +23,7 @@ export const NAME_NOUNS = [
 ];
 
 export const MODEL_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: "opus", label: "Opus 4.6" },
+  { value: "opus", label: "Opus 4.7" },
   { value: "sonnet", label: "Sonnet 4.6" },
   { value: "haiku", label: "Haiku 4.5" },
 ];
