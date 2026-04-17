@@ -123,6 +123,7 @@ import type {
   WorkspaceGroup,
   ShortcutKeys,
   PermissionRequestEvent,
+  HtmlArtifact,
 } from "./types";
 import LinkifiedInlineText from "./components/LinkifiedInlineText";
 import MarkdownMessage from "./components/MarkdownMessage";
@@ -131,6 +132,7 @@ import PermissionCard from "./components/PermissionCard";
 import SortableWorkspaceItem from "./components/SortableWorkspaceItem";
 import GroupDropZone from "./components/GroupDropZone";
 import OrchestrationGraph from "./components/OrchestrationGraph";
+import CanvasPanel from "./components/CanvasPanel";
 import ThinkingTimer from "./components/ThinkingTimer";
 import SettingsModal, { type SettingsTab } from "./components/SettingsModal";
 import ToolbarDropdown from "./components/ToolbarDropdown";
@@ -188,6 +190,8 @@ function App() {
   const [loadingDiffTabId, setLoadingDiffTabId] = useState<string | null>(null);
   const [centerTabs, setCenterTabs] = useState<CenterTab[]>([{ id: "chat", type: "chat", title: "Chat" }]);
   const [activeCenterTabId, setActiveCenterTabId] = useState("chat");
+  const [htmlArtifactsByWorkspace, setHtmlArtifactsByWorkspace] = useState<Record<string, HtmlArtifact[]>>({});
+  const [activeArtifactByWorkspace, setActiveArtifactByWorkspace] = useState<Record<string, string>>({});
   const [workspaceChanges, setWorkspaceChanges] = useState<WorkspaceChangeEntry[]>([]);
   const [isLoadingChanges, setIsLoadingChanges] = useState(false);
   const [detectedChecks, setDetectedChecks] = useState<WorkspaceCheckDefinition[]>([]);
@@ -341,6 +345,7 @@ function App() {
   const pendingUnreadByWorkspaceRef = useRef<Record<string, boolean>>({});
   const detectedPrUrlByWorkspaceRef = useRef<Record<string, string>>({});
   const sendMessageRef = useRef<(rawMessage?: string, visibleOverride?: string, targetWorkspaceId?: string) => Promise<boolean>>(async () => false);
+  const onHtmlArtifactRef = useRef<(artifact: HtmlArtifact) => void>(() => {});
   const [queuedMessagesByWorkspace, setQueuedMessagesByWorkspace] = useState<Record<string, QueuedMessage[]>>({});
   const queuedMessagesByWorkspaceRef = useRef<Record<string, QueuedMessage[]>>({});
   useEffect(() => { queuedMessagesByWorkspaceRef.current = queuedMessagesByWorkspace; }, [queuedMessagesByWorkspace]);
@@ -462,8 +467,89 @@ function App() {
     setGodWorkspaces,
     setPendingPermissions,
     setQueuedMessagesByWorkspace,
+    onHtmlArtifactRef,
     persistUnread,
   });
+
+  useEffect(() => {
+    onHtmlArtifactRef.current = (artifact: HtmlArtifact) => {
+      setHtmlArtifactsByWorkspace((prev) => {
+        const existing = prev[artifact.workspaceId] ?? [];
+        const deduped = existing.filter((a) => a.id !== artifact.id);
+        return {
+          ...prev,
+          [artifact.workspaceId]: [artifact, ...deduped],
+        };
+      });
+      setActiveArtifactByWorkspace((prev) => ({
+        ...prev,
+        [artifact.workspaceId]: artifact.id,
+      }));
+      // Only auto-open the Canvas tab when the artifact's workspace is
+      // currently focused. Artifacts in background workspaces queue up
+      // silently and surface when the user switches to that workspace.
+      if (selectedWorkspaceRef.current === artifact.workspaceId) {
+        setCenterTabs((prev) => {
+          if (prev.some((tab) => tab.id === "canvas")) return prev;
+          return [...prev, { id: "canvas", type: "canvas", title: "Canvas" }];
+        });
+        setActiveCenterTabId((prev) => (prev === "chat" ? "canvas" : prev));
+      }
+    };
+  }, []);
+
+  // Load persisted HTML artifacts when a workspace is selected, and sync
+  // the Canvas tab's existence to whether this workspace has any artifacts.
+  // Depending on the raw `htmlArtifactsByWorkspace` map would re-run the
+  // effect on every artifact change; a boolean "already loaded" flag limits
+  // re-runs to workspace switches.
+  const artifactsLoadedForSelected =
+    selectedWorkspace !== null && htmlArtifactsByWorkspace[selectedWorkspace] !== undefined;
+  const selectedHasArtifacts =
+    selectedWorkspace !== null && (htmlArtifactsByWorkspace[selectedWorkspace]?.length ?? 0) > 0;
+  useEffect(() => {
+    if (!selectedWorkspace) return;
+    if (artifactsLoadedForSelected) {
+      // Already loaded — just sync the Canvas tab's presence to the current count.
+      setCenterTabs((prev) => {
+        const hasTab = prev.some((tab) => tab.id === "canvas");
+        if (selectedHasArtifacts && !hasTab) {
+          return [...prev, { id: "canvas", type: "canvas", title: "Canvas" }];
+        }
+        if (!selectedHasArtifacts && hasTab) {
+          return prev.filter((tab) => tab.id !== "canvas");
+        }
+        return prev;
+      });
+      if (!selectedHasArtifacts) {
+        setActiveCenterTabId((prev) => (prev === "canvas" ? "chat" : prev));
+      }
+      return;
+    }
+    invoke<HtmlArtifact[]>("list_html_artifacts", { workspaceId: selectedWorkspace })
+      .then((artifacts) => {
+        setHtmlArtifactsByWorkspace((prev) => ({
+          ...prev,
+          [selectedWorkspace]: artifacts,
+        }));
+        if (artifacts.length > 0) {
+          setActiveArtifactByWorkspace((prev) =>
+            prev[selectedWorkspace] ? prev : { ...prev, [selectedWorkspace]: artifacts[0].id }
+          );
+          setCenterTabs((prev) => {
+            if (prev.some((tab) => tab.id === "canvas")) return prev;
+            return [...prev, { id: "canvas", type: "canvas", title: "Canvas" }];
+          });
+        } else {
+          // Drop a stale Canvas tab inherited from a previous workspace.
+          setCenterTabs((prev) => prev.filter((tab) => tab.id !== "canvas"));
+          setActiveCenterTabId((prev) => (prev === "canvas" ? "chat" : prev));
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to load HTML artifacts:", err);
+      });
+  }, [selectedWorkspace, artifactsLoadedForSelected, selectedHasArtifacts]);
 
   useTauriListener<number>("remote-clients-updated", (count) => {
     setServerStatus((prev) => prev ? { ...prev, connectedClients: count } : prev);
@@ -3479,6 +3565,48 @@ function App() {
                       godWorkspaceId={selectedGodWorkspace}
                       godWorkspaceName={godWorkspaces.find((g) => g.id === selectedGodWorkspace)?.name ?? "Orchestrator"}
                       onSelectWorkspace={handleSelectWorkspace}
+                    />
+                  ) : activeCenterTab.type === "canvas" && selectedWorkspace ? (
+                    <CanvasPanel
+                      artifacts={htmlArtifactsByWorkspace[selectedWorkspace] ?? []}
+                      artifact={(htmlArtifactsByWorkspace[selectedWorkspace] ?? []).find(
+                        (a) => a.id === activeArtifactByWorkspace[selectedWorkspace],
+                      )}
+                      onSelectArtifact={(artifactId) =>
+                        setActiveArtifactByWorkspace((prev) => ({
+                          ...prev,
+                          [selectedWorkspace]: artifactId,
+                        }))
+                      }
+                      onDeleteArtifact={async (artifactId) => {
+                        try {
+                          await invoke("delete_html_artifact", { artifactId });
+                        } catch (err) {
+                          console.error("Failed to delete HTML artifact:", err);
+                          return;
+                        }
+                        let becameEmpty = false;
+                        setHtmlArtifactsByWorkspace((prev) => {
+                          const current = prev[selectedWorkspace] ?? [];
+                          const remaining = current.filter((a) => a.id !== artifactId);
+                          becameEmpty = remaining.length === 0;
+                          setActiveArtifactByWorkspace((prevActive) => {
+                            if (prevActive[selectedWorkspace] !== artifactId) return prevActive;
+                            const next = { ...prevActive };
+                            if (remaining.length > 0) {
+                              next[selectedWorkspace] = remaining[0].id;
+                            } else {
+                              delete next[selectedWorkspace];
+                            }
+                            return next;
+                          });
+                          return { ...prev, [selectedWorkspace]: remaining };
+                        });
+                        if (becameEmpty) {
+                          setCenterTabs((prev) => prev.filter((tab) => tab.id !== "canvas"));
+                          setActiveCenterTabId((prev) => (prev === "canvas" ? "chat" : prev));
+                        }
+                      }}
                     />
                   ) : (
                     <div>

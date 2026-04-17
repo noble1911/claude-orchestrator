@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentMessage,
   AgentRunStateEvent,
+  HtmlArtifact,
   PermissionRequestEvent,
   Workspace,
   QueuedMessage,
@@ -27,6 +28,8 @@ interface UseAgentEventsParams {
   setGodWorkspaces: Dispatch<SetStateAction<Workspace[]>>;
   setPendingPermissions: Dispatch<SetStateAction<Record<string, PermissionRequestEvent[]>>>;
   setQueuedMessagesByWorkspace: Dispatch<SetStateAction<Record<string, QueuedMessage[]>>>;
+  /** Fired when an agent emits an HTML artifact via the render_html MCP tool. */
+  onHtmlArtifactRef: RefObject<(artifact: HtmlArtifact) => void>;
   persistUnread: (workspaceId: string, count: number) => void;
 }
 
@@ -56,6 +59,7 @@ export function useAgentEvents(params: UseAgentEventsParams): void {
     setGodWorkspaces,
     setPendingPermissions,
     setQueuedMessagesByWorkspace,
+    onHtmlArtifactRef,
     persistUnread,
   } = params;
 
@@ -192,10 +196,15 @@ export function useAgentEvents(params: UseAgentEventsParams): void {
       }
     });
 
+    const unlistenArtifact = listen<HtmlArtifact>("html-artifact", (event) => {
+      onHtmlArtifactRef.current?.(event.payload);
+    });
+
     return () => {
       void unlisten.then((fn) => fn());
       void unlistenRunState.then((fn) => fn());
       void unlistenPermission.then((fn) => fn());
+      void unlistenArtifact.then((fn) => fn());
     };
   // All params are refs or dispatch functions (stable references) — [] is correct
   // eslint-disable-next-line react-hooks/exhaustive-deps

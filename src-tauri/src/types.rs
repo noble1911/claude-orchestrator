@@ -330,3 +330,24 @@ pub struct TerminalCommandResult {
     pub duration_ms: u128,
 }
 
+// ─── HTML Artifacts ─────────────────────────────────────────────────
+//
+// Agent-emitted HTML pages that the frontend renders in a sandboxed iframe.
+// Written via the MCP `render_html` tool → POST /api/render_html. Stored in
+// SQLite so artifacts survive restarts alongside the conversation they
+// belong to.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HtmlArtifact {
+    pub id: String,
+    pub workspace_id: String,
+    /// Stable key chosen by the agent. When the agent reuses the same identifier
+    /// for the same workspace, we replace the existing artifact in place
+    /// (so "update the chart" actually updates, rather than stacking tabs).
+    pub identifier: Option<String>,
+    pub title: String,
+    pub html: String,
+    pub created_at: String,
+}
+
