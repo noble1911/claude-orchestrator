@@ -2016,6 +2016,27 @@ async fn respond_to_permission(
     commands::agent::respond_to_permission(&state, agent_id, request_id, allow, deny_message, updated_input)
 }
 
+/// List all HTML artifacts emitted by agents in the given workspace, newest first.
+/// Returns the full artifact (including `html` body) so the frontend can seed
+/// Canvas tabs on workspace switch without a follow-up fetch.
+#[tauri::command]
+async fn list_html_artifacts(
+    workspace_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<HtmlArtifact>, String> {
+    state.db.get_html_artifacts_by_workspace(&workspace_id)
+        .map_err(|e| format!("Failed to list artifacts: {}", e))
+}
+
+#[tauri::command]
+async fn delete_html_artifact(
+    artifact_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state.db.delete_html_artifact(&artifact_id)
+        .map_err(|e| format!("Failed to delete artifact: {}", e))
+}
+
 /// Answer a question asked by the Claude CLI (AskUserQuestion tool).
 /// Writes the answer directly to the running process's stdin, just like
 /// permission responses.  This avoids the need to spawn a new CLI process
@@ -3687,6 +3708,8 @@ pub fn run() {
             stop_agent,
             interrupt_agent,
             respond_to_permission,
+            list_html_artifacts,
+            delete_html_artifact,
             answer_agent_question,
             send_message_to_agent,
             get_agent_messages,

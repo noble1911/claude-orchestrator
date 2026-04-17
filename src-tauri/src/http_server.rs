@@ -143,10 +143,26 @@ impl HttpServer {
             .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
             .route_layer(middleware::from_fn_with_state(api_state.clone(), require_bearer_token));
 
-        // Permission bridge — no token required (uses its own request_id auth)
+        // Bridge endpoints — no token required. These are only reachable on
+        // localhost (the server binds 127.0.0.1 only — see TcpListener below)
+        // and their self-asserted workspace_id is validated against the live
+        // workspaces map, matching the permission-bridge threat model. If the
+        // server is ever exposed beyond localhost, these endpoints must gain
+        // auth.
+        //
+        // Body limit is larger than MAX_ARTIFACT_HTML_BYTES to leave headroom
+        // for JSON envelope + string escaping, so the handler's explicit
+        // size error is reachable for html near the content cap.
+        const MAX_ARTIFACT_BODY_BYTES: usize = (2 * 1024 * 1024) + 256 * 1024;
+
         let api_routes = Router::new()
             .route("/api/permission", post(handle_permission_request))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+            .merge(
+                Router::new()
+                    .route("/api/render_html", post(handle_render_html))
+                    .layer(axum::extract::DefaultBodyLimit::max(MAX_ARTIFACT_BODY_BYTES))
+            )
             .merge(orchestrator_routes)
             .with_state(api_state);
 
@@ -260,6 +276,81 @@ async fn handle_permission_request(
             });
             (StatusCode::OK, axum::Json(deny)).into_response()
         }
+    }
+}
+
+// ─── HTML Artifact Bridge Handler ───────────────────────────────────
+
+/// Request body from the MCP `render_html` tool.
+#[derive(Deserialize)]
+struct RenderHtmlRequest {
+    workspace_id: String,
+    #[serde(default)]
+    identifier: Option<String>,
+    title: String,
+    html: String,
+}
+
+const MAX_ARTIFACT_TITLE_LEN: usize = 200;
+const MAX_ARTIFACT_IDENTIFIER_LEN: usize = 128;
+const MAX_ARTIFACT_HTML_BYTES: usize = 2 * 1024 * 1024;
+
+/// POST /api/render_html — called by the MCP `render_html` tool.
+/// Validates inputs, persists to SQLite, emits a `html-artifact` Tauri event,
+/// and returns the artifact's id so the calling agent can reference it.
+async fn handle_render_html(
+    AxumState(state): AxumState<ApiState>,
+    axum::Json(req): axum::Json<RenderHtmlRequest>,
+) -> impl IntoResponse {
+    if req.title.is_empty() || req.title.len() > MAX_ARTIFACT_TITLE_LEN {
+        return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
+            "error": format!("title must be 1-{} characters", MAX_ARTIFACT_TITLE_LEN),
+        }))).into_response();
+    }
+    if let Some(ident) = &req.identifier {
+        if ident.len() > MAX_ARTIFACT_IDENTIFIER_LEN {
+            return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
+                "error": format!("identifier must be at most {} characters", MAX_ARTIFACT_IDENTIFIER_LEN),
+            }))).into_response();
+        }
+    }
+    if req.html.as_bytes().len() > MAX_ARTIFACT_HTML_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, axum::Json(serde_json::json!({
+            "error": format!("html exceeds maximum size of {} bytes", MAX_ARTIFACT_HTML_BYTES),
+        }))).into_response();
+    }
+    // Validate the workspace exists — the bridge is unauthenticated, so we
+    // refuse calls that target a workspace the orchestrator doesn't know about.
+    if !state.app_state.workspaces.read().contains_key(&req.workspace_id) {
+        return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({
+            "error": "Workspace not found",
+        }))).into_response();
+    }
+
+    match state.app_state.db.upsert_html_artifact(
+        &req.workspace_id,
+        req.identifier.as_deref(),
+        &req.title,
+        &req.html,
+    ) {
+        Ok(artifact) => {
+            // Emit the full artifact (including HTML body) — the frontend
+            // keeps it in state and renders it via iframe srcdoc. Emit
+            // failures are non-fatal: the artifact is already persisted and
+            // will show up on the next workspace switch.
+            if let Err(e) = state.app_handle.emit("html-artifact", &artifact) {
+                eprintln!("warn: failed to emit html-artifact event: {}", e);
+            }
+            (StatusCode::OK, axum::Json(serde_json::json!({
+                "id": artifact.id,
+                "workspaceId": artifact.workspace_id,
+                "title": artifact.title,
+                "createdAt": artifact.created_at,
+            }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({
+            "error": format!("Failed to store artifact: {}", e),
+        }))).into_response(),
     }
 }
 

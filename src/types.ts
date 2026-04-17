@@ -202,11 +202,24 @@ export interface CustomSkillRepo {
 
 export interface CenterTab {
   id: string;
-  type: "chat" | "file" | "diff" | "graph";
+  type: "chat" | "file" | "diff" | "graph" | "canvas";
   title: string;
   path?: string;
   status?: string;
   oldPath?: string;
+  /** For type === "canvas": the HTML artifact id being displayed */
+  artifactId?: string;
+}
+
+/** HTML artifact emitted by an agent via the `render_html` MCP tool. */
+export interface HtmlArtifact {
+  id: string;
+  workspaceId: string;
+  /** Stable key — when the agent reuses it, we replace in place. */
+  identifier?: string | null;
+  title: string;
+  html: string;
+  createdAt: string;
 }
 
 // ─── Orchestration Graph ───────────────────────────────────────────

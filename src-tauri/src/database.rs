@@ -4,7 +4,7 @@ use rusqlite::{Connection, Result, params};
 use std::path::PathBuf;
 use parking_lot::Mutex;
 
-use crate::{Repository, Workspace, WorkspaceStatus, AgentMessage};
+use crate::{Repository, Workspace, WorkspaceStatus, AgentMessage, HtmlArtifact};
 
 pub struct Database {
     conn: Mutex<Connection>,
@@ -86,6 +86,23 @@ impl Database {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS html_artifacts (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                identifier TEXT,
+                title TEXT NOT NULL,
+                html TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_html_artifacts_workspace
+                ON html_artifacts(workspace_id, created_at DESC);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_html_artifacts_identifier
+                ON html_artifacts(workspace_id, identifier)
+                WHERE identifier IS NOT NULL;
             "#,
         )?;
         Ok(())
@@ -360,6 +377,8 @@ impl Database {
         )?;
         // Delete associated sessions
         conn.execute("DELETE FROM sessions WHERE workspace_id = ?1", params![id])?;
+        // Delete associated html artifacts
+        conn.execute("DELETE FROM html_artifacts WHERE workspace_id = ?1", params![id])?;
         // Delete workspace
         conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
         Ok(())
@@ -391,13 +410,18 @@ impl Database {
             "DELETE FROM sessions WHERE workspace_id IN (SELECT id FROM workspaces WHERE parent_god_workspace_id = ?1)",
             params![id],
         )?;
+        tx.execute(
+            "DELETE FROM html_artifacts WHERE workspace_id IN (SELECT id FROM workspaces WHERE parent_god_workspace_id = ?1)",
+            params![id],
+        )?;
         tx.execute("DELETE FROM workspaces WHERE parent_god_workspace_id = ?1", params![id])?;
-        // Delete the god workspace's own messages and sessions
+        // Delete the god workspace's own messages, sessions, and artifacts
         tx.execute(
             "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE workspace_id = ?1)",
             params![id],
         )?;
         tx.execute("DELETE FROM sessions WHERE workspace_id = ?1", params![id])?;
+        tx.execute("DELETE FROM html_artifacts WHERE workspace_id = ?1", params![id])?;
         // Delete the god workspace itself
         tx.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
         tx.commit()
@@ -615,6 +639,74 @@ impl Database {
             "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?1, ?2)",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    // HTML Artifact CRUD
+    //
+    // Upsert semantics: when `identifier` is Some, an existing artifact with the
+    // same (workspace_id, identifier) is replaced in place (same id retained).
+    // When `identifier` is None, every call creates a fresh row.
+    pub fn upsert_html_artifact(
+        &self,
+        workspace_id: &str,
+        identifier: Option<&str>,
+        title: &str,
+        html: &str,
+    ) -> Result<HtmlArtifact> {
+        let conn = self.conn.lock();
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        // Check for an existing row when identifier is provided — if present,
+        // reuse its id (stable URL + stable React key for updates in place).
+        let existing_id: Option<String> = if let Some(ident) = identifier {
+            conn.query_row(
+                "SELECT id FROM html_artifacts WHERE workspace_id = ?1 AND identifier = ?2",
+                params![workspace_id, ident],
+                |row| row.get(0),
+            ).ok()
+        } else {
+            None
+        };
+
+        let id = existing_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        conn.execute(
+            "INSERT OR REPLACE INTO html_artifacts (id, workspace_id, identifier, title, html, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, workspace_id, identifier, title, html, created_at],
+        )?;
+        Ok(HtmlArtifact {
+            id,
+            workspace_id: workspace_id.to_string(),
+            identifier: identifier.map(str::to_owned),
+            title: title.to_string(),
+            html: html.to_string(),
+            created_at,
+        })
+    }
+
+    pub fn get_html_artifacts_by_workspace(&self, workspace_id: &str) -> Result<Vec<HtmlArtifact>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, identifier, title, html, created_at
+             FROM html_artifacts WHERE workspace_id = ?1 ORDER BY created_at DESC"
+        )?;
+        let rows = stmt.query_map(params![workspace_id], |row| {
+            Ok(HtmlArtifact {
+                id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                identifier: row.get(2)?,
+                title: row.get(3)?,
+                html: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?.collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_html_artifact(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM html_artifacts WHERE id = ?1", params![id])?;
         Ok(())
     }
 }
