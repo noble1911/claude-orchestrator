@@ -3449,6 +3449,51 @@ function App() {
                 </div>
               </div>
 
+              {activeCenterTab.type === "canvas" && selectedWorkspace ? (
+                <div className="flex-1 min-h-0 overflow-hidden">
+                  <CanvasPanel
+                    artifacts={htmlArtifactsByWorkspace[selectedWorkspace] ?? []}
+                    artifact={(htmlArtifactsByWorkspace[selectedWorkspace] ?? []).find(
+                      (a) => a.id === activeArtifactByWorkspace[selectedWorkspace],
+                    )}
+                    onSelectArtifact={(artifactId) =>
+                      setActiveArtifactByWorkspace((prev) => ({
+                        ...prev,
+                        [selectedWorkspace]: artifactId,
+                      }))
+                    }
+                    onDeleteArtifact={async (artifactId) => {
+                      try {
+                        await invoke("delete_html_artifact", { artifactId });
+                      } catch (err) {
+                        console.error("Failed to delete HTML artifact:", err);
+                        return;
+                      }
+                      let becameEmpty = false;
+                      setHtmlArtifactsByWorkspace((prev) => {
+                        const current = prev[selectedWorkspace] ?? [];
+                        const remaining = current.filter((a) => a.id !== artifactId);
+                        becameEmpty = remaining.length === 0;
+                        setActiveArtifactByWorkspace((prevActive) => {
+                          if (prevActive[selectedWorkspace] !== artifactId) return prevActive;
+                          const next = { ...prevActive };
+                          if (remaining.length > 0) {
+                            next[selectedWorkspace] = remaining[0].id;
+                          } else {
+                            delete next[selectedWorkspace];
+                          }
+                          return next;
+                        });
+                        return { ...prev, [selectedWorkspace]: remaining };
+                      });
+                      if (becameEmpty) {
+                        setCenterTabs((prev) => prev.filter((tab) => tab.id !== "canvas"));
+                        setActiveCenterTabId((prev) => (prev === "canvas" ? "chat" : prev));
+                      }
+                    }}
+                  />
+                </div>
+              ) : (
               <div className={`flex-1 overflow-y-auto ${v2Chat ? "px-5 py-5" : "md-px-3 md-py-3"}`} style={{ zoom: chatFontSize / 14 }}>
                 <div className={v2Chat ? "flex flex-col gap-[18px]" : "space-y-3"}>
                   {activeCenterTab.type === "chat" && workspaceMessages.length === 0 ? (
@@ -3566,48 +3611,6 @@ function App() {
                       godWorkspaceName={godWorkspaces.find((g) => g.id === selectedGodWorkspace)?.name ?? "Orchestrator"}
                       onSelectWorkspace={handleSelectWorkspace}
                     />
-                  ) : activeCenterTab.type === "canvas" && selectedWorkspace ? (
-                    <CanvasPanel
-                      artifacts={htmlArtifactsByWorkspace[selectedWorkspace] ?? []}
-                      artifact={(htmlArtifactsByWorkspace[selectedWorkspace] ?? []).find(
-                        (a) => a.id === activeArtifactByWorkspace[selectedWorkspace],
-                      )}
-                      onSelectArtifact={(artifactId) =>
-                        setActiveArtifactByWorkspace((prev) => ({
-                          ...prev,
-                          [selectedWorkspace]: artifactId,
-                        }))
-                      }
-                      onDeleteArtifact={async (artifactId) => {
-                        try {
-                          await invoke("delete_html_artifact", { artifactId });
-                        } catch (err) {
-                          console.error("Failed to delete HTML artifact:", err);
-                          return;
-                        }
-                        let becameEmpty = false;
-                        setHtmlArtifactsByWorkspace((prev) => {
-                          const current = prev[selectedWorkspace] ?? [];
-                          const remaining = current.filter((a) => a.id !== artifactId);
-                          becameEmpty = remaining.length === 0;
-                          setActiveArtifactByWorkspace((prevActive) => {
-                            if (prevActive[selectedWorkspace] !== artifactId) return prevActive;
-                            const next = { ...prevActive };
-                            if (remaining.length > 0) {
-                              next[selectedWorkspace] = remaining[0].id;
-                            } else {
-                              delete next[selectedWorkspace];
-                            }
-                            return next;
-                          });
-                          return { ...prev, [selectedWorkspace]: remaining };
-                        });
-                        if (becameEmpty) {
-                          setCenterTabs((prev) => prev.filter((tab) => tab.id !== "canvas"));
-                          setActiveCenterTabId((prev) => (prev === "canvas" ? "chat" : prev));
-                        }
-                      }}
-                    />
                   ) : (
                     <div>
                       <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -3670,6 +3673,7 @@ function App() {
                   )}
                 </div>
               </div>
+              )}
 
               {activeCenterTab.type === "chat" && selectedWorkspace && credentialErrorWorkspaces.has(selectedWorkspace) && (
                 <div className="border-t border-amber-700/50 bg-amber-950/40 px-4 py-3">
