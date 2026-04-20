@@ -102,14 +102,19 @@ pub fn append_claude_request_args(
     let has_permission_prompt_tool = claude_supports_permission_prompt_tool(claude_path);
     let wants_interactive = needs_interactive_permissions(permission_mode) && supports_stream;
 
-    // When --permission-prompt-tool is available AND the bridge script exists,
-    // delegate permission handling to the MCP bridge (HTTP-based) instead of
-    // using stdin control_request/control_response.
-    let bridge_path = if wants_interactive && has_permission_prompt_tool {
+    // Spawn the bridge whenever stream-json is supported — it exposes
+    // non-permission tools (render_html, etc.) that must be available in every
+    // permission mode, including dangerouslySkipPermissions/bypassPermissions
+    // where no permission prompting happens. The `--permission-prompt-tool`
+    // flag is only wired in interactive modes; the bridge's other tools work
+    // regardless.
+    let bridge_path = if supports_stream {
         find_permission_bridge_path()
     } else {
         None
     };
+    let wire_permission_prompt =
+        bridge_path.is_some() && wants_interactive && has_permission_prompt_tool;
     let _use_mcp_bridge = bridge_path.is_some();
     // Stdin must be piped whenever the CLI supports stream-json, regardless of
     // permission mode.  Question answers (AskUserQuestion) and follow-up messages
@@ -141,7 +146,9 @@ pub fn append_claude_request_args(
             }
         });
         cmd.args(["--mcp-config", &mcp_config.to_string()]);
-        cmd.args(["--permission-prompt-tool", "mcp__perm_bridge__check_permission"]);
+        if wire_permission_prompt {
+            cmd.args(["--permission-prompt-tool", "mcp__perm_bridge__check_permission"]);
+        }
     }
     if interactive {
         // Legacy fallback: bidirectional stream-json for control_request/control_response.
